@@ -42,12 +42,14 @@ for _dir in dict.fromkeys((_HERE, os.getcwd())):  # script folder first, then cu
 # =====================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # =====================================================================
-#  PRIMARY BOT OWNER  -  Telegram user IDs allowed to manage Super Admins
-#  (owners and Super Admins can both use Bot Edit)
-#  (send /id to the bot to see your own ID), e.g. OWNER_IDS = [123456789]
+#  PRIMARY BOT OWNER  -  Telegram USER IDs (positive numbers, never a group/channel ID) that
+#  may use Bot Edit (/bot) and manage Super Admins. Super Admins and group owners/admins can NOT
+#  use Bot Edit. (send /id to the bot to see your own ID), e.g. OWNER_IDS = [123456789]
 # =====================================================================
 # Comma/space separated list in the OWNER_IDS environment variable; the default keeps the old owner.
-OWNER_IDS = [int(x) for x in re.split(r"[,\s]+", os.environ.get("OWNER_IDS", "5675165124").strip()) if x.strip().lstrip("-").isdigit()]
+# Only positive numbers count: Telegram user IDs are positive, group/channel IDs are negative.
+OWNER_IDS = [int(x) for x in re.split(r"[,\s]+", os.environ.get("OWNER_IDS", "5675165124").strip())
+             if x.isascii() and x.isdigit() and int(x) > 0]
 # =====================================================================
 
 import asyncio
@@ -986,7 +988,7 @@ HELP_SECTIONS = {
         "🤖 Bot Edit",
         "<b>Bot Edit</b>\n\n" + _numbered([
             "/bot: Change the bot's name, username, photo or bio "
-            "(Bot Owner and Super Admins only).",
+            "(Bot Owner only).",
             "/addadmin: Add a Super Admin - reply to a user, or give an ID or @username "
             "(Primary Bot Owner only).",
             "/removeadmin: Remove a Super Admin (Primary Bot Owner only).",
@@ -3873,7 +3875,7 @@ EDIT_ACTIONS = {
 ERR_GROUP_DENIED = (
     "⚠️ Access Denied: You need the 'Change Group Info' admin permission to use this command."
 )
-ERR_BOT_DENIED = "⚠️ Access Denied: Only the Bot Owner or Super Admins can manage bot settings."
+ERR_BOT_DENIED = "⚠️ Access Denied: Only the Bot Owner can manage or edit bot settings."
 ERR_USERNAME_CHARS = (
     "⚠️ Invalid Username: Spaces and special characters are not allowed. "
     "Only letters, numbers, and underscores (_) can be used."
@@ -3918,7 +3920,8 @@ def cancel_keyboard(kind):
 async def edit_perm_error(kind, chat, user_id):
     """Returns an error message if this user may not use the editor, else None."""
     if kind == "bot":
-        if user_id in OWNER_IDS or is_super_admin(user_id):
+        # Bot settings: ONLY the configured Bot Owner (never group roles or Super Admins).
+        if user_id in OWNER_IDS:
             return None
         return ERR_BOT_DENIED if OWNER_IDS else owner_setup_hint(user_id)
     if chat.type == "private":
@@ -4087,6 +4090,11 @@ async def read_image(context, msg, jpeg_only=False):
         return None, "⚠️ I couldn't download that image. Please try again."
 
 
+def _api_error_text(e) -> str:
+    """Short description of a Telegram API error (plain text; shown without HTML parsing)."""
+    return (getattr(e, "message", None) or str(e) or type(e).__name__)[:200]
+
+
 def card(title, detail=""):
     return f"✅ <b>{title}</b>" + (f"\n\n{detail}" if detail else "")
 
@@ -4169,12 +4177,18 @@ async def h_bot_name(update, context, s):
         return False
     try:
         await context.bot.set_my_name(value)
+    except RetryAfter as e:
+        logging.warning("Set bot name rate-limited: %s", e)
+        await msg.reply_text(f"⚠️ Telegram is rate-limiting bot name changes. "
+                             f"Please try again in about {int(e.retry_after)} seconds.")
+        return True
     except TelegramError as e:
         logging.warning("Set bot name failed: %s", e)
-        await msg.reply_text("⚠️ Telegram rejected that name (bot names can only be changed a "
-                             "limited number of times). Please try again later.")
+        await msg.reply_text(f"⚠️ Telegram rejected the name change: {_api_error_text(e)}\n"
+                             "(Telegram also limits how often a bot's name can be changed.)")
         return True
-    set_setting(0, "bot_name", value)  # kept so a restart doesn't revert it
+    # Saved per bot (test bot and main bot may share one database) so a restart can re-apply it.
+    set_setting(0, _bkey("bot_name"), value)
     extra.set_bot_name(value)
     await extra.refresh_identity(context.bot, force=True)
     await msg.reply_html(card("Bot name updated", f"New name: <b>{html.escape(value)}</b>"))
@@ -4203,7 +4217,7 @@ async def h_bot_bio(update, context, s):
 
 async def h_bot_photo(update, context, s):
     msg = update.effective_message
-    data, err = await read_image(context, msg, jpeg_only=False)
+    data, err = await read_image(context, msg, jpeg_only=True)  # Telegram accepts only JPG here
     if err:
         await msg.reply_text(err)
         return False
@@ -4211,11 +4225,24 @@ async def h_bot_photo(update, context, s):
         await msg.reply_text("⚠️ This version of python-telegram-bot can't change a bot's photo. "
                              "Please upgrade it: pip install -U python-telegram-bot")
         return True
+    if not data.startswith(b"\xff\xd8\xff"):  # real JPEG signature; the API only takes .JPG
+        await msg.reply_text("⚠️ That file isn't a valid JPG image. Please send a JPG photo.")
+        return False
     try:
-        await context.bot.set_my_profile_photo(InputProfilePhotoStatic(photo=data))
+        ok = await context.bot.set_my_profile_photo(InputProfilePhotoStatic(photo=data))
+    except RetryAfter as e:
+        logging.warning("Set bot photo rate-limited: %s", e)
+        await msg.reply_text(f"⚠️ Telegram is rate-limiting profile photo changes. "
+                             f"Please try again in about {int(e.retry_after)} seconds.")
+        return True
     except TelegramError as e:
         logging.warning("Set bot photo failed: %s", e)
-        await msg.reply_text("⚠️ Telegram rejected that image. Please try a square JPG photo.")
+        await msg.reply_text(f"⚠️ Telegram rejected the profile photo: {_api_error_text(e)}\n"
+                             "Please try a different square JPG photo.")
+        return True
+    if ok is not True:  # the API returns True on success; never report success otherwise
+        logging.warning("Set bot photo returned %r", ok)
+        await msg.reply_text("⚠️ Telegram did not confirm the profile photo change. Please try again.")
         return True
     await msg.reply_html(card("Bot profile photo updated"))
     return True
@@ -4372,11 +4399,14 @@ async def _startup_sync(app):
     try:
         # Only an owner edit (Bot Edit) may change the Telegram name. The old code pushed the generic
         # BOT_NAME default on every start, undoing a rename done in BotFather.
-        target_name = get_setting(0, "bot_name")
+        target_name = get_setting(0, _bkey("bot_name"))
         if target_name:
-            current = await app.bot.get_my_name()
-            if current.name != target_name:  # name changes are rate-limited, so only when needed
-                await app.bot.set_my_name(target_name)
+            try:
+                current = await app.bot.get_my_name()
+                if current.name != target_name:  # name changes are rate-limited, so only when needed
+                    await app.bot.set_my_name(target_name)
+            except TelegramError as e:
+                logging.warning("Couldn't re-apply the saved bot name: %s", e)
         await extra.refresh_identity(app.bot, force=True)
         await app.bot.set_my_short_description(
             get_setting(0, "bot_short_description")
