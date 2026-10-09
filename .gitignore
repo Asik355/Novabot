@@ -1,0 +1,13 @@
+# Secrets: never upload your bot token
+env
+env.txt
+.env
+bot.env
+bot.env.txt
+
+# Your groups' data (settings, warnings, approved users)
+*.db
+
+# Python junk
+__pycache__/
+*.pyc
