@@ -2282,6 +2282,9 @@ def register_ai(app):
 #      block_ads         "1"/"0"   📢 ads on media (photo/video/file + ad signal)   (not set = ON)
 #      block_promo       "1"/"0"   📣 promotion in text-only messages               (not set = ON)
 #      block_promo_auth  JSON list of authorised promotions  (not set = none authorised)
+#      block_punish      "mute"/"kick"/"ban"/"delete"  what happens to the sender   (not set = mute)
+#      block_punish_secs mute length in seconds                                     (not set = 24 hours)
+#  Admins change the last two with /adpunish. Groups that never use it keep the old 24-hour mute.
 #  Nothing is migrated or overwritten: groups that never touched the menu behave exactly as the
 #  old Auto-Ads blocker did.
 #
@@ -2294,6 +2297,11 @@ AUTOADS_MUTE_SECS = 24 * 60 * 60  # exactly 1 day
 BL_ADS_KEY = "block_ads"
 BL_PROMO_KEY = "block_promo"
 BL_AUTH_KEY = "block_promo_auth"
+BL_PUNISH_KEY = "block_punish"            # "mute" | "kick" | "ban" | "delete"   (not set = mute)
+BL_PUNISH_SECS_KEY = "block_punish_secs"  # mute length in seconds              (not set = AUTOADS_MUTE_SECS)
+BL_PUNISH_ACTIONS = ("mute", "kick", "ban", "delete")
+BL_PUNISH_MIN_SECS = 60
+BL_PUNISH_MAX_SECS = 365 * 24 * 60 * 60
 BL_AUTH_MAX = 30           # authorised promotions per group
 BL_PENDING_SECS = 180      # time an admin has to send the link after tapping ➕ Add Promotion
 
@@ -2812,6 +2820,30 @@ def is_authorized_promotion(chat_id, url):
 
 
 # ------------------------------------------------------------ the guard (one active enforcement path)
+def bl_punishment(chat_id):
+    """(action, mute_secs) for this group. Falls back to the original 24-hour mute on any bad/missing value."""
+    action, secs = "mute", AUTOADS_MUTE_SECS
+    try:
+        a = str(_BD.get_setting(chat_id, BL_PUNISH_KEY, "mute") or "mute").strip().lower()
+        if a in BL_PUNISH_ACTIONS:
+            action = a
+        v = int(_BD.get_setting(chat_id, BL_PUNISH_SECS_KEY, AUTOADS_MUTE_SECS) or AUTOADS_MUTE_SECS)
+        if BL_PUNISH_MIN_SECS <= v <= BL_PUNISH_MAX_SECS:
+            secs = v
+    except Exception:
+        log.exception("Blocking: couldn't read the punishment setting for chat %s; using the default", chat_id)
+    return action, secs
+
+
+def _bl_human(secs):
+    """86400 -> '24 hours', 172800 -> '2 days', 600 -> '10 minutes'."""
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if secs >= size and secs % size == 0 and (unit != "day" or secs >= 2 * 86400):
+            n = secs // size
+            return f"{n} {unit}{'s' if n != 1 else ''}"
+    return f"{secs} seconds"
+
+
 async def ads_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Runs before every other handler (group -3). Deletes the ad, mutes the sender for 24h."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
@@ -2878,7 +2910,8 @@ async def ads_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.info("Blocking: %s detected in chat %s but the sender (%s) is exempt (admin/approved/bot)", kind_name, chat.id, user.id)
         return
     reason = ", ".join(reasons)
-    log.info("Blocking: chat=%s kind=%s action=delete+mute reason=%s", chat.id, kind_name, reason)
+    action, mute_secs = bl_punishment(chat.id)
+    log.info("Blocking: chat=%s kind=%s action=delete+%s reason=%s", chat.id, kind_name, action, reason)
     deleted = False
     try:
         await msg.delete()
@@ -2886,19 +2919,28 @@ async def ads_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError as e:
         log.warning("Auto-ads: couldn't delete in chat %s: %s", chat.id, e)
     muted = False
-    if msg.sender_chat is None and user.id not in (777000, context.bot.id):
+    if action != "delete" and msg.sender_chat is None and user.id not in (777000, context.bot.id):
         try:
-            await chat.restrict_member(user.id, _BD.MUTED, until_date=int(time.time()) + AUTOADS_MUTE_SECS)
+            if action == "mute":
+                await chat.restrict_member(user.id, _BD.MUTED, until_date=int(time.time()) + mute_secs)
+            elif action == "ban":
+                await chat.ban_member(user.id)
+            else:  # kick = remove, but they can rejoin
+                await chat.ban_member(user.id)
+                await chat.unban_member(user.id)
             muted = True
         except TelegramError as e:
-            log.warning("Auto-ads: couldn't mute %s in chat %s: %s", user.id, chat.id, e)
+            log.warning("Auto-ads: couldn't %s %s in chat %s: %s", action, user.id, chat.id, e)
     mention = user.mention_html() if msg.sender_chat is None else html.escape(getattr(msg.sender_chat, "title", None) or "that channel")
     if deleted and muted:
-        text = f"🚫 <b>Ad removed.</b> {mention} is muted for 24 hours. <i>({html.escape(reason)})</i>"
+        done = {"mute": f"is muted for {_bl_human(mute_secs)}", "ban": "is banned", "kick": "was removed from the group"}[action]
+        text = f"🚫 <b>Ad removed.</b> {mention} {done}. <i>({html.escape(reason)})</i>"
+    elif deleted and action == "delete":
+        text = f"🚫 <b>Ad removed.</b> <i>({html.escape(reason)})</i>"
     elif deleted and msg.sender_chat is not None:
         text = f"🚫 <b>Ad removed</b> (posted as {mention}). <i>({html.escape(reason)})</i>"
     elif deleted:
-        text = (f"🚫 <b>Ad removed.</b> I couldn't mute {mention} - "
+        text = (f"🚫 <b>Ad removed.</b> I couldn't {action} {mention} - "
                 "please give me the 'Restrict members' admin right.")
     else:
         if time.time() - _ads_notice.get(chat.id, 0) > 600:
@@ -2910,7 +2952,8 @@ async def ads_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sent:
         _bl_spawn(_bl_delete_later(sent, 60))  # keep the chat clean
     await _BD.log_action(chat, "spam", f"🚫 Auto-ads: deleted a message from {mention} ({html.escape(reason)})"
-                         + (" and muted them for 24h." if muted else "."))
+                         + ({"mute": f" and muted them for {_bl_human(mute_secs)}.", "ban": " and banned them.",
+                             "kick": " and kicked them."}.get(action, ".") if muted else "."))
     raise ApplicationHandlerStop
 
 
@@ -2921,17 +2964,24 @@ BLOCK_CATEGORIES = {
     "ads": ("📢 Ads", BL_ADS_KEY,
             "Handles advertising that comes with an image, video or file: ad links, invite links, "
             "ad wording or referral codes in the caption or link buttons. A normal picture is not "
-            "an ad. Removes it and mutes the sender for 24 hours. Independent of Promotion."),
+            "an ad. Removes it and punishes the sender (24-hour mute unless an admin changed it with /adpunish). Independent of Promotion."),
     "promo": ("📣 Promotion", BL_PROMO_KEY,
               "Handles text-only promotion: promotional wording, referral/coupon codes and promotional "
               "calls-to-action. A normal link (YouTube, Instagram, news...) is never promotion by itself. "
-              "Removes it and mutes the sender for 24 hours. Independent of Ads."),
+              "Removes it and punishes the sender (24-hour mute unless an admin changed it with /adpunish). Independent of Ads."),
 }
 _BL_EXTRA_BUTTONS = {  # extra rows on a category screen
     "promo": [[InlineKeyboardButton("⭐ Authorized Promotions", callback_data="bl:auth")]],
 }
 BL_MENU_TEXT = ("<b>🔒 Blocking</b>\n\n"
-                "Choose what to manage. Settings apply to this group only.")
+                "Choose what to manage. Settings apply to this group only.\n\n"
+                "<b>⚖️ Punishment for ads &amp; promotion</b> (admins)\n"
+                "<code>/adpunish</code> - show the current punishment\n"
+                "<code>/adpunish mute 1h</code> - mute for a time (m, h, d, w)\n"
+                "<code>/adpunish kick</code> - remove the sender (can rejoin)\n"
+                "<code>/adpunish ban</code> - ban the sender\n"
+                "<code>/adpunish delete</code> - only delete the message\n"
+                "<code>/adpunish reset</code> - back to a 24-hour mute")
 
 
 def blocking_menu_button():
@@ -3107,6 +3157,54 @@ async def bl_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raise ApplicationHandlerStop
 
 
+_ADPUNISH_USAGE = ("Usage:\n"
+                   "<code>/adpunish mute 1h</code> - mute for a time (m, h, d, w; 1 minute to 365 days)\n"
+                   "<code>/adpunish kick</code> - remove the sender (they can rejoin)\n"
+                   "<code>/adpunish ban</code> - ban the sender\n"
+                   "<code>/adpunish delete</code> - only delete the message\n"
+                   "<code>/adpunish reset</code> - back to a 24-hour mute")
+
+
+def _adpunish_summary(chat_id):
+    action, secs = bl_punishment(chat_id)
+    return {"mute": f"mute for {_bl_human(secs)}", "kick": "kick", "ban": "ban",
+            "delete": "delete the message only"}[action]
+
+
+async def adpunish_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/adpunish [mute <time>|kick|ban|delete|reset]  - what happens to someone who posts an ad/promotion here."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if msg is None or chat is None or user is None:
+        return
+    if chat.type == "private":
+        await msg.reply_text("Use this command in a group.")
+        return
+    if not await _bl_can_manage(chat, user.id):
+        await msg.reply_text("Only group admins can change the ad/promotion punishment.")
+        return
+    args = [a.lower() for a in (context.args or [])]
+    if not args:
+        await msg.reply_html(f"Current punishment for ads/promotion: <b>{_adpunish_summary(chat.id)}</b>.\n\n" + _ADPUNISH_USAGE)
+        return
+    action = args[0]
+    if action == "reset":
+        _BD.set_setting(chat.id, BL_PUNISH_KEY, "mute")
+        _BD.set_setting(chat.id, BL_PUNISH_SECS_KEY, str(AUTOADS_MUTE_SECS))
+    elif action in BL_PUNISH_ACTIONS:
+        if action == "mute" and len(args) > 1:
+            secs = parse_duration(args[1])
+            if not secs or not BL_PUNISH_MIN_SECS <= secs <= BL_PUNISH_MAX_SECS:
+                await msg.reply_html("That time isn't valid. Use something like <code>30m</code>, <code>2h</code>, "
+                                     "<code>1d</code> or <code>1w</code> (1 minute to 365 days).")
+                return
+            _BD.set_setting(chat.id, BL_PUNISH_SECS_KEY, str(secs))
+        _BD.set_setting(chat.id, BL_PUNISH_KEY, action)
+    else:
+        await msg.reply_html(_ADPUNISH_USAGE)
+        return
+    await msg.reply_html(f"✅ Ads/promotion punishment is now: <b>{_adpunish_summary(chat.id)}</b>.")
+
+
 def register_blocking(app, deps):
     """deps needs: is_admin, lock_exempt, load_allow, url_allowed, log_action, MUTED,
     is_super_admin, owner_ids, get_setting, set_setting."""
@@ -3117,6 +3215,7 @@ def register_blocking(app, deps):
         return
     _bl_registered.add(id(app))
     app.add_handler(CallbackQueryHandler(blocking_callback, pattern=r"^bl:"))
+    app.add_handler(CommandHandler("adpunish", adpunish_command, filters=filters.ChatType.GROUPS))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, bl_pending_input),
                     group=-6)  # -5..-1 are already used by nova.py; PTB runs only one handler per group
     if AUTOADS_ENABLED:
