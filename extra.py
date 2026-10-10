@@ -1694,7 +1694,7 @@ def _is_image(data: bytes) -> bool:
 # =====================================================================
 IMAGE_PROMPT_MAX = 1200
 IMAGE_REF_MAX_BYTES = 7 * 1024 * 1024
-IMAGE_PROVIDERS = ["gemini"]
+IMAGE_PROVIDERS = ["cloudflare"]  # /imagine uses Cloudflare Workers AI (FLUX.1 schnell); Gemini is still used for /ask and /search
 # Gemini 3.1 Flash Image is the single /imagine model.
 # Deliberately do not append older image models or silently fall back to another provider.
 # This keeps /imagine predictable and prevents an old GEMINI image model from being tried.
@@ -1925,6 +1925,70 @@ def _img_gemini(prompt: str, ref=None) -> bytes:
     raise last or ImageProviderError("no usable gemini image model")
 
 
+CLOUDFLARE_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell"
+CLOUDFLARE_PROMPT_MAX = 2048  # model limit for the prompt field
+
+
+def _img_cloudflare(prompt: str) -> bytes:
+    """Generate an image with Cloudflare Workers AI (FLUX.1 schnell). Text-to-image only: no reference photo.
+
+    Response format: JSON {"result": {"image": "<base64 JPEG>"}, "success": true, "errors": [], ...}.
+    Errors carry only a status code (never the token, headers or the account URL).
+    """
+    import base64
+
+    token = (os.environ.get("CLOUDFLARE_API_TOKEN") or "").strip()
+    account = (os.environ.get("CLOUDFLARE_ACCOUNT_ID") or "").strip()
+    if not token:
+        raise ImageProviderError("cloudflare API token not configured")
+    if not account:
+        raise ImageProviderError("cloudflare account id not configured")
+    if requests is None:
+        raise ImageProviderError("requests library not available")
+
+    url = (f"https://api.cloudflare.com/client/v4/accounts/{urllib.parse.quote(account, safe='')}"
+           f"/ai/run/{CLOUDFLARE_IMAGE_MODEL}")
+    try:
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"prompt": prompt[:CLOUDFLARE_PROMPT_MAX]},
+            timeout=IMAGE_TIMEOUT_SECS,
+        )
+    except requests.RequestException as exc:
+        raise ImageProviderError(f"cloudflare network error {type(exc).__name__}")  # no URL in the message
+
+    code = resp.status_code
+    if code in (401, 403):
+        raise ImageProviderError(f"cloudflare API token/permission error (HTTP {code})")
+    if code == 429:
+        raise ImageProviderError("cloudflare rate limit or quota exhausted (HTTP 429)")
+    if code >= 500:
+        raise ImageProviderError(f"cloudflare server error (HTTP {code})")
+    if code != 200:
+        raise ImageProviderError(f"cloudflare HTTP {code}")
+
+    if _is_image(resp.content):  # some Workers AI models answer with the raw image bytes
+        return resp.content
+    try:
+        body = resp.json()
+    except ValueError:
+        raise ImageProviderError("cloudflare returned invalid JSON")
+    if not isinstance(body, dict) or body.get("success") is False:
+        raise ImageProviderError("cloudflare reported failure")
+    result = body.get("result")
+    encoded = result.get("image") if isinstance(result, dict) else None
+    if not encoded or not isinstance(encoded, str):
+        raise ImageProviderError("cloudflare returned no image data")
+    try:
+        data = base64.b64decode(encoded.strip(), validate=True)
+    except (ValueError, TypeError):
+        raise ImageProviderError("cloudflare image data could not be decoded")
+    if not _is_image(data):
+        raise ImageProviderError("cloudflare returned data that is not an image")
+    return data
+
+
 async def _reference_photo(msg, context):
     """(mime, bytes) of the photo the command replies to, or None. Downloaded through the Bot API."""
     src = msg.reply_to_message
@@ -1966,20 +2030,25 @@ async def image_engine(update: Update, context: ContextTypes.DEFAULT_TYPE, raw: 
         log.warning("Reference photo unusable: %s", type(exc).__name__)
         await msg.reply_text("I couldn't use that reference photo (it must be a JPEG, PNG or WebP image under 7 MB).")
         return
+    if ref:  # FLUX.1 schnell is text-to-image only; never silently ignore the photo
+        await msg.reply_text("Reference photos aren't supported by the current image generator, so I can't use that photo. "
+                             "Send /imagine with just a text description instead.")
+        return
     spec = parse_image_request(request)
-    has_key = bool((os.environ.get("GEMINI_API_KEY") or "").strip())
-    # Gemini is the only /imagine provider. Ignore any old provider setting.
-    chain = ["gemini"] if has_key else []
-    _log_engine("IMAGE", providers=",".join(chain), reference=bool(ref), named=spec.named, chars=len(request))
+    cf_token = bool((os.environ.get("CLOUDFLARE_API_TOKEN") or "").strip())
+    cf_account = bool((os.environ.get("CLOUDFLARE_ACCOUNT_ID") or "").strip())
+    # Cloudflare Workers AI is the only /imagine provider. Ignore any old provider setting.
+    chain = ["cloudflare"] if (cf_token and cf_account) else []
+    _log_engine("IMAGE", providers=",".join(chain), reference=False, named=spec.named, chars=len(request))
     if not chain:
-        await msg.reply_text("I can't use a reference photo right now: it needs the Gemini image provider, which isn't set up."
-                             if ref else "No image provider is available right now. Please try again later.")
+        log.warning("Cloudflare image provider not configured (token set: %s, account id set: %s)", cf_token, cf_account)
+        await msg.reply_text("Image generation isn't set up right now. Please try again later.")
         return
     last = None
     for name in chain:  # providers are tried in order; each gets the COMPLETE request
         try:
-            prompt = build_image_prompt(spec, instruct=True, reference=bool(ref))
-            data = await asyncio.wait_for(asyncio.to_thread(_img_gemini, prompt, ref), IMAGE_TIMEOUT_SECS)
+            prompt = build_image_prompt(spec, instruct=False, reference=False)
+            data = await asyncio.wait_for(asyncio.to_thread(_img_cloudflare, prompt), IMAGE_TIMEOUT_SECS)
         except Exception as exc:
             last = exc
             log.warning("Image provider %s failed: %s", name, _error_detail(exc) if isinstance(exc, (RuntimeError, ValueError)) else type(exc).__name__)
@@ -1993,6 +2062,10 @@ async def image_engine(update: Update, context: ContextTypes.DEFAULT_TYPE, raw: 
             await msg.reply_photo(photo=data, caption=(("🎨 " + request)[:900] + note)[:1024])
         except TelegramError:
             log.warning("Telegram error while sending the generated image", exc_info=True)
+            try:
+                await msg.reply_text("I generated the image but couldn't send it to Telegram. Please try again.")
+            except TelegramError:
+                pass
         return
     # (No "send the URL instead" fallback: Telegram would just show the provider's logo page.)
     if ref:
@@ -2003,14 +2076,12 @@ async def image_engine(update: Update, context: ContextTypes.DEFAULT_TYPE, raw: 
     else:
         detail = str(last or "")
         if "429" in detail:
-            message = ("Gemini image generation is currently rate/quota limited (HTTP 429). "
+            message = ("Image generation is currently rate/quota limited (HTTP 429). "
                        "Your /ask and /search quotas can still work separately. Please try again later.")
         elif "401" in detail or "403" in detail:
-            message = "Gemini image generation is not authorized for the current API key (HTTP permission error). Check the Gemini API key and image-model access."
-        elif "404" in detail:
-            message = "Gemini 3.1 Flash Image was not found for this API key/project (HTTP 404)."
+            message = "Image generation is not authorized for the current Cloudflare API token (HTTP permission error). Check the token's Workers AI permission."
         else:
-            message = "Gemini image generation is temporarily unavailable. Please try again in a minute."
+            message = "Image generation is temporarily unavailable. Please try again in a minute."
         await msg.reply_text("I couldn't generate that image right now. " + message)
 
 
