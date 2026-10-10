@@ -2175,19 +2175,19 @@ AI_HELP_LINES = [
 # key -> (button label, detail text, runs instantly when tapped?)
 AI_PAGES = {
     "ask": ("💬 Ask AI",
-            "<b>💬 Ask AI</b>\n\n<code>/ask &lt;question&gt;</code>\n"
+            "<b>💬 Ask AI</b>\n\n/ask &lt;question&gt;\n"
             "Ask anything: quick answers, explanations, ideas. I reply in your language "
             "(English, Hindi or Hinglish).\n\nTip: reply to any of my messages to keep the "
             "conversation going, or reply to someone's message with /ask.", False),
     "imagine": ("🎨 AI Imagine",
-                "<b>🎨 AI Imagine</b>\n\n<code>/imagine &lt;prompt&gt;</code>\n"
+                "<b>🎨 AI Imagine</b>\n\n/imagine &lt;prompt&gt;\n"
                 "Describe a picture and I'll generate it. Reply to a clear photo with /imagine to use it as a reference for the person.\n"
-                "Example: <code>/imagine a cat astronaut on the moon</code>", False),
+                "Example: /imagine a cat astronaut on the moon", False),
     "search": ("🔍 AI Web Search",
-               "<b>🔍 AI Web Search</b>\n\n<code>/search &lt;topic&gt;</code>\n"
+               "<b>🔍 AI Web Search</b>\n\n/search &lt;topic&gt;\n"
                "I look up live information and summarise only results that match your topic, year or date (e.g. <code>IPL result 2023</code>).", False),
     "translate": ("🌐 AI Translate",
-                  "<b>🌐 AI Translate</b>\n\n<code>/translate &lt;text&gt;</code>\n"
+                  "<b>🌐 AI Translate</b>\n\n/translate &lt;text&gt;\n"
                   "Translates your text into both Hindi and English. You can also reply to a "
                   "message with /translate.", False),
     "joke": ("😄 Joke", "<b>😄 Joke</b>\n\n/joke: a random joke.", True),
@@ -2195,7 +2195,7 @@ AI_PAGES = {
     "fact": ("🧠 Fact", "<b>🧠 Fact</b>\n\n/fact: an interesting fact.", True),
     "roll": ("🎲 Roll", "<b>🎲 Roll</b>\n\n/roll: roll a dice (1-6).", True),
     "flip": ("🪙 Flip", "<b>🪙 Flip</b>\n\n/flip: flip a coin (Heads or Tails).", True),
-    "say": ("📢 Say", "<b>📢 Say</b>\n\n<code>/say &lt;text&gt;</code>\nI repeat your text.", False),
+    "say": ("📢 Say", "<b>📢 Say</b>\n\n/say &lt;text&gt;\nI repeat your text.", False),
 }
 _AI_RUNNERS = {
     "joke": "joke_command", "quote": "quote_command", "fact": "fact_command",
@@ -2975,13 +2975,9 @@ _BL_EXTRA_BUTTONS = {  # extra rows on a category screen
 }
 BL_MENU_TEXT = ("<b>🔒 Blocking</b>\n\n"
                 "Choose what to manage. Settings apply to this group only.\n\n"
-                "<b>⚖️ Punishment for ads &amp; promotion</b> (admins)\n"
-                "<code>/adpunish</code> - show the current punishment\n"
-                "<code>/adpunish mute 1h</code> - mute for a time (m, h, d, w)\n"
-                "<code>/adpunish kick</code> - remove the sender (can rejoin)\n"
-                "<code>/adpunish ban</code> - ban the sender\n"
-                "<code>/adpunish delete</code> - only delete the message\n"
-                "<code>/adpunish reset</code> - back to a 24-hour mute")
+                "<b>⚖️ Punishment for ads &amp; promotion</b> (admins)\n\n"
+                "1. /adpunish: Set the punishment for ads and promotion in this group, "
+                "for example /adpunish mute 1h")
 
 
 def blocking_menu_button():
@@ -3158,11 +3154,11 @@ async def bl_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 _ADPUNISH_USAGE = ("Usage:\n"
-                   "<code>/adpunish mute 1h</code> - mute for a time (m, h, d, w; 1 minute to 365 days)\n"
-                   "<code>/adpunish kick</code> - remove the sender (they can rejoin)\n"
-                   "<code>/adpunish ban</code> - ban the sender\n"
-                   "<code>/adpunish delete</code> - only delete the message\n"
-                   "<code>/adpunish reset</code> - back to a 24-hour mute")
+                   "1. /adpunish mute 1h: Mute for a set time (m, h, d, w; 1 minute to 365 days).\n"
+                   "2. /adpunish kick: Remove the sender; they can rejoin.\n"
+                   "3. /adpunish ban: Ban the sender.\n"
+                   "4. /adpunish delete: Only delete the message.\n"
+                   "5. /adpunish reset: Back to a 24-hour mute.")
 
 
 def _adpunish_summary(chat_id):
