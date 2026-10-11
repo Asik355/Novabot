@@ -936,7 +936,7 @@ async def blocking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             toast = "Turned ON." if parts[3] == "1" else "Turned OFF."
             text, markup = _bl_category_screen(chat, parts[2])
         elif action == "n":
-            text, markup = _bl_nsfw_menu_screen()
+            text, markup = _bl_nsfw_menu_screen(chat)
         elif action == "nc" and len(parts) == 3 and parts[2] in NSFW_CATEGORIES:
             text, markup = _bl_nsfw_category_screen(chat, parts[2])
         elif action == "ns" and len(parts) == 4 and parts[2] in NSFW_CATEGORIES and parts[3] in ("0", "1"):
@@ -1427,12 +1427,46 @@ async def nsfw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ------------------------------------------------------------ the 🔞 NSFW menu (same design as Ads Settings)
-def _bl_nsfw_menu_screen():
+def _bl_nsfw_status(chat_id):
+    """Read-only status lines for THIS group only (every read below is keyed by this chat id)."""
+    onoff = lambda flag: "🟢 ON" if flag else "🔴 OFF"  # noqa: E731
+    try:
+        words = _BD.block_words(chat_id)
+        mode = _BD.describe_mode(str(_BD.get_setting(chat_id, "blocklist_mode", "delete")))
+        ads_action, _ads_secs = bl_punishment(chat_id)
+        return ("\n\n<b>📊 This group</b>\n"
+                f"Blocklist: {len(words)} word(s), action: {html.escape(mode)}\n"
+                f"NSFW Word: {onoff(_nsfw_on(chat_id, NSFW_WORD_KEY))} | "
+                f"Content: {onoff(_nsfw_on(chat_id, NSFW_CONTENT_KEY))}\n"
+                f"NSFW action: {html.escape(_nsfw_summary(chat_id))}\n"
+                f"Ads: {onoff(_bl_on(chat_id, BL_ADS_KEY))} | Promotion: {onoff(_bl_on(chat_id, BL_PROMO_KEY))}\n"
+                f"Ads/promotion punishment: {html.escape(_adpunish_summary(chat_id))}"
+                f" (action: {html.escape(ads_action)})")
+    except Exception:
+        log.exception("Blocking: couldn't build the NSFW menu status for chat %s", chat_id)
+        return ""
+
+
+def _bl_nsfw_menu_screen(chat=None):
+    """🔞 NSFW Protection: every Blocklist / NSFW / ads command and switch in one place. Only the buttons
+    and the (read-only) status are new; the commands are the existing ones."""
     text = ("<b>🔞 NSFW Protection</b>\n\n"
             "Choose what to manage. Settings apply to this group only. Word and Content are separate "
-            "switches.\n\n<b>⚖️ Action</b> (admins)\n\n"
-            "1. /nsfw: Show or set the action, for example /nsfw mute 10m")
+            "switches. Every word on the Blocklist is also applied by NSFW Word.\n\n"
+            "<b>🚫 Blocklist</b> (admins)\n\n"
+            "1. /addblocklist word: Auto-delete messages with this word (quotes for phrases, spam* = wildcard).\n"
+            "2. /unblocklist word: Remove a blocklisted word.\n"
+            "3. /blocklist: List all blocklisted words.\n"
+            "4. /blocklistmode: Set the action taken on a blocklist hit.\n\n"
+            "<b>⚖️ Action</b> (admins)\n\n"
+            "5. /nsfw: Show or set the action for NSFW content, for example /nsfw mute 10m\n"
+            "6. /adpunish: Set the punishment for ads and promotion, for example /adpunish mute 1h")
+    if chat is not None:
+        text += _bl_nsfw_status(chat.id)
     rows = [[InlineKeyboardButton(NSFW_CATEGORIES[k][0], callback_data=f"bl:nc:{k}") for k in ("word", "content")],
+            [InlineKeyboardButton(BLOCK_CATEGORIES["promo"][0], callback_data="bl:c:promo"),
+             InlineKeyboardButton(BLOCK_CATEGORIES["ads"][0], callback_data="bl:c:ads")],
+            [InlineKeyboardButton("⭐ Authorized Promotions", callback_data="bl:auth")],
             [InlineKeyboardButton("🔙 Back", callback_data="bl:menu")]]
     return text, InlineKeyboardMarkup(rows)
 
