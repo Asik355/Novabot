@@ -3,7 +3,8 @@ Group moderation bot - a Rose-style Telegram group management bot.
 
 Files:
     nova.py              this file: core bot logic, handlers and the entry point (python nova.py)
-    extra.py             utilities, AI/search helpers, auto-ads + promotion blocker, logging, the Render keep-alive web server
+    extra.py             utilities, AI/search helpers, logging, the Render keep-alive web server
+    blocking.py          everything blocking-related: Blocklist, ads/promotion blocker, NSFW Word + Content, the 🔒 Blocking menu
     fun_systems.py       games and entertainment: roast battles, court
     migrate_to_mongo.py  the MongoDB data layer + the one-time SQLite -> MongoDB import
 
@@ -104,6 +105,7 @@ try:
 except ModuleNotFoundError:  # the file was saved as extras.py: accept it instead of crashing
     import extras as extra
     sys.modules["extra"] = extra
+import blocking  # Blocklist, ads/promotion blocker, NSFW (wired up in main(); never imports this file)
 import fun_systems  # roast + court entertainment (wired up in main())
 import migrate_to_mongo as store  # the MongoDB data layer (the only file that talks to the database)
 from extra import (  # pure helpers (no bot state): see extra.py
@@ -773,7 +775,12 @@ async def report_cmd(update, context):
 
 
 async def log_action(chat, category, text):
-    """Send text to the chat's log channel, if one is set and this category is enabled."""
+    """Record the event in this group's own moderation history (always), then send it to the
+    chat's log channel, if one is set and this category is enabled."""
+    try:  # stored under THIS chat's id only; a storage failure never blocks moderation
+        await asyncio.to_thread(store.modlog_add, chat.id, category, text, int(time.time()))
+    except Exception:
+        logging.exception("Couldn't store the moderation log entry for chat %s", chat.id)
     log_id = get_setting(chat.id, "log_channel")
     if not log_id:
         return
@@ -945,6 +952,7 @@ HELP_SECTIONS = {
             "/log category: Start logging that category (see /logcategories).",
             "/nolog category: Stop logging that category.",
             "/logcategories: List every loggable category and what it covers.",
+            "/modlog [count]: Show this group's latest recorded moderation events (admins, this group only).",
         ]),
     ),
     "reports": (
@@ -1228,7 +1236,7 @@ def help_main_keyboard(chat=None):
         for key in HELP_ORDER
     ]
     buttons.append(extra.ai_menu_button())  # "🤖 AI Commands" (handled by extra.ai_menu_callback)
-    buttons.append(extra.blocking_menu_button())  # "🔒 Blocking" (handled by extra.blocking_callback)
+    buttons.append(blocking.blocking_menu_button())  # "🔒 Blocking" (handled by blocking.blocking_callback)
     rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
     if len(rows) > 1 and len(rows[-1]) == 1:  # never leave a lone button: share the last two rows (2 + 2)
         rows[-1].insert(0, rows[-2].pop())
@@ -1280,7 +1288,7 @@ async def action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "rmwarn":
         rows = active_warns(chat.id, uid)
         if rows:
-            store.warn_delete(rows[-1][0])
+            store.warn_delete(rows[-1][0], chat.id)  # scoped: only this group's warning
             await q.answer("Warning removed.")
             await q.edit_message_text(q.message.text_html + "\n<i>Warning removed.</i>", parse_mode="HTML")
         else:
@@ -1647,7 +1655,7 @@ async def rmwarn(update, context):
     if not rows:
         await msg.reply_html(f"{name} has no warnings.")
         return
-    store.warn_delete(rows[-1][0])
+    store.warn_delete(rows[-1][0], chat.id)  # scoped: only this group's warning
     limit = int(get_setting(chat.id, "warn_limit", 3))
     await msg.reply_html(f"Removed the latest warning from {name} ({len(rows) - 1}/{limit}).")
     await log_action(chat, "warn", f"🗑 {update.effective_user.mention_html()} removed a warning from {name}.")
@@ -2392,56 +2400,6 @@ async def list_filters(update, context):
     await update.effective_message.reply_text(text)
 
 
-async def addblocklist(update, context):
-    if not await admin_only(update):
-        return
-    word, _ = split_keyword(update.effective_message.text.partition(" ")[2])
-    if not word:
-        await update.effective_message.reply_text(
-            'Usage: /addblocklist word  (quotes for phrases, * as wildcard: spam*)'
-        )
-        return
-    store.block_add(update.effective_chat.id, word)
-    await update.effective_message.reply_text(
-        f"'{word}' added to the blocklist "
-        f"(action: {describe_mode(get_setting(update.effective_chat.id, 'blocklist_mode', 'delete'))})."
-    )
-    await log_action(update.effective_chat, "blocklist", f"➕ {update.effective_user.mention_html()} blocklisted '{word}'.")
-
-
-async def unblocklist(update, context):
-    if not await admin_only(update):
-        return
-    word, _ = split_keyword(update.effective_message.text.partition(" ")[2])
-    if not word:
-        await update.effective_message.reply_text("Usage: /unblocklist word")
-        return
-    removed = store.block_remove(update.effective_chat.id, word)
-    await update.effective_message.reply_text(
-        "Removed from the blocklist." if removed else "That word isn't blocklisted."
-    )
-    if removed:
-        await log_action(update.effective_chat, "blocklist", f"➖ {update.effective_user.mention_html()} removed '{word}' from the blocklist.")
-
-
-async def blocklist_cmd(update, context):
-    if not await admin_only(update):
-        return
-    chat_id = update.effective_chat.id
-    mode = get_setting(chat_id, "blocklist_mode", "delete")
-    words = "\n".join(f"- {w}" for w in store.block_words(chat_id)) or "The blocklist is empty."
-    await update.effective_message.reply_text(
-        f"Blocklist action: {describe_mode(mode)}\n\n{words}"
-    )
-
-
-async def blocklistmode(update, context):
-    await _mode_cmd(
-        update, context, "blocklistmode", "blocklist_mode", "delete",
-        ("nothing", "delete", "warn", "mute", "tmute", "kick", "ban"), "Blocklist action",
-    )
-
-
 # ------------------------------------------------------------- log channels
 async def setlog(update, context):
     """Send in the channel itself; the bot must be admin there."""
@@ -2516,6 +2474,43 @@ async def logcategories(update, context):
     )
 
 
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _modlog_line(row):
+    """One stored moderation-log row as a single HTML-safe line (tags removed, entities kept)."""
+    when = time.strftime("%m-%d %H:%M", time.gmtime(row.get("ts") or 0))
+    text = html.unescape(_TAG_RE.sub("", row.get("text") or "")).replace("\n", " ")
+    if len(text) > 220:
+        text = text[:219] + "…"
+    return f"<code>{when}</code> [{html.escape(str(row.get('category') or '?'))}] {html.escape(text)}"
+
+
+async def modlog_cmd(update, context):
+    """/modlog [count]  - the latest moderation events of THIS group (group admins only)."""
+    chat, msg = update.effective_chat, update.effective_message
+    if chat.type == "private":
+        await msg.reply_text("Use /modlog inside the group whose history you want to see.")
+        return
+    if not await admin_only(update):
+        return
+    arg = context.args[0] if context.args else ""
+    count = int(arg) if arg.isdigit() and 1 <= int(arg) <= 50 else 15
+    rows = await asyncio.to_thread(store.modlog_recent, chat.id, count)  # this chat id only
+    if not rows:
+        await msg.reply_text("No moderation events have been recorded in this group yet.")
+        return
+    lines, size = [], 0
+    for r in rows:
+        line = _modlog_line(r)
+        if size + len(line) > 3600:
+            break
+        lines.append(line)
+        size += len(line) + 1
+    await msg.reply_html("<b>Moderation log (this group)</b>\n\n" + "\n".join(lines),
+                         disable_web_page_preview=True)
+
+
 async def check_setlog_forward(update, context):
     """If this group message is the forward that completes a /setlog handshake, wire it up."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
@@ -2529,6 +2524,13 @@ async def check_setlog_forward(update, context):
         return False
     if not await is_admin(chat, user.id):
         await msg.reply_text("Only a group admin can finish setting up the log channel.")
+        return True
+    # Privacy: this group's events will be posted into that channel, so the person linking it must
+    # administer the channel too (otherwise a stranger could pipe a group's log into someone's channel).
+    # Anonymous group admins can't be checked against the channel and keep the old behaviour.
+    if (user.id not in OWNER_IDS and user.id != ANON_ADMIN_ID and not msg.sender_chat
+            and not await is_admin(origin_chat, user.id)):
+        await msg.reply_text("Only an admin of that channel can link it as this group's log channel.")
         return True
     set_setting(chat.id, "log_channel", origin_chat.id)
     store.setlog_del(origin_chat.id)
@@ -3346,18 +3348,8 @@ async def watcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # blocklist (admins are exempt)
-    words = store.block_words(chat.id)
-    hit = next((w for w in words if word_match(w, text)), None)
-    if hit and not await is_admin(chat, user.id) and not is_approved(chat.id, user.id):
-        mode = get_setting(chat.id, "blocklist_mode", "delete")
-        if mode != "nothing":
-            await try_delete(msg)
-            await announce(
-                chat,
-                await enforce(chat, user.id, mention, mode, f"blocklisted word '{hit}'", "blocklist"),
-                user.id,
-            )
+    # blocklist (admins are exempt) - implemented in blocking.py
+    if await blocking.blocklist_guard(chat, msg, user, text):
         return
 
     # #note shortcut
@@ -4534,6 +4526,404 @@ def instrument_handlers(app):
             h.callback = timed(label, cb, always=loud)
 
 
+# ------------------------------------------------------------------ /stats (Bot Owner only)
+# Lists every group the bot is in, with an Open Group, an Inspect and a Remove (leave) button for each.
+# Privacy: this is the ONLY place that shows information about several groups. It works for the Bot Owner
+# (OWNER_IDS) in a PRIVATE chat only - the owner id is re-checked on every command and every button press,
+# and nothing global is ever shown in a group. 🔍 Inspect opens one group's complete settings, Blocklist,
+# NSFW configuration, warnings and moderation log (read-only).
+# The list is kept in the settings store under chat_id 0 (the same place the bot keeps its other
+# bot-wide values) and is updated automatically: when the bot is added/removed (my_chat_member),
+# when a group is migrated to a supergroup, and the first time a message is seen in a group.
+# Every /stats view re-checks each stored group with Telegram and drops the ones the bot has left.
+import json as _stats_json
+
+_STATS_KEY = "stats_groups"   # settings(0, "stats_groups") = JSON {"<chat id>": "<title>"}
+STATS_PAGE_SIZE = 8
+_stats_cache = {}             # chat id (int) -> last stored title, so repeated messages cost nothing
+
+
+def _stats_load():
+    try:
+        data = _stats_json.loads(get_setting(0, _STATS_KEY, "{}") or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logging.exception("stats: couldn't read the group list")
+        return {}
+
+
+def _stats_save(data):
+    set_setting(0, _STATS_KEY, _stats_json.dumps(data, ensure_ascii=False))
+
+
+def _stats_remember(chat_id, title):
+    title = (title or "").strip() or str(chat_id)
+    if _stats_cache.get(chat_id) == title:
+        return
+    try:
+        data = _stats_load()
+        if data.get(str(chat_id)) != title:
+            data[str(chat_id)] = title
+            _stats_save(data)
+        _stats_cache[chat_id] = title
+    except Exception:
+        logging.exception("stats: couldn't record chat %s", chat_id)
+
+
+def _stats_forget(chat_id):
+    _stats_cache.pop(chat_id, None)
+    try:
+        data = _stats_load()
+        if data.pop(str(chat_id), None) is not None:
+            _stats_save(data)
+    except Exception:
+        logging.exception("stats: couldn't remove chat %s", chat_id)
+
+
+async def stats_record(update, context):
+    """group=-30, never blocks: remembers each group the bot sees a message in."""
+    chat = update.effective_chat
+    if chat is not None and chat.type in ("group", "supergroup"):
+        _stats_remember(chat.id, chat.title)
+
+
+async def stats_member_update(update, context):
+    """group=40: the bot was added to / removed from a group."""
+    ev = update.my_chat_member
+    chat = ev.chat
+    if chat.type not in ("group", "supergroup"):
+        return
+    if ev.new_chat_member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+        _stats_forget(chat.id)
+    else:
+        _stats_remember(chat.id, chat.title)
+
+
+async def stats_migrate(update, context):
+    """group=41: a basic group became a supergroup (new chat id): move the entry across."""
+    msg = update.effective_message
+    new_id = msg.migrate_to_chat_id if msg else None
+    if not new_id:
+        return
+    _stats_forget(msg.chat.id)
+    _stats_remember(new_id, msg.chat.title)
+
+
+def _stats_link(info, chat_id):
+    if getattr(info, "username", None):
+        return f"https://t.me/{info.username}"
+    if getattr(info, "invite_link", None):
+        return info.invite_link
+    s = str(chat_id)
+    if s.startswith("-100"):
+        return f"https://t.me/c/{s[4:]}/1"  # opens the group for members (the owner)
+    return None
+
+
+async def _stats_refresh(bot):
+    """Re-check every stored group with Telegram. Returns [(chat_id, title, link)] and drops groups
+    the bot is no longer in. A temporary Telegram/network error keeps the stored entry."""
+    data = _stats_load()
+    sem = asyncio.Semaphore(5)
+
+    async def check(cid_text):
+        cid, title = int(cid_text), data[cid_text]
+        async with sem:
+            try:
+                me = await bot.get_chat_member(cid, bot.id)
+                if me.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+                    return cid, None, None
+                info = await bot.get_chat(cid)
+            except Forbidden:
+                return cid, None, None
+            except BadRequest as e:
+                if "chat not found" in str(e).lower():
+                    return cid, None, None
+                return cid, title, None
+            except TelegramError as e:
+                logging.warning("stats: couldn't check chat %s: %s", cid, e)
+                return cid, title, None
+        return cid, (info.title or title), _stats_link(info, cid)
+
+    results = await asyncio.gather(*(check(k) for k in data))
+    gone = [cid for cid, title, _ in results if title is None]
+    changed = False
+    for cid in gone:
+        _stats_cache.pop(cid, None)
+        data.pop(str(cid), None)
+        changed = True
+    for cid, title, _ in results:
+        if title is not None and data.get(str(cid)) != title:
+            data[str(cid)] = title
+            _stats_cache[cid] = title
+            changed = True
+    if changed:
+        try:
+            _stats_save(data)
+        except Exception:
+            logging.exception("stats: couldn't save the refreshed group list")
+    return [(cid, title, link) for cid, title, link in results if title is not None]
+
+
+async def _stats_render(bot, page):
+    groups = await _stats_refresh(bot)
+    total = len(groups)
+    pages = max(1, -(-total // STATS_PAGE_SIZE))
+    page = min(max(page, 0), pages - 1)
+    chunk = groups[page * STATS_PAGE_SIZE:(page + 1) * STATS_PAGE_SIZE]
+    lines = ["📊 <b>Group Statistics</b>", "", f"Total Groups: {total}"]
+    rows = []
+    for i, (cid, title, link) in enumerate(chunk, page * STATS_PAGE_SIZE + 1):
+        lines += ["", f"{i}. 🏠 {html.escape(title)}", f"🆔 Group ID: <code>{cid}</code>"]
+        open_btn = (InlineKeyboardButton("🔗 Open Group", url=link) if link
+                    else InlineKeyboardButton("🔗 Open Group", callback_data="stats:nolink"))
+        short = title if len(title) <= 20 else title[:19] + "…"
+        rows.append([open_btn,
+                     InlineKeyboardButton(f"🗑 Remove: {short}", callback_data=f"stats:rm:{cid}:{page}")])
+        rows.append([InlineKeyboardButton(f"🔍 Inspect: {short}", callback_data=f"stats:i:{cid}:{page}")])
+    if not total:
+        lines += ["", "No groups yet. A group appears here when I'm added to it or when a message is seen in it."]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"stats:p:{page - 1}"))
+    nav.append(InlineKeyboardButton("🔄 Refresh", callback_data=f"stats:p:{page}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("Next ▶", callback_data=f"stats:p:{page + 1}"))
+    rows.append(nav)
+    if pages > 1:
+        lines += ["", f"Page {page + 1}/{pages}"]
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _owner_may(user) -> bool:
+    """The one Bot Owner check used by every global (multi-group) feature."""
+    return bool(user) and user.id in OWNER_IDS
+
+
+# ---- Owner inspection of ONE group (read-only; every query below uses that group's chat id)
+_INSPECT_BUDGET = 3300   # characters per Telegram page
+_INSPECT_VIEWS = {"s": "⚙️ Settings", "b": "🚫 Blocklist", "l": "📜 Mod log", "w": "⚠️ Warnings"}
+
+
+def _inspect_pages(lines):
+    pages, cur, size = [], [], 0
+    for ln in lines:
+        if cur and size + len(ln) + 1 > _INSPECT_BUDGET:
+            pages.append(cur)
+            cur, size = [], 0
+        cur.append(ln)
+        size += len(ln) + 1
+    if cur:
+        pages.append(cur)
+    return pages or [[]]
+
+
+def _on_off_text(flag) -> str:
+    return "🟢 ON" if flag else "🔴 OFF"
+
+
+def _safe(fn, *a):
+    try:
+        return fn(*a)
+    except Exception:
+        return "?"
+
+
+def _inspect_summary(cid, title):
+    """Complete overview of one group: configuration of every feature plus record counts."""
+    cid = int(cid)
+    gs = lambda key, default=None: store.get_setting(cid, key, default)  # noqa: E731
+
+    def dm(mode):  # a hand-edited / odd stored value must never break the panel
+        try:
+            return html.escape(describe_mode(str(mode)))
+        except Exception:
+            return html.escape(str(mode))
+    lines = [f"🔍 <b>{html.escape(title)}</b>", f"🆔 <code>{cid}</code>", ""]
+    # Blocklist + NSFW (the Blocklist is the shared word source of NSFW Word)
+    try:
+        nsfw_action, nsfw_secs = blocking.nsfw_punishment(cid)
+        ads_action, ads_secs = blocking.bl_punishment(cid)
+        lines += [
+            "<b>🔞 NSFW / Blocking</b>",
+            f"NSFW Word: {_on_off_text(blocking._nsfw_on(cid, blocking.NSFW_WORD_KEY))}"
+            f" | Content: {_on_off_text(blocking._nsfw_on(cid, blocking.NSFW_CONTENT_KEY))}",
+            f"NSFW action: {html.escape(nsfw_action)}"
+            + (f" ({html.escape(extra.fmt_duration(nsfw_secs))})" if nsfw_action == "mute" else ""),
+            f"Ads: {_on_off_text(blocking._bl_on(cid, blocking.BL_ADS_KEY))}"
+            f" | Promotion: {_on_off_text(blocking._bl_on(cid, blocking.BL_PROMO_KEY))}",
+            f"Ad/promo punishment: {html.escape(ads_action)}"
+            + (f" ({html.escape(extra.fmt_duration(ads_secs))})" if ads_action == "mute" else ""),
+        ]
+    except Exception:
+        logging.exception("inspect: NSFW/blocking summary failed for %s", cid)
+        lines.append("<b>🔞 NSFW / Blocking</b>\n(see the Settings page for the raw values)")
+    words = store.block_words(cid)
+    lines += [f"Blocklist: {len(words)} word(s), action: {dm(gs('blocklist_mode', 'delete'))}", ""]
+    # moderation configuration
+    lim = gs("warn_limit", 3)
+    lines += [
+        "<b>🛡 Moderation</b>",
+        f"Warn limit: {html.escape(str(lim))} | action: {dm(gs('warn_mode', 'ban'))}"
+        f" | expiry: {html.escape(str(gs('warn_time', 0)))}s",
+        f"Antiflood: {html.escape(str(gs('flood_limit', FLOOD_LIMIT)))} msgs / "
+        f"{html.escape(str(gs('flood_secs', FLOOD_WINDOW)))}s -> {dm(gs('flood_mode', 'tmute:300'))}",
+        f"Antispam: {gs('antispam', 'False')} -> {dm(gs('spam_mode', 'warn'))}",
+        f"Captcha: {html.escape(_safe(captcha_text, cid))}",
+        f"Log channel: {html.escape(str(gs('log_channel') or 'none'))}"
+        f" | categories: {html.escape(str(gs('log_categories', '') or 'none'))}",
+        "",
+    ]
+    # record counts of every group-specific collection
+    counts = store.chat_overview(cid)
+    shown = ", ".join(f"{k} {v}" for k, v in counts.items() if v)
+    lines += ["<b>🗂 Stored records</b>", html.escape(shown or "nothing stored")]
+    return "\n".join(lines)
+
+
+def _inspect_view_lines(cid, kind):
+    cid = int(cid)
+    if kind == "s":
+        snap = store.settings_snapshot(cid)
+        return [f"<code>{html.escape(k)}</code> = {html.escape(str(v)[:200])}" for k, v in sorted(snap.items())] \
+            or ["No settings stored."]
+    if kind == "b":
+        words = store.block_words(cid)
+        return [f"• {html.escape(w[:120])}" for w in words] or ["The blocklist is empty."]
+    if kind == "l":
+        return [_modlog_line(r) for r in store.modlog_recent(cid, 100)] or ["No moderation events recorded."]
+    if kind == "w":
+        rows = store.warn_recent(cid, 50)
+        return [f"<code>{u}</code> {html.escape(r or 'no reason')} ({time.strftime('%Y-%m-%d', time.gmtime(t or 0))})"
+                for u, r, t in rows] or ["No warnings recorded."]
+    return ["Unknown view."]
+
+
+def _inspect_keyboard(cid, page, kind=None, vpage=0, vpages=1):
+    rows = []
+    if kind is None:
+        rows.append([InlineKeyboardButton(_INSPECT_VIEWS[k], callback_data=f"stats:v:{k}:{cid}:{page}:0")
+                     for k in ("s", "b")])
+        rows.append([InlineKeyboardButton(_INSPECT_VIEWS[k], callback_data=f"stats:v:{k}:{cid}:{page}:0")
+                     for k in ("l", "w")])
+    else:
+        nav = []
+        if vpage > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"stats:v:{kind}:{cid}:{page}:{vpage - 1}"))
+        if vpage < vpages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data=f"stats:v:{kind}:{cid}:{page}:{vpage + 1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([InlineKeyboardButton("🔙 Group overview", callback_data=f"stats:i:{cid}:{page}")])
+    rows.append([InlineKeyboardButton("🏠 Group list", callback_data=f"stats:p:{page}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def stats_cmd(update, context):
+    """/stats: Bot Owner only, and only in a private chat (the list covers every group)."""
+    msg, user = update.effective_message, update.effective_user
+    if not _owner_may(user):
+        await msg.reply_text("⚠️ Access Denied: Only the Bot Owner can use /stats.")
+        return
+    if update.effective_chat.type != "private":
+        await msg.reply_text("🔒 For privacy, /stats only works in a private chat with me.")
+        return
+    text, markup = await _stats_render(context.bot, 0)
+    await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+async def stats_callback(update, context):
+    """Buttons: stats:p:<page>, stats:rm:<chat id>:<page>, stats:nolink,
+    stats:i:<chat id>:<page> (inspect a group), stats:v:<s|b|l|w>:<chat id>:<page>:<view page>."""
+    q = update.callback_query
+    if not _owner_may(q.from_user):  # the Owner id is verified on every single press
+        await q.answer("Only the Bot Owner can use this.", show_alert=True)
+        return
+    if q.message is None or q.message.chat.type != "private":  # never act on / show global data in a group
+        await q.answer("Open /stats in a private chat with me.", show_alert=True)
+        return
+    parts = (q.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    page, toast, alert = 0, None, False
+    try:
+        if action == "nolink":
+            await q.answer("This group has no public link, so I can't open it from here.", show_alert=True)
+            return
+        if action in ("i", "v"):
+            await _stats_inspect(update, context, parts)
+            return
+        if action == "p" and len(parts) == 3:
+            page = int(parts[2])
+        elif action == "rm" and len(parts) == 4:
+            cid, page = int(parts[2]), int(parts[3])
+            if str(cid) in _stats_load():
+                try:
+                    await context.bot.leave_chat(cid)
+                    _stats_forget(cid)
+                    toast = "Left the group."
+                except TelegramError as e:
+                    logging.warning("stats: couldn't leave chat %s: %s", cid, e)
+                    toast, alert = f"Couldn't leave that group: {str(e)[:150]}", True
+            else:
+                toast = "That group is no longer in the list."
+    except ValueError:
+        pass
+    try:
+        await q.answer(toast, show_alert=alert)
+    except TelegramError:
+        pass
+    text, markup = await _stats_render(context.bot, page)
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+    except TelegramError:
+        pass  # unchanged message (e.g. Refresh with no change)
+
+
+async def _stats_inspect(update, context, parts):
+    """stats:i:<cid>:<page> (overview) and stats:v:<kind>:<cid>:<page>:<vpage> (one list)."""
+    q = update.callback_query
+    try:
+        if parts[1] == "i" and len(parts) == 4:
+            kind, cid, page, vpage = None, int(parts[2]), int(parts[3]), 0
+        elif parts[1] == "v" and len(parts) == 6 and parts[2] in _INSPECT_VIEWS:
+            kind, cid, page, vpage = parts[2], int(parts[3]), int(parts[4]), int(parts[5])
+        else:
+            await q.answer("That button isn't valid any more.", show_alert=True)
+            return
+    except ValueError:
+        await q.answer("That button isn't valid any more.", show_alert=True)
+        return
+    known = _stats_load()
+    if str(cid) not in known:
+        await q.answer("That group is no longer in the list.", show_alert=True)
+        return
+    title = known[str(cid)]
+    try:
+        if kind is None:
+            text, markup = await asyncio.to_thread(_inspect_summary, cid, title), _inspect_keyboard(cid, page)
+        else:
+            pages = _inspect_pages(await asyncio.to_thread(_inspect_view_lines, cid, kind))
+            vpage = min(max(vpage, 0), len(pages) - 1)
+            head = f"<b>{_INSPECT_VIEWS[kind]}</b> — {html.escape(title)} (<code>{cid}</code>)"
+            if len(pages) > 1:
+                head += f"\nPage {vpage + 1}/{len(pages)}"
+            text = head + "\n\n" + "\n".join(pages[vpage])
+            markup = _inspect_keyboard(cid, page, kind, vpage, len(pages))
+    except Exception:
+        logging.exception("stats: inspect failed for chat %s", cid)
+        await q.answer("Couldn't read that group's data right now.", show_alert=True)
+        return
+    try:
+        await q.answer()
+    except TelegramError:
+        pass
+    try:
+        await q.edit_message_text(text[:4090], parse_mode="HTML", reply_markup=markup,
+                                  disable_web_page_preview=True)
+    except TelegramError:
+        pass  # unchanged message
+
+
 def main():
     extra.start_web_server()  # Render: open the port first (health check / keep-alive)
     missing = [n for n in ("BOT_TOKEN", "MONGO_URI") if not (os.getenv(n) or "").strip()]
@@ -4582,7 +4972,7 @@ def main():
         "flood": flood, "setflood": setflood, "floodmode": floodmode,
         "antispam": antispam, "spammode": spammode,
         "repeatlimit": repeatlimit, "mentionlimit": mentionlimit,
-        "blocklistmode": blocklistmode, "report": report_cmd, "reports": reports_toggle,
+        "blocklistmode": blocking.blocklistmode, "report": report_cmd, "reports": reports_toggle,
         "groupedit": groupedit_cmd, "bot": bot_cmd, "cancel": cancel_cmd,
         "addadmin": addadmin_cmd, "removeadmin": removeadmin_cmd, "adminlist": adminlist_cmd,
         "disable": disable_cmd, "enable": enable_cmd, "disableable": disableable_cmd,
@@ -4590,7 +4980,7 @@ def main():
         "approve": approve_user, "unapprove": unapprove_user, "approved": approved_list,
         "unapproveall": unapprove_all, "approval": approval_status, "suggestions": suggestions_toggle,
         "setlog": setlog, "unsetlog": unsetlog, "logchannel": logchannel,
-        "log": log_enable, "nolog": log_disable, "logcategories": logcategories,
+        "log": log_enable, "nolog": log_disable, "logcategories": logcategories, "modlog": modlog_cmd,
         "captcha": captcha_cmd, "captchamode": captchamode,
         "captchatime": captchatime, "captchaaction": captchaaction,
         "setwelcome": setwelcome, "welcome": welcome_cmd, "resetwelcome": resetwelcome,
@@ -4604,7 +4994,7 @@ def main():
         "filter": add_filter, "stop": stop_filter, "filters": list_filters,
         "lock": lock, "unlock": unlock, "pin": pin, "purge": purge, "spurge": spurge, "del": del_cmd,
         "purgefrom": purgefrom, "purgeto": purgeto,
-        "addblocklist": addblocklist, "unblocklist": unblocklist, "blocklist": blocklist_cmd,
+        "addblocklist": blocking.addblocklist, "unblocklist": blocking.unblocklist, "blocklist": blocking.blocklist_cmd,
     }
     for name, fn in commands.items():
         if name in DISABLEABLE_COMMANDS:
@@ -4618,11 +5008,16 @@ def main():
     fun_systems.register(app, SimpleNamespace(
         is_admin=is_admin, admin_only=admin_only, lock_exempt=lock_exempt,
         load_allow=load_allow, url_allowed=url_allowed, log_action=log_action, MUTED=MUTED))
-    # auto-ads / promotion blocker + the 🔒 Blocking menu (lives in extra.py; per-group settings in the settings store)
-    extra.register_blocking(app, SimpleNamespace(
-        is_admin=is_admin, lock_exempt=lock_exempt, load_allow=load_allow, url_allowed=url_allowed,
-        log_action=log_action, MUTED=MUTED, is_super_admin=is_super_admin, owner_ids=OWNER_IDS,
-        get_setting=store.get_setting, set_setting=store.set_setting))
+    # everything blocking-related (Blocklist, ads/promotion, NSFW, the 🔒 Blocking menu) lives in blocking.py;
+    # its helpers are handed in here (per-group settings stay in the settings store, the Blocklist in `blocklist`)
+    blocking.register_blocking(app, SimpleNamespace(
+        is_admin=is_admin, is_approved=is_approved, lock_exempt=lock_exempt, load_allow=load_allow,
+        url_allowed=url_allowed, log_action=log_action, MUTED=MUTED, is_super_admin=is_super_admin,
+        owner_ids=OWNER_IDS, get_setting=store.get_setting, set_setting=store.set_setting,
+        block_words=store.block_words, block_add=store.block_add, block_remove=store.block_remove,
+        admin_only=admin_only, describe_mode=describe_mode, mode_cmd=_mode_cmd, enforce=enforce,
+        announce=announce, try_delete=try_delete, split_keyword=split_keyword,
+        parse_duration=parse_duration, norm_url=norm_url, gemini_text=extra.gemini_text))
     app.add_handler(CallbackQueryHandler(captcha_callback, pattern=r"^cap:"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:"))
     app.add_handler(CallbackQueryHandler(edit_callback, pattern=r"^(gedit|bedit):"))
@@ -4654,6 +5049,13 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
     app.add_handler(MessageHandler(~filters.COMMAND & ~filters.StatusUpdate.ALL, watcher))
+    # /stats (Bot Owner only): group list with Open / Remove buttons. Own handler groups (-30, 40, 41)
+    # so none of the existing handlers is replaced or shadowed; none of these ever stops an update.
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CallbackQueryHandler(stats_callback, pattern=r"^stats:"))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, stats_record), group=-30)
+    app.add_handler(ChatMemberHandler(stats_member_update, ChatMemberHandler.MY_CHAT_MEMBER), group=40)
+    app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, stats_migrate), group=41)
     instrument_handlers(app)
     # Set DROP_PENDING_UPDATES=1 to skip the backlog that piled up while the bot was offline
     # (otherwise a restart first replays every old message, which feels like lag).

@@ -16,7 +16,7 @@ Environment:  MONGO_URI (required)   MONGO_DB (optional, default "telegram_bot")
 Collections (same names as the old SQLite tables, so nothing is lost in translation):
   settings, warn_log, notes, filters, blocklist, setlog_pending, super_admins, approved, allowlist,
   captcha_pending, roast_profiles, roast_battles, roast_results, roast_votes, court_cases,
-  court_votes, court_verdicts  (+ counters for auto-increment ids, meta for the migration marker)
+  court_votes, court_verdicts, modlog (new: per-group moderation history)  (+ counters for auto-increment ids, meta for the migration marker)
 
 Speed: the bot reads settings / approvals / allowlist / blocklist / filters / notes / super admins
 on almost every message, so those are cached in memory and the cache is updated on every write
@@ -116,11 +116,13 @@ UNIQUE_INDEXES = {
     "roast_profiles": ["chat_id", "user_id"], "roast_battles": ["id"], "roast_results": ["id"],
     "roast_votes": ["battle_id", "voter_id"], "court_cases": ["id"],
     "court_votes": ["case_id", "voter_id"], "court_verdicts": ["id"],
+    "modlog": ["id"],
 }
 PLAIN_INDEXES = {
     "warn_log": [["chat_id", "user_id"]], "captcha_pending": [["expires"]],
     "roast_battles": [["chat_id"]], "roast_profiles": [["chat_id", "points"]],
     "court_cases": [["chat_id", "case_no"], ["chat_id", "defendant_id"]], "court_verdicts": [["case_id"]],
+    "modlog": [["chat_id", "id"]],
 }
 
 
@@ -420,8 +422,12 @@ def warn_active(chat_id, user_id, expiry=0):
     return [(r["id"], r.get("reason"), r.get("ts")) for r in rows]
 
 
-def warn_delete(warn_id):
-    col("warn_log").delete_one({"id": warn_id})
+def warn_delete(warn_id, chat_id=None):
+    """Delete one warning. Pass chat_id so a warning id can only ever be removed from its own group."""
+    flt = {"id": warn_id}
+    if chat_id is not None:
+        flt["chat_id"] = int(chat_id)
+    col("warn_log").delete_one(flt)
 
 
 def warn_clear(chat_id, user_id):
@@ -543,10 +549,68 @@ def sa_set_username(user_id, username):
             _super_admins()[user_id] = (username, _super_admins()[user_id][1])
 
 
+# ------------------------------------------------------------------ per-group moderation log
+# One row per moderation event, always stored under the chat_id of the group it happened in.
+# (The optional Telegram log channel still works exactly as before; this is the stored history.)
+MODLOG_KEEP = 1000  # newest rows kept per group
+_MODLOG_PRUNE_EVERY = 50
+
+
+def modlog_add(chat_id, category, text, ts):
+    chat_id = int(chat_id)
+    row_id = next_id("modlog")
+    col("modlog").insert_one({"id": row_id, "chat_id": chat_id, "category": str(category),
+                              "text": str(text)[:2000], "ts": int(ts)})
+    if row_id % _MODLOG_PRUNE_EVERY == 0:  # keep the history bounded, one group at a time
+        cutoff = list(col("modlog").find({"chat_id": chat_id}, {"id": 1}, sort=[("id", DESCENDING)],
+                                         skip=MODLOG_KEEP, limit=1))
+        if cutoff:
+            col("modlog").delete_many({"chat_id": chat_id, "id": {"$lte": cutoff[0]["id"]}})
+
+
+def modlog_recent(chat_id, limit=20, category=None):
+    """Newest first: [{id, category, text, ts}] for THIS group only."""
+    flt = {"chat_id": int(chat_id)}
+    if category:
+        flt["category"] = category
+    rows = col("modlog").find(flt, sort=[("id", DESCENDING)], limit=max(1, min(int(limit), 200)))
+    return [{"id": r["id"], "category": r.get("category"), "text": r.get("text", ""), "ts": r.get("ts", 0)}
+            for r in rows]
+
+
+def modlog_count(chat_id):
+    return col("modlog").count_documents({"chat_id": int(chat_id)})
+
+
+# ------------------------------------------------------------------ read-only inspection (Bot Owner panel)
+HIDDEN_SETTING_PREFIXES = ("uname:", "lastname:")  # per-member bookkeeping, not group configuration
+
+
+def settings_snapshot(chat_id):
+    """A copy of one group's settings (member bookkeeping hidden). Never touches another group."""
+    with _lock:
+        return {k: v for k, v in _settings(int(chat_id)).items() if not k.startswith(HIDDEN_SETTING_PREFIXES)}
+
+
+def chat_overview(chat_id):
+    """Row counts of every group-specific collection for ONE group (read-only)."""
+    chat_id = int(chat_id)
+    out = {}
+    for name in CHAT_COLLECTIONS:
+        out[name] = col(name).count_documents({"chat_id": chat_id})
+    return out
+
+
+def warn_recent(chat_id, limit=10):
+    """Newest warnings recorded in ONE group: [(user_id, reason, ts)]."""
+    rows = col("warn_log").find({"chat_id": int(chat_id)}, sort=[("id", DESCENDING)], limit=int(limit))
+    return [(r["user_id"], r.get("reason"), r.get("ts")) for r in rows]
+
+
 # ------------------------------------------------------------------ group -> supergroup migration
 CHAT_COLLECTIONS = ("settings", "warn_log", "notes", "filters", "blocklist", "approved", "allowlist",
                     "captcha_pending", "roast_profiles", "roast_battles", "roast_results", "roast_votes",
-                    "court_cases", "court_votes", "court_verdicts")
+                    "court_cases", "court_votes", "court_verdicts", "modlog")
 
 
 def migrate_chat(old_id, new_id):
