@@ -1484,6 +1484,8 @@ _t_legacy_trial = None     # fun_systems.court_cmd
 _t_MIN_SECS = 30
 _t_MAX_SECS = 24 * 3600
 _t_DEFAULT_SECS = 300
+_t_POINTS = 10           # Trial Points won (INNOCENT) or lost (GUILTY) per finished case
+_t_PTS_PAGE = 5          # ranks per page on the points leaderboard
 _t_CRIME_MAX = 80
 _t_CHARGES_MAX = 120
 _t_PAGE_SIZE = 5
@@ -1600,6 +1602,9 @@ def _t_setup():
     _t_col("trial_templates").create_index("id", unique=True)
     _t_col("trial_seen").create_index([("chat_id", 1), ("user_id", 1)], unique=True)
     _t_col("trial_settings").create_index("chat_id", unique=True)
+    _t_col("trial_scores").create_index([("chat_id", 1), ("user_id", 1)], unique=True)
+    _t_col("trial_scores").create_index([("chat_id", 1), ("score", -1)])
+    _t_col("trial_point_log").create_index("case_no", unique=True)
     # Safety net: the counter can only ever move forward past the highest case already stored.
     top = _t_col("trial_cases").find_one({}, {"case_no": 1}, sort=[("case_no", -1)])
     if top:
@@ -1819,6 +1824,9 @@ def _t_trial_text(c):
     lines += [f"🔴 <b>Guilty Votes:</b> {g}", f"🟢 <b>Innocent Votes:</b> {i}"]
     if status == "completed":
         lines += ["", f"🏛️ <b>Final Verdict:</b> {_t_VERDICT_LABEL.get(c.get('verdict'), c.get('verdict'))}"]
+        pl = _t_points_line(c)
+        if pl:
+            lines.append(pl)
     elif is_open:
         lines += ["", "Cast your vote below. You may change your vote before voting closes."]
     if c.get("edits"):
@@ -1850,6 +1858,9 @@ def _t_details_text(c):
              f"🔴 <b>Guilty Votes:</b> {g}", f"🟢 <b>Innocent Votes:</b> {i}"]
     if c["status"] == "completed":
         lines.append(f"🏛️ <b>Final Verdict:</b> {_t_VERDICT_LABEL.get(c.get('verdict'), c.get('verdict'))}")
+        pl = _t_points_line(c)
+        if pl:
+            lines.append(pl)
     avg, n = _t_rating_stats(c["creator_id"], c["chat_id"])
     if n:
         lines.append(f"⭐ <b>Creator Rating:</b> {_t_rating_line(avg, n)}")
@@ -1877,21 +1888,12 @@ async def _t_finish(bot, case_no):
     verdict = _t_compute_verdict(g, i)
     c = _t_col("trial_cases").find_one_and_update(
         {"case_no": case_no, "status": "closing"},
-        {"$set": {"status": "completed", "verdict": verdict, "guilty": g, "innocent": i, "completed_at": now}},
+        {"$set": {"status": "completed", "verdict": verdict, "guilty": g, "innocent": i, "completed_at": now,
+                  "settle_pending": True}},   # new cases only: points + announcement still to be settled
         return_document=ReturnDocument.AFTER)
     if not c:
         return
-    c.pop("_id", None)
-    if c.get("message_id"):
-        await _t_edit(bot, c["chat_id"], c["message_id"], _t_trial_text(c), _t_trial_kb(c))
-        if c.get("pinned"):
-            try:
-                await bot.unpin_chat_message(c["chat_id"], c["message_id"])
-            except TelegramError:
-                pass
-    sent = await _t_send(bot, c["chat_id"], _t_rating_text(c), _t_rating_kb(c["case_no"]))
-    if sent:
-        _t_col("trial_cases").update_one({"case_no": case_no}, {"$set": {"rating_message_id": sent.message_id}})
+    await _t_settle(bot, case_no)
 
 
 async def _t_sweep_once():
@@ -1900,6 +1902,10 @@ async def _t_sweep_once():
                                     {"$set": {"status": "open"}})   # crashed mid-close: retry
     for d in list(_t_col("trial_cases").find({"status": "open", "deadline": {"$lte": now}}, {"case_no": 1})):
         await _t_finish(bot, d["case_no"])
+    # a crash after the verdict was saved but before points/announcement: settle again (idempotent)
+    for d in list(_t_col("trial_cases").find({"status": "completed", "settle_pending": True,
+                                              "completed_at": {"$lt": now - 10}}, {"case_no": 1})):
+        await _t_settle(bot, d["case_no"])
     for d in list(_t_col("trial_cases").find({"status": "open", "last_refresh": {"$lt": now - _t_REFRESH_EVERY}},
                                            {"case_no": 1})):
         await _t_refresh(bot, d["case_no"])
@@ -2019,6 +2025,7 @@ def _t_menu_view(owner):
         [B("📝 Create Custom Trial", callback_data=p + "new")],
         [B("📁 Trial History", callback_data=p + "hist"), B("🔍 Search a Case", callback_data=p + "find")],
         [B("🏆 Trial Leaderboard", callback_data=p + "lead"), B("⭐ Creator Ratings", callback_data=p + "rate")],
+        [B("🏆 Points Leaderboard", callback_data=p + "pts")],
         [B("⚙️ Trial Settings", callback_data=p + "set"), B("❌ Close Menu", callback_data=p + "close")]]))
 
 
@@ -2099,6 +2106,9 @@ async def _t_h_menu(q, context, p):
         return await _t_edit(bot, chat.id, mid, "🔍 <b>Search a Case</b>\n\nSend a case number, e.g. <code>42</code>.",
                            KB([[B("↩️ Back", callback_data="tr:m:%d:main" % owner),
                                 B("❌ Cancel", callback_data="tr:m:%d:main" % owner)]]))
+    if act == "pts":
+        await _t_ans(q)
+        return await _t_pts_show(bot, chat, mid, owner, 0)
     if act == "lead":
         await _t_ans(q)
         return await _t_lead_show(bot, chat, mid, owner, "c")
@@ -2444,7 +2454,7 @@ async def _t_h_wiz(q, context, p):
         field = {"crc": "crime", "cgc": "charges", "duc": "duration"}[act]
         d["await"], d["ts"] = field, time.time()
         await _t_ans(q)
-        hint = {"crime": f"Send a short description of the crime (max {_t_CRIME_MAX} characters).",
+        hint = {"crime": f"⚖️ <b>Enter a custom crime:</b>\nDescribe the alleged crime in a few words (max {_t_CRIME_MAX} characters). It is a fictional allegation, not proof.",
                 "charges": f"Send the charges (max {_t_CHARGES_MAX} characters).",
                 "duration": f"Send a duration like <code>7</code> (minutes), <code>90s</code>, <code>2h</code> or "
                             f"<code>1h30m</code>. Allowed: {_t_fmt_duration(_t_MIN_SECS)} to {_t_fmt_duration(_t_MAX_SECS)}."}[field]
@@ -2707,7 +2717,7 @@ async def _t_h_edit(q, context, p):
     if act in ("crc", "cgc", "duc"):
         st["await"] = {"crc": "e_crime", "cgc": "e_charges", "duc": "e_dur"}[act]
         await _t_ans(q)
-        hint = {"crc": f"Send the new crime (max {_t_CRIME_MAX} characters).",
+        hint = {"crc": f"⚖️ <b>Enter a custom crime:</b> (max {_t_CRIME_MAX} characters).",
                 "cgc": f"Send the new charges (max {_t_CHARGES_MAX} characters).",
                 "duc": "Send the new duration, e.g. <code>7</code> (minutes), <code>90s</code> or <code>1h30m</code>."}[act]
         return await _t_edit(bot, chat.id, st["mid"], "✍️ " + hint, KB([[
@@ -2813,7 +2823,188 @@ async def _t_on_message(update, context):
 
 
 # ------------------------------------------------------------------ dispatch + registration
-_t_HANDLERS = {"m": _t_h_menu, "w": _t_h_wiz, "t": _t_h_tpl, "h": _t_h_hist, "v": _t_h_vote, "c": _t_h_view, "e": _t_h_edit,
+# ---------------------------------------------------------------- trial points (per group)
+# Score = Trial Points of one Telegram user inside one group (like every other trial ranking).
+# Exactly one transaction per case: the score document remembers the case numbers it already applied
+# (single atomic update), and trial_point_log keeps one audit row per case (unique case_no).
+def _t_points_line(c):
+    pt = c.get("points")
+    if not pt:
+        return None
+    d = pt["delta"]
+    return f"📊 <b>Trial Points:</b> {d:+d} (score: {pt['new']})" if d else f"📊 <b>Trial Points:</b> no change (score: {pt['new']})"
+
+
+def _t_apply_points(c):
+    """Apply the finished case's points once. Safe to call repeatedly. Returns the points dict."""
+    n = c["case_no"]
+    cur = _t_get(n)
+    if cur and cur.get("points"):
+        return cur["points"]
+    logged = _t_col("trial_point_log").find_one({"case_no": n}, {"_id": 0})
+    if logged:
+        pts = {k: logged[k] for k in ("delta", "prev", "new")}
+    else:
+        delta = {"GUILTY": -_t_POINTS, "INNOCENT": _t_POINTS}.get(c.get("verdict"), 0)
+        key = {"chat_id": c["chat_id"], "user_id": c["accused_id"]}
+        try:
+            r = _t_col("trial_scores").find_one_and_update(
+                {**key, "applied_cases": {"$ne": n}},
+                {"$inc": {"score": delta}, "$set": {"name": c["accused_name"]}, "$push": {"applied_cases": n}},
+                upsert=True, return_document=ReturnDocument.AFTER)
+            pts = {"delta": delta, "new": r["score"], "prev": r["score"] - delta}
+        except DuplicateKeyError:   # this case was already applied earlier (record lost in a crash)
+            r = _t_col("trial_scores").find_one(key) or {}
+            pts = {"delta": delta, "new": r.get("score", 0), "prev": None}
+        try:
+            _t_col("trial_point_log").insert_one({"case_no": n, "chat_id": c["chat_id"], "user_id": c["accused_id"],
+                                                  "verdict": c.get("verdict"), **pts, "ts": _t_now()})
+        except DuplicateKeyError:
+            pass
+    _t_col("trial_cases").update_one({"case_no": n}, {"$set": {"points": pts}})
+    return pts
+
+
+def _t_completed_text(c):
+    g, i = c.get("guilty") or 0, c.get("innocent") or 0
+    pt = c.get("points")
+    lines = ["⚖️ <b>TRIAL COMPLETED</b>", "",
+             f"📁 Case #{c['case_no']}",
+             f"👤 Accused: {_t_mention(c['accused_id'], c['accused_name'])}",
+             f"⚖️ Crime: {_t_esc(c['crime'])}",
+             f"🔴 Guilty Votes: {g}", f"🟢 Innocent Votes: {i}", "",
+             f"🏛️ <b>Verdict:</b> {_t_VERDICT_LABEL.get(c.get('verdict'), c.get('verdict'))}", ""]
+    if not pt:
+        lines.append("📊 Points update pending.")
+    else:
+        if c.get("verdict") == "GUILTY":
+            lines += ["⚖️ <b>Punishment:</b>", f"{pt['delta']:+d} Trial Points", ""]
+        elif c.get("verdict") == "INNOCENT":
+            lines += ["🎉 <b>Reward:</b>", f"{pt['delta']:+d} Trial Points", ""]
+        else:
+            lines += ["➖ <b>No points change.</b>", ""]
+        if pt.get("prev") is not None and pt["delta"]:
+            lines.append(f"📊 Previous Score: {pt['prev']}")
+            lines.append(f"{'📉' if pt['delta'] < 0 else '📈'} New Score: {pt['new']}")
+        else:
+            lines.append(f"📊 Score: {pt['new']}")
+        if pt["delta"]:
+            lines += ["", "😈 The accused's Criminal/Saint leaderboard position may change." if pt["delta"] < 0
+                      else "😇 The accused's leaderboard position may change."]
+    lines += ["", "<i>Fictional trial: an allegation is not proof, only the votes decide. "
+                  "Points are virtual.</i>"]
+    return "\n".join(lines)
+
+
+async def _t_settle(bot, case_no):
+    """After the verdict is saved: apply points once, update the message, announce, offer ratings."""
+    c = _t_get(case_no)
+    if not c or c["status"] != "completed":
+        return
+    if not c.get("points"):
+        try:
+            _t_apply_points(c)
+        except Exception:
+            log.exception("couldn't apply points for case %s (will retry)", case_no)
+            return
+        c = _t_get(case_no)
+    # claim the announcement: only one caller continues (settle_pending True -> False)
+    if not _t_col("trial_cases").update_one({"case_no": case_no, "settle_pending": True},
+                                            {"$set": {"settle_pending": False}}).matched_count:
+        return
+    if c.get("message_id"):
+        await _t_edit(bot, c["chat_id"], c["message_id"], _t_trial_text(c), _t_trial_kb(c))
+        if c.get("pinned"):
+            try:
+                await bot.unpin_chat_message(c["chat_id"], c["message_id"])
+            except TelegramError:
+                pass
+    await _t_send(bot, c["chat_id"], _t_completed_text(c))
+    sent = await _t_send(bot, c["chat_id"], _t_rating_text(c), _t_rating_kb(c["case_no"]))
+    if sent:
+        _t_col("trial_cases").update_one({"case_no": case_no}, {"$set": {"rating_message_id": sent.message_id}})
+
+
+def _t_ranked(rows):
+    """[(rank, row)] with standard competition ranking (ties share a rank: 1, 1, 3)."""
+    out, prev, rank = [], None, 0
+    for k, r in enumerate(rows, 1):
+        if r["score"] != prev:
+            rank, prev = k, r["score"]
+        out.append((rank, r))
+    return out
+
+
+def _t_title_holders(rows):
+    """(criminals, saints). None when titles would be meaningless (under 2 players, or everyone tied)."""
+    if len(rows) < 2:
+        return None
+    lo, hi = min(r["score"] for r in rows), max(r["score"] for r in rows)
+    if lo == hi:
+        return None
+    return [r for r in rows if r["score"] == lo], [r for r in rows if r["score"] == hi]
+
+
+def _t_points_view(chat_id, uid, page):
+    rows = list(_t_col("trial_scores").find({"chat_id": chat_id}, {"_id": 0, "applied_cases": 0}))
+    rows.sort(key=lambda r: (-r["score"], r["user_id"]))                 # stable tie order
+    saints = _t_ranked([r for r in rows if r["score"] > 0])
+    crooks = _t_ranked(sorted((r for r in rows if r["score"] < 0), key=lambda r: (r["score"], r["user_id"])))
+    pages = max(1, -(-max(len(saints), len(crooks)) // _t_PTS_PAGE))
+    page = min(max(page, 0), pages - 1)
+    sl = slice(page * _t_PTS_PAGE, (page + 1) * _t_PTS_PAGE)
+    pt = lambda r: f"{r['score']} point{'s' if abs(r['score']) != 1 else ''}"
+    lines = ["🏆 <b>TRIAL POINTS LEADERBOARD</b>", ""]
+    th = _t_title_holders(rows)
+    if th:
+        crim, saint = th
+        lines += [f"😈 Criminal: {_t_esc(r['name'])} ({pt(r)})" for r in crim]
+        lines += [f"😇 Saint: {_t_esc(r['name'])} ({pt(r)})" for r in saint]
+    else:
+        lines.append("<i>Titles appear once at least two players have different scores.</i>")
+    lines += ["", "😇 <b>SAINTS — HIGHEST SCORES</b>", ""]
+    lines += [f"{k}. {_t_esc(r['name'])} — {pt(r)}" for k, r in saints[sl]] or ["No saints yet."]
+    lines += ["", "😈 <b>CRIMINALS — LOWEST SCORES</b>", ""]
+    lines += [f"{k}. {_t_esc(r['name'])} — {pt(r)}" for k, r in crooks[sl]] or ["No criminals yet."]
+    mine = next((r for r in rows if r["user_id"] == uid), None)
+    lines += ["", f"📊 Your score: {mine['score'] if mine else 0}"]
+    if pages > 1:
+        lines.append(f"<i>Page {page + 1}/{pages}</i>")
+    return "\n".join(lines), page, pages
+
+
+async def _t_pts_show(bot, chat, mid, owner, page):
+    text, page, pages = _t_points_view(chat.id, owner, page)
+    nav = []
+    if page > 0:
+        nav.append(B("⬅️ Previous", callback_data=f"tr:p:{owner}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(B("➡️ Next", callback_data=f"tr:p:{owner}:{page + 1}"))
+    rows = ([nav] if nav else []) + [[B("↩️ Back", callback_data=f"tr:m:{owner}:main"),
+                                      B("❌ Close", callback_data=f"tr:m:{owner}:close")]]
+    await _t_edit(bot, chat.id, mid, text, KB(rows))
+
+
+async def _t_h_pts(q, context, p):
+    owner = int(p[2])
+    if q.from_user.id != owner:
+        return await _t_ans(q, "That's someone else's menu. Send /trialpoints for your own.", True)
+    await _t_ans(q)
+    try:
+        page = int(p[3])
+    except (IndexError, ValueError):
+        page = 0
+    await _t_pts_show(context.bot, q.message.chat, q.message.message_id, owner, page)
+
+
+async def _t_trialpoints_cmd(update, context):
+    if not await _t_group_only(update):
+        return
+    sent = await update.effective_message.reply_text("🏆 Loading...")
+    await _t_pts_show(context.bot, update.effective_chat, sent.message_id, update.effective_user.id, 0)
+
+
+_t_HANDLERS = {"p": _t_h_pts, "m": _t_h_menu, "w": _t_h_wiz, "t": _t_h_tpl, "h": _t_h_hist, "v": _t_h_vote, "c": _t_h_view, "e": _t_h_edit,
              "k": _t_h_rate, "l": _t_h_lead, "s": _t_h_settings}
 
 
@@ -2841,7 +3032,7 @@ def _t_register(app, deps, random_trial, legacy_trial):
     _t_D, _t_BOT, _t_random_trial, _t_legacy_trial = deps, app.bot, random_trial, legacy_trial
     _t_setup()
     for name, fn in (("trial", _t_trial_cmd), ("trialhistory", _t_trialhistory_cmd), ("case", _t_case_cmd),
-                     ("trialleaderboard", _t_trialleaderboard_cmd)):
+                     ("trialleaderboard", _t_trialleaderboard_cmd), ("trialpoints", _t_trialpoints_cmd)):
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(_t_on_callback, pattern=r"^tr:"))
     # group=3: tracks active members + reads wizard text input without blocking normal handlers
