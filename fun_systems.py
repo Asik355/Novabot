@@ -23,10 +23,16 @@ import random
 import re
 import threading
 import time
+import unicodedata
 from collections import Counter, defaultdict, deque
 
+from datetime import datetime, timezone
+
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import TelegramError
+from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as KB
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -1153,21 +1159,27 @@ async def court_cmd(update, context):
     if not tgt:
         return
     uid, name, mention = tgt
-    chat, msg, bot = update.effective_chat, update.effective_message, context.bot
+    await _open_random_trial(context.bot, update.effective_chat, update.effective_message.reply_html,
+                             update.effective_user, uid, name, mention)
+
+
+async def _open_random_trial(bot, chat, send, opener, uid, name, mention):
+    """Opens the random comedy trial. `send(text, reply_markup=None)` posts a message.
+    Shared by /court and by the 🎲 Random Trial button in the /trial menu."""
     if _case({"chat_id": chat.id, "defendant_id": uid, "status": "open"}):
-        await msg.reply_html(f"{mention} is already on trial here!")
+        await send(f"{mention} is already on trial here!")
         return
     k = chat.id
     now = int(time.time())
     no = ((_case({"chat_id": k}, sort=[("case_no", -1)]) or {}).get("case_no") or 0) + 1
-    pid, pname = _who(update.effective_user)
+    pid, pname = _who(opener)
     cid = M.next_id("court_cases")
     case = dict.fromkeys(_CASE_COLS)
     case.update(id=cid, chat_id=k, case_no=no, defendant_id=uid, defendant_name=name, opened_by=pid,
                 opened_by_name=pname, charge=_pick(CHARGES, f"{k}:charge"), evidence=_pick(EVIDENCE, f"{k}:evid"),
                 status="open", bail=0, appeals=0, opened=now, closes=now + COURT_OPEN_SECS)
     M.col("court_cases").insert_one(dict(case))
-    sent = await msg.reply_html(_case_text(bot, case), reply_markup=_plea_keyboard(cid))
+    sent = await send(_case_text(bot, case), reply_markup=_plea_keyboard(cid))
     _case_set(cid, message_id=sent.message_id)
     _spawn(_court_timer(bot, k, cid, COURT_OPEN_SECS))
 
@@ -1456,6 +1468,1393 @@ async def appeal_cmd(update, context):
     _spawn(_court_timer(bot, chat.id, case["id"], COURT_OPEN_SECS))
 
 
+# =====================================================================
+# CUSTOM TRIAL SYSTEM (persistent, button-driven). Everything below is prefixed _t_ so it never
+# collides with the random court above. Collections: trial_counters, trial_cases, trial_votes,
+# trial_ratings, trial_templates, trial_seen, trial_settings.
+#   /trial menu, /trialhistory, /case <n>, /trialleaderboard   ("/trial @user" = old random trial)
+# =====================================================================
+_t_log = logging.getLogger("trial_system")
+
+_t_D = None                 # helpers from nova (is_admin) handed in by fun_systems.register
+_t_BOT = None
+_t_random_trial = None     # fun_systems._open_random_trial
+_t_legacy_trial = None     # fun_systems.court_cmd
+
+_t_MIN_SECS = 30
+_t_MAX_SECS = 24 * 3600
+_t_DEFAULT_SECS = 300
+_t_CRIME_MAX = 80
+_t_CHARGES_MAX = 120
+_t_PAGE_SIZE = 5
+_t_TOP_N = 10
+_t_MIN_RATINGS = 3          # Top Rated needs at least this many ratings
+_t_MAX_TEMPLATES = 8
+_t_STATE_TTL = 900          # unfinished wizard/search/edit input expires after 15 min
+_t_REFRESH_EVERY = 30       # open trial messages refresh their countdown this often
+
+_t_CRIMES = {"theft": ("🛒 Theft", "Theft"), "lying": ("🤥 Lying", "Lying"),
+          "betray": ("💔 Betrayal", "Betrayal"), "mischief": ("😈 Mischief", "Mischief"),
+          "rule": ("🚫 Rule Violation", "Rule Violation")}
+_t_CHARGES = {"minor": "Minor Misconduct", "repeat": "Repeated Rule Breaking",
+           "susp": "Suspicious Behaviour", "multi": "Multiple Allegations"}
+_t_DURATIONS = (60, 180, 300, 600)
+_t_ORDER = ("accused", "crime", "charges", "duration")
+_t_VERDICT_LABEL = {"GUILTY": "🔴 GUILTY", "INNOCENT": "🟢 INNOCENT", "TIE": "🟡 TIE", "NO VOTES": "⚪ NO VOTES"}
+
+_t_S = {}              # (chat_id, user_id) -> interaction state (wizard / edit / search)
+_t_seen_written = {}
+_t_member_cache = {}
+_t_cool_log = {}
+_t_sweeper_task = None
+
+
+# ------------------------------------------------------------------ pure helpers
+def _t_now():
+    return int(time.time())
+
+
+def _t_col(name):
+    return M.col(name)
+
+
+def _t_esc(s):
+    return html.escape("" if s is None else str(s))
+
+
+def _t_mention(uid, name):
+    return f'<a href="tg://user?id={uid}">{_t_esc(name or "someone")}</a>'
+
+
+def _t_norm(t):
+    return re.sub(r"\s+", " ", (t or "").strip()).lower()
+
+
+def _t_clean_text(text, limit):
+    """(clean, error). Collapses whitespace, drops control characters, enforces the length limit."""
+    t = "".join(ch for ch in (text or "") if unicodedata.category(ch) != "Cc" or ch in "\n\t ")
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return None, "Please send some text."
+    if len(t) > limit:
+        return None, f"That's too long ({len(t)} characters). The limit is {limit}."
+    return t, None
+
+
+def _t_parse_duration(text):
+    """Seconds from '7', '7m', '90s', '2h', '1h30m', '5 minutes'. Plain numbers are minutes.
+    None when malformed (range is checked separately by valid_duration)."""
+    t = re.sub(r"\s+", "", (text or "").lower())
+    if not t:
+        return None
+    if re.fullmatch(r"\d{1,9}", t):
+        return int(t) * 60
+    m = re.fullmatch(r"(?:(\d{1,9})d(?:ays?)?)?(?:(\d{1,9})h(?:ours?|rs?)?)?"
+                     r"(?:(\d{1,9})m(?:in(?:ute)?s?)?)?(?:(\d{1,9})s(?:ec(?:ond)?s?)?)?", t)
+    if not m or not any(m.groups()):
+        return None
+    d, h, mi, s = (int(x or 0) for x in m.groups())
+    return d * 86400 + h * 3600 + mi * 60 + s
+
+
+def _t_valid_duration(secs):
+    return secs is not None and _t_MIN_SECS <= secs <= _t_MAX_SECS
+
+
+def _t_fmt_duration(secs):
+    secs = int(secs)
+    parts = []
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60), ("second", 1)):
+        n, secs = divmod(secs, size)
+        if n:
+            parts.append(f"{n} {unit}{'s' if n != 1 else ''}")
+    return " ".join(parts) or "0 seconds"
+
+
+def _t_fmt_clock(secs):
+    s = max(0, int(secs))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+
+def _t_compute_verdict(guilty, innocent):
+    if guilty > innocent:
+        return "GUILTY"
+    if innocent > guilty:
+        return "INNOCENT"
+    return "TIE" if guilty else "NO VOTES"
+
+
+def _t_when(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+# ------------------------------------------------------------------ database
+def _t_setup():
+    _t_col("trial_cases").create_index("case_no", unique=True)
+    _t_col("trial_cases").create_index([("chat_id", 1), ("case_no", -1)])
+    _t_col("trial_cases").create_index([("status", 1), ("deadline", 1)])
+    _t_col("trial_votes").create_index([("case_no", 1), ("voter_id", 1)], unique=True)
+    _t_col("trial_ratings").create_index([("case_no", 1), ("rater_id", 1)], unique=True)
+    _t_col("trial_templates").create_index("id", unique=True)
+    _t_col("trial_seen").create_index([("chat_id", 1), ("user_id", 1)], unique=True)
+    _t_col("trial_settings").create_index("chat_id", unique=True)
+    # Safety net: the counter can only ever move forward past the highest case already stored.
+    top = _t_col("trial_cases").find_one({}, {"case_no": 1}, sort=[("case_no", -1)])
+    if top:
+        _t_col("trial_counters").update_one({"_id": "case_no"}, {"$max": {"seq": top["case_no"]}}, upsert=True)
+
+
+def _t_next(name):
+    """Atomic, persistent, never-reused counter (single findOneAndUpdate $inc)."""
+    d = _t_col("trial_counters").find_one_and_update(
+        {"_id": name}, {"$inc": {"seq": 1}}, upsert=True, return_document=ReturnDocument.AFTER)
+    return d["seq"]
+
+
+def _t_get(case_no):
+    return _t_col("trial_cases").find_one({"case_no": case_no}, {"_id": 0})
+
+
+def _t_tally(c):
+    flt = {"case_no": c["case_no"], "epoch": c.get("epoch", 0), "ts": {"$lte": c["deadline"]}}
+    votes = _t_col("trial_votes")
+    return (votes.count_documents({**flt, "vote": "g"}), votes.count_documents({**flt, "vote": "i"}))
+
+
+def _t_counts(c):
+    if c["status"] == "completed":
+        return c.get("guilty") or 0, c.get("innocent") or 0
+    return _t_tally(c)
+
+
+def _t_settings(chat_id):
+    s = _t_col("trial_settings").find_one({"chat_id": chat_id}, {"_id": 0}) or {}
+    return {"default_secs": s.get("default_secs", _t_DEFAULT_SECS), "auto_pin": s.get("auto_pin", True)}
+
+
+def _t_rating_stats(creator_id, chat_id):
+    r = list(_t_col("trial_ratings").aggregate([
+        {"$match": {"creator_id": creator_id, "chat_id": chat_id, "rating": {"$gte": 1, "$lte": 5}}},
+        {"$group": {"_id": None, "avg": {"$avg": "$rating"}, "n": {"$sum": 1}}}]))
+    return (r[0]["avg"], r[0]["n"]) if r else (None, 0)
+
+
+def _t_rating_line(avg, n):
+    return f"{avg:.1f}/5 ({n} rating{'s' if n != 1 else ''})" if n else "No ratings yet"
+
+
+def _t_top_creators(chat_id):
+    return list(_t_col("trial_cases").aggregate([
+        {"$match": {"chat_id": chat_id, "status": {"$ne": "cancelled"}}},
+        {"$sort": {"case_no": 1}},
+        {"$group": {"_id": "$creator_id", "n": {"$sum": 1}, "name": {"$last": "$creator_name"}}},
+        {"$sort": {"n": -1, "_id": 1}}, {"$limit": _t_TOP_N}]))
+
+
+def _t_top_rated(chat_id):
+    rows = list(_t_col("trial_ratings").aggregate([
+        {"$match": {"chat_id": chat_id, "rating": {"$gte": 1, "$lte": 5}}},
+        {"$group": {"_id": "$creator_id", "avg": {"$avg": "$rating"}, "n": {"$sum": 1}}},
+        {"$match": {"n": {"$gte": _t_MIN_RATINGS}}},
+        {"$sort": {"avg": -1, "n": -1, "_id": 1}}, {"$limit": _t_TOP_N}]))
+    for r in rows:
+        last = _t_col("trial_cases").find_one({"chat_id": chat_id, "creator_id": r["_id"]},
+                                            {"creator_name": 1}, sort=[("case_no", -1)])
+        r["name"] = (last or {}).get("creator_name") or "someone"
+    return rows
+
+
+# ------------------------------------------------------------------ telegram helpers
+async def _t_ans(q, text=None, alert=False):
+    try:
+        await q.answer(text, show_alert=alert)
+    except TelegramError:
+        pass
+
+
+async def _t_edit(bot, chat_id, mid, text, kb=None):
+    try:
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=mid, parse_mode="HTML",
+                                    reply_markup=kb, disable_web_page_preview=True)
+        return True
+    except BadRequest as e:
+        if "not modified" in str(e).lower():
+            return True
+        _t_log.warning("edit failed (chat %s msg %s): %s", chat_id, mid, e)
+    except TelegramError as e:
+        _t_log.warning("edit failed (chat %s msg %s): %s", chat_id, mid, e)
+    return False
+
+
+async def _t_send(bot, chat_id, text, kb=None):
+    try:
+        return await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb,
+                                      disable_web_page_preview=True)
+    except TelegramError as e:
+        _t_log.warning("send failed (chat %s): %s", chat_id, e)
+        return None
+
+
+async def _t_member_user(bot, chat_id, uid):
+    """The User if uid currently belongs to the chat, else None (Telegram is the source of truth)."""
+    try:
+        m = await bot.get_chat_member(chat_id, uid)
+    except TelegramError:
+        return None
+    if m.status in ("creator", "administrator", "member") or (
+            m.status == "restricted" and getattr(m, "is_member", False)):
+        return m.user
+    return None
+
+
+async def _t_is_member(bot, chat_id, uid):
+    k = (chat_id, uid)
+    hit = _t_member_cache.get(k)
+    if hit and hit[0] > time.monotonic():
+        return hit[1]
+    u = await _t_member_user(bot, chat_id, uid)
+    ok = u is not None and not u.is_bot
+    if len(_t_member_cache) > 5000:
+        _t_member_cache.clear()
+    _t_member_cache[k] = (time.monotonic() + 60, ok)
+    return ok
+
+
+def _t_cool(chat_id, uid, secs=3):
+    k = (chat_id, uid)
+    t = time.monotonic()
+    if t - _t_cool_log.get(k, 0) < secs:
+        return False
+    if len(_t_cool_log) > 5000:
+        _t_cool_log.clear()
+    _t_cool_log[k] = t
+    return True
+
+
+def _t_note_seen(chat_id, user):
+    if user.is_bot:
+        return
+    k = (chat_id, user.id)
+    t = time.monotonic()
+    if t - _t_seen_written.get(k, 0) < 600:
+        return
+    if len(_t_seen_written) > 20000:
+        _t_seen_written.clear()
+    _t_seen_written[k] = t
+    try:
+        _t_col("trial_seen").update_one(
+            {"chat_id": chat_id, "user_id": user.id},
+            {"$set": {"name": user.full_name or user.first_name or "someone",
+                      "username": (user.username or "").lower(), "ts": _t_now()}}, upsert=True)
+    except Exception:
+        _t_log.exception("couldn't record seen user")
+
+
+def _t_recent_users(chat_id, limit=12):
+    rows = _t_col("trial_seen").find({"chat_id": chat_id}, {"_id": 0}, sort=[("ts", -1)], limit=limit)
+    return [(r["user_id"], r.get("name") or "someone") for r in rows]
+
+
+async def _t_resolve_accused(bot, chat_id, msg):
+    """(user_id, display_name, error). Never trusts a bare ID: Telegram must confirm membership."""
+    uid = None
+    rep = msg.reply_to_message
+    if rep and rep.from_user and not rep.from_user.is_bot:
+        uid = rep.from_user.id
+    if uid is None:
+        for ent in (msg.entities or []):
+            if ent.type == "text_mention" and ent.user:
+                uid = ent.user.id
+                break
+    text = (msg.text or "").strip()
+    if uid is None and text:
+        if re.fullmatch(r"\d{5,15}", text):
+            uid = int(text)
+        else:
+            m = re.fullmatch(r"@?([A-Za-z0-9_]{4,32})", text) or re.search(r"@([A-Za-z0-9_]{4,32})", text)
+            if m:
+                seen = _t_col("trial_seen").find_one({"chat_id": chat_id, "username": m.group(1).lower()})
+                if seen:
+                    uid = seen["user_id"]
+                else:
+                    try:
+                        ch = await bot.get_chat("@" + m.group(1))
+                        if ch.type == "private":
+                            uid = ch.id
+                    except TelegramError:
+                        pass
+    if uid is None:
+        return None, None, ("I couldn't tell who you mean. Reply to one of their messages, tag them, "
+                            "or send their @username (I only know people who have chatted here).")
+    return await _t_validate_accused(bot, chat_id, uid)
+
+
+async def _t_validate_accused(bot, chat_id, uid):
+    if uid == bot.id:
+        return None, None, "I'm the judge, not a defendant. Pick someone else."
+    user = await _t_member_user(bot, chat_id, uid)
+    if user is None:
+        return None, None, "I couldn't confirm that person is a member of this group. Try someone else."
+    if user.is_bot:
+        return None, None, "Bots can't be put on trial. Pick a person."
+    return user.id, user.full_name or user.first_name or "someone", None
+
+
+# ------------------------------------------------------------------ trial message
+def _t_trial_text(c):
+    g, i = _t_counts(c)
+    status = c["status"]
+    is_open = status == "open"
+    lines = ["⚖️ <b>TRIAL COURT — OFFICIAL CASE</b>", "",
+             f"📁 <b>Case Number:</b> #{c['case_no']}", "",
+             f"👤 <b>Accused:</b> {_t_mention(c['accused_id'], c['accused_name'])}",
+             f"🧑‍⚖️ <b>Created By:</b> {_t_mention(c['creator_id'], c['creator_name'])}",
+             f"⚖️ <b>Crime:</b> {_t_esc(c['crime'])}",
+             f"📜 <b>Charges:</b> {_t_esc(c['charges'])}", "",
+             f"🗳️ <b>Voting Status:</b> {'OPEN' if is_open else 'CLOSED'}"]
+    if is_open:
+        lines.append(f"⏱️ <b>Time Remaining:</b> {_t_fmt_clock(c['deadline'] - _t_now())}")
+    lines += [f"🔴 <b>Guilty Votes:</b> {g}", f"🟢 <b>Innocent Votes:</b> {i}"]
+    if status == "completed":
+        lines += ["", f"🏛️ <b>Final Verdict:</b> {_t_VERDICT_LABEL.get(c.get('verdict'), c.get('verdict'))}"]
+    elif is_open:
+        lines += ["", "Cast your vote below. You may change your vote before voting closes."]
+    if c.get("edits"):
+        lines.append("✏️ <i>Edited by the creator.</i>")
+    lines.append("🎭 <i>Fictional group trial, just for fun.</i>")
+    return "\n".join(lines)
+
+
+def _t_trial_kb(c):
+    n = c["case_no"]
+    if c["status"] == "open":
+        return KB([[B("🔴 GUILTY", callback_data=f"tr:v:{n}:g"), B("🟢 INNOCENT", callback_data=f"tr:v:{n}:i")],
+                   [B("📄 View Case", callback_data=f"tr:c:{n}"), B("✏️ Edit Trial", callback_data=f"tr:e:{n}:menu")]])
+    return KB([[B("📄 View Case", callback_data=f"tr:c:{n}")]])
+
+
+def _t_details_text(c):
+    g, i = _t_counts(c)
+    status = {"open": "Voting Open", "closing": "Closing", "completed": "Completed"}.get(c["status"], c["status"])
+    lines = ["⚖️ <b>CASE DETAILS</b>", "",
+             f"📁 <b>Case Number:</b> #{c['case_no']}", "",
+             f"👤 <b>Accused:</b> {_t_mention(c['accused_id'], c['accused_name'])}",
+             f"🧑‍⚖️ <b>Created By:</b> {_t_mention(c['creator_id'], c['creator_name'])}", "",
+             f"📜 <b>Crime:</b> {_t_esc(c['crime'])}",
+             f"⚖️ <b>Charges:</b> {_t_esc(c['charges'])}", "",
+             f"📅 <b>Created:</b> {_t_when(c['created'])}",
+             f"⏱️ <b>Voting Duration:</b> {_t_fmt_duration(c['duration'])}",
+             f"📊 <b>Status:</b> {status}", "",
+             f"🔴 <b>Guilty Votes:</b> {g}", f"🟢 <b>Innocent Votes:</b> {i}"]
+    if c["status"] == "completed":
+        lines.append(f"🏛️ <b>Final Verdict:</b> {_t_VERDICT_LABEL.get(c.get('verdict'), c.get('verdict'))}")
+    avg, n = _t_rating_stats(c["creator_id"], c["chat_id"])
+    if n:
+        lines.append(f"⭐ <b>Creator Rating:</b> {_t_rating_line(avg, n)}")
+    return "\n".join(lines)
+
+
+async def _t_refresh(bot, case_no):
+    c = _t_get(case_no)
+    if not c or not c.get("message_id"):
+        return
+    await _t_edit(bot, c["chat_id"], c["message_id"], _t_trial_text(c), _t_trial_kb(c))
+    _t_col("trial_cases").update_one({"case_no": case_no}, {"$set": {"last_refresh": _t_now()}})
+
+
+# ------------------------------------------------------------------ closing + sweeper
+async def _t_finish(bot, case_no):
+    """Atomically close a due case, store the verdict, update the message, offer ratings."""
+    now = _t_now()
+    claim = _t_col("trial_cases").find_one_and_update(
+        {"case_no": case_no, "status": "open", "deadline": {"$lte": now}},
+        {"$set": {"status": "closing", "closing_at": now}}, return_document=ReturnDocument.AFTER)
+    if not claim:
+        return  # already closed, or the deadline was moved by an edit
+    g, i = _t_tally(claim)
+    verdict = _t_compute_verdict(g, i)
+    c = _t_col("trial_cases").find_one_and_update(
+        {"case_no": case_no, "status": "closing"},
+        {"$set": {"status": "completed", "verdict": verdict, "guilty": g, "innocent": i, "completed_at": now}},
+        return_document=ReturnDocument.AFTER)
+    if not c:
+        return
+    c.pop("_id", None)
+    if c.get("message_id"):
+        await _t_edit(bot, c["chat_id"], c["message_id"], _t_trial_text(c), _t_trial_kb(c))
+        if c.get("pinned"):
+            try:
+                await bot.unpin_chat_message(c["chat_id"], c["message_id"])
+            except TelegramError:
+                pass
+    sent = await _t_send(bot, c["chat_id"], _t_rating_text(c), _t_rating_kb(c["case_no"]))
+    if sent:
+        _t_col("trial_cases").update_one({"case_no": case_no}, {"$set": {"rating_message_id": sent.message_id}})
+
+
+async def _t_sweep_once():
+    bot, now = _t_BOT, _t_now()
+    _t_col("trial_cases").update_many({"status": "closing", "closing_at": {"$lt": now - 60}},
+                                    {"$set": {"status": "open"}})   # crashed mid-close: retry
+    for d in list(_t_col("trial_cases").find({"status": "open", "deadline": {"$lte": now}}, {"case_no": 1})):
+        await _t_finish(bot, d["case_no"])
+    for d in list(_t_col("trial_cases").find({"status": "open", "last_refresh": {"$lt": now - _t_REFRESH_EVERY}},
+                                           {"case_no": 1})):
+        await _t_refresh(bot, d["case_no"])
+        await asyncio.sleep(0.3)
+
+
+async def _t_sweeper():
+    while True:
+        try:
+            await _t_sweep_once()
+        except Exception:
+            _t_log.exception("trial sweeper error")
+        await asyncio.sleep(5)
+
+
+def _t_ensure_sweeper():
+    global _t_sweeper_task
+    if _t_BOT is None or (_t_sweeper_task and not _t_sweeper_task.done()):
+        return
+    try:
+        _t_sweeper_task = asyncio.get_running_loop().create_task(_t_sweeper())
+    except RuntimeError:
+        pass
+
+
+# ------------------------------------------------------------------ ratings
+def _t_rating_text(c):
+    avg, n = _t_rating_stats(c["creator_id"], c["chat_id"])
+    return ("⭐ <b>RATE THE TRIAL CREATOR</b>\n\n"
+            f"Case #{c['case_no']} is over ({_t_VERDICT_LABEL.get(c.get('verdict'), '')}).\n"
+            f"How would you rate {_t_mention(c['creator_id'], c['creator_name'])}?\n\n"
+            f"Creator Rating: {_t_rating_line(avg, n)}\n"
+            "<i>One rating per member. Ratings never change the verdict.</i>")
+
+
+def _t_rating_kb(n):
+    return KB([[B("⭐ 1", callback_data=f"tr:k:{n}:1"), B("⭐⭐ 2", callback_data=f"tr:k:{n}:2"),
+                B("⭐⭐⭐ 3", callback_data=f"tr:k:{n}:3")],
+               [B("⭐⭐⭐⭐ 4", callback_data=f"tr:k:{n}:4"), B("⭐⭐⭐⭐⭐ 5", callback_data=f"tr:k:{n}:5")],
+               [B("❌ Skip", callback_data=f"tr:k:{n}:s")]])
+
+
+async def _t_h_rate(q, context, p):
+    bot, chat, uid = context.bot, q.message.chat, q.from_user.id
+    try:
+        n = int(p[2])
+    except ValueError:
+        return await _t_ans(q)
+    c = _t_get(n)
+    if not c or c["chat_id"] != chat.id:
+        return await _t_ans(q, "Case not found.", True)
+    if p[3] == "s":
+        return await _t_ans(q, "Skipped. Nothing was recorded.")
+    if p[3] not in ("1", "2", "3", "4", "5"):
+        return await _t_ans(q)
+    if c["status"] != "completed":
+        return await _t_ans(q, "You can rate once the trial is over.", True)
+    if uid == c["creator_id"]:
+        return await _t_ans(q, "You can't rate your own trial.", True)
+    if not await _t_is_member(bot, chat.id, uid):
+        return await _t_ans(q, "Only group members can rate.", True)
+    try:
+        _t_col("trial_ratings").insert_one({"case_no": n, "chat_id": chat.id, "rater_id": uid,
+                                          "creator_id": c["creator_id"], "rating": int(p[3]), "ts": _t_now()})
+    except DuplicateKeyError:
+        return await _t_ans(q, "You already rated this case.", True)
+    await _t_ans(q, f"Thanks! You gave {p[3]}⭐")
+    await _t_edit(bot, chat.id, q.message.message_id, _t_rating_text(c), _t_rating_kb(n))
+
+
+# ------------------------------------------------------------------ voting
+async def _t_h_vote(q, context, p):
+    bot, chat, uid = context.bot, q.message.chat, q.from_user.id
+    try:
+        n, choice = int(p[2]), p[3]
+    except (ValueError, IndexError):
+        return await _t_ans(q)
+    if choice not in ("g", "i"):
+        return await _t_ans(q)
+    c = _t_get(n)
+    if not c or c["chat_id"] != chat.id:
+        return await _t_ans(q, "Case not found.", True)
+    if c["status"] != "open" or _t_now() >= c["deadline"]:
+        return await _t_ans(q, "Voting is closed for this case.", True)
+    if not await _t_is_member(bot, chat.id, uid):
+        return await _t_ans(q, "Only members of this group can vote.", True)
+    label = "GUILTY" if choice == "g" else "INNOCENT"
+    old = _t_col("trial_votes").find_one({"case_no": n, "voter_id": uid, "epoch": c.get("epoch", 0)})
+    if old and old["vote"] == choice:
+        return await _t_ans(q, f"Your vote is already {label}.")
+    _t_col("trial_votes").update_one(
+        {"case_no": n, "voter_id": uid},
+        {"$set": {"vote": choice, "ts": _t_now(), "epoch": c.get("epoch", 0), "chat_id": chat.id}}, upsert=True)
+    await _t_ans(q, f"Vote {'changed to' if old else 'recorded:'} {label}")
+    await _t_refresh(bot, n)
+
+
+async def _t_h_view(q, context, p):
+    chat = q.message.chat
+    try:
+        c = _t_get(int(p[2]))
+    except ValueError:
+        return await _t_ans(q)
+    if not c or c["chat_id"] != chat.id:
+        return await _t_ans(q, "Case not found.", True)
+    if not _t_cool(chat.id, q.from_user.id):
+        return await _t_ans(q, "Easy there. Give it a moment.")
+    await _t_ans(q)
+    await _t_send(context.bot, chat.id, _t_details_text(c))
+
+
+# ------------------------------------------------------------------ main menu
+def _t_menu_view(owner):
+    p = f"tr:m:{owner}:"
+    return ("⚖️ <b>TRIAL COURT</b>\n\nWhat would you like to do?", KB([
+        [B("🎲 Random Trial", callback_data=p + "rand")],
+        [B("📝 Create Custom Trial", callback_data=p + "new")],
+        [B("📁 Trial History", callback_data=p + "hist"), B("🔍 Search a Case", callback_data=p + "find")],
+        [B("🏆 Trial Leaderboard", callback_data=p + "lead"), B("⭐ Creator Ratings", callback_data=p + "rate")],
+        [B("⚙️ Trial Settings", callback_data=p + "set"), B("❌ Close Menu", callback_data=p + "close")]]))
+
+
+async def _t_group_only(update):
+    if update.effective_chat.type == "private":
+        await update.effective_message.reply_text("Trials are for groups. Add me to a chat with your friends!")
+        return False
+    return True
+
+
+async def _t_trial_cmd(update, context):
+    msg = update.effective_message
+    if context.args or msg.reply_to_message:
+        return await _t_legacy_trial(update, context)   # old "/trial @user" keeps working
+    if not await _t_group_only(update):
+        return
+    _t_ensure_sweeper()
+    text, kb = _t_menu_view(update.effective_user.id)
+    await msg.reply_html(text, reply_markup=kb)
+
+
+async def _t_show_menu(bot, q, owner):
+    text, kb = _t_menu_view(owner)
+    await _t_edit(bot, q.message.chat.id, q.message.message_id, text, kb)
+
+
+async def _t_h_menu(q, context, p):
+    bot, chat, uid = context.bot, q.message.chat, q.from_user.id
+    owner, act = int(p[2]), p[3]
+    if uid != owner:
+        return await _t_ans(q, "That's someone else's menu. Send /trial to open your own.", True)
+    mid = q.message.message_id
+    if act == "main":
+        _t_S.pop((chat.id, uid), None)
+        await _t_ans(q)
+        return await _t_show_menu(bot, q, owner)
+    if act == "close":
+        _t_S.pop((chat.id, uid), None)
+        await _t_ans(q)
+        try:
+            await q.message.delete()
+        except TelegramError:
+            await _t_edit(bot, chat.id, mid, "Menu closed.")
+        return
+    if act == "new":
+        await _t_ans(q)
+        d = {"kind": "wiz", "chat_id": chat.id, "user_id": uid, "mid": mid, "await": None, "ts": time.time(),
+             "stage": "accused", "from_preview": False, "creator_name": q.from_user.full_name or "someone",
+             "accused_id": None, "accused_name": None, "crime": None, "charges": None, "duration": None}
+        _t_S[(chat.id, uid)] = d
+        return await _t_wz_render(bot, d, "accused")
+    if act == "rand":
+        if not _t_cool(chat.id, uid, 4):
+            return await _t_ans(q, "Easy there. Give it a few seconds.")
+        pool = [(u, n) for u, n in _t_recent_users(chat.id, 30) if u != bot.id]
+        others = [x for x in pool if x[0] != uid]
+        random.shuffle(others)
+        pick = None
+        for u, _n in others[:5] + [x for x in pool if x[0] == uid]:
+            user = await _t_member_user(bot, chat.id, u)
+            if user and not user.is_bot:
+                pick = (user.id, user.full_name or user.first_name or "someone")
+                break
+        if not pick:
+            return await _t_ans(q, "I haven't seen anyone chatting here yet. Use /court @user instead.", True)
+        await _t_ans(q, "🎲 Random trial!")
+
+        async def send(text, reply_markup=None):
+            return await bot.send_message(chat.id, text, parse_mode="HTML", reply_markup=reply_markup)
+        return await _t_random_trial(bot, chat, send, q.from_user, pick[0], pick[1], _t_mention(*pick))
+    if act == "hist":
+        await _t_ans(q)
+        return await _t_hist_show(bot, chat, mid, owner, "x", 0)
+    if act == "find":
+        await _t_ans(q)
+        _t_S[(chat.id, uid)] = {"kind": "search", "await": "s_case", "chat_id": chat.id, "user_id": uid,
+                              "mid": mid, "ts": time.time()}
+        return await _t_edit(bot, chat.id, mid, "🔍 <b>Search a Case</b>\n\nSend a case number, e.g. <code>42</code>.",
+                           KB([[B("↩️ Back", callback_data="tr:m:%d:main" % owner),
+                                B("❌ Cancel", callback_data="tr:m:%d:main" % owner)]]))
+    if act == "lead":
+        await _t_ans(q)
+        return await _t_lead_show(bot, chat, mid, owner, "c")
+    if act == "rate":
+        await _t_ans(q)
+        avg, n = _t_rating_stats(uid, chat.id)
+        text = ("⭐ <b>CREATOR RATINGS</b>\n\n"
+                f"Your rating as a trial creator here:\n<b>{_t_rating_line(avg, n)}</b>")
+        return await _t_edit(bot, chat.id, mid, text, KB([
+            [B("🏆 Top Rated Creators", callback_data=f"tr:l:{owner}:r")],
+            [B("↩️ Back", callback_data=f"tr:m:{owner}:main"), B("❌ Close", callback_data=f"tr:m:{owner}:close")]]))
+    if act == "set":
+        await _t_ans(q)
+        return await _t_settings_show(bot, chat, mid, owner, uid)
+    await _t_ans(q)
+
+
+# ------------------------------------------------------------------ settings
+async def _t_settings_show(bot, chat, mid, owner, uid, note=""):
+    s = _t_settings(chat.id)
+    is_admin = await _t_D.is_admin(chat, uid)
+    text = ("⚙️ <b>TRIAL SETTINGS</b>\n\n"
+            f"⏱️ Default voting duration: <b>{_t_fmt_duration(s['default_secs'])}</b>\n"
+            f"📌 Auto-pin trials: <b>{'ON' if s['auto_pin'] else 'OFF'}</b>\n")
+    rows = []
+    if is_admin:
+        rows.append([B(("✅ " if s["default_secs"] == x else "") + f"{x // 60} min", callback_data=f"tr:s:{owner}:d{x}")
+                     for x in _t_DURATIONS])
+        rows.append([B(f"📌 Auto-pin: {'ON → turn OFF' if s['auto_pin'] else 'OFF → turn ON'}",
+                       callback_data=f"tr:s:{owner}:pin")])
+    else:
+        text += "\n<i>Only group admins can change these.</i>"
+    rows.append([B("↩️ Back", callback_data=f"tr:m:{owner}:main"), B("❌ Close", callback_data=f"tr:m:{owner}:close")])
+    await _t_edit(bot, chat.id, mid, text + (f"\n{note}" if note else ""), KB(rows))
+
+
+async def _t_h_settings(q, context, p):
+    bot, chat, uid = context.bot, q.message.chat, q.from_user.id
+    owner, act = int(p[2]), p[3]
+    if uid != owner:
+        return await _t_ans(q, "That's someone else's menu.", True)
+    if not await _t_D.is_admin(chat, uid):
+        return await _t_ans(q, "Only group admins can change trial settings.", True)
+    if act == "pin":
+        s = _t_settings(chat.id)
+        _t_col("trial_settings").update_one({"chat_id": chat.id}, {"$set": {"auto_pin": not s["auto_pin"]}}, upsert=True)
+    elif act.startswith("d") and act[1:].isdigit() and int(act[1:]) in _t_DURATIONS:
+        _t_col("trial_settings").update_one({"chat_id": chat.id}, {"$set": {"default_secs": int(act[1:])}}, upsert=True)
+    else:
+        return await _t_ans(q)
+    await _t_ans(q, "Saved.")
+    await _t_settings_show(bot, chat, q.message.message_id, owner, uid)
+
+
+# ------------------------------------------------------------------ history / search / case
+def _t_status_label(c):
+    return {"open": "Voting Open", "closing": "Closing", "completed": "Completed"}.get(c["status"], c["status"])
+
+
+def _t_case_lines(c):
+    out = f"<b>Case #{c['case_no']}</b> — {_t_esc(c['crime'])}\nStatus: {_t_status_label(c)}"
+    if c["status"] == "completed":
+        out += f"\nVerdict: {_t_VERDICT_LABEL.get(c.get('verdict'), c.get('verdict'))}"
+    return out
+
+
+def _t_view_row(cases):
+    return [B(f"#{c['case_no']}", callback_data=f"tr:c:{c['case_no']}") for c in cases]
+
+
+async def _t_hist_show(bot, chat, mid, owner, f, page):
+    flt = {"chat_id": chat.id}
+    if f == "a":
+        flt["status"] = {"$in": ["open", "closing"]}
+        title = "🟡 ACTIVE CASES"
+    elif f == "c":
+        flt["status"] = "completed"
+        title = "✅ COMPLETED CASES"
+    else:
+        flt["status"] = {"$ne": "cancelled"}
+        title = "📁 TRIAL HISTORY"
+    total = _t_col("trial_cases").count_documents(flt)
+    pages = max(1, -(-total // _t_PAGE_SIZE))
+    page = min(max(page, 0), pages - 1)
+    cases = list(_t_col("trial_cases").find(flt, {"_id": 0}, sort=[("case_no", -1)],
+                                          skip=page * _t_PAGE_SIZE, limit=_t_PAGE_SIZE))
+    p = f"tr:h:{owner}:"
+    if cases:
+        text = f"<b>{title}</b>  (page {page + 1}/{pages})\n\n" + "\n\n".join(_t_case_lines(c) for c in cases)
+    else:
+        text = f"<b>{title}</b>\n\nNo cases found."
+    rows = []
+    if cases:
+        rows.append(_t_view_row(cases))
+    nav = []
+    if page > 0:
+        nav.append(B("⬅️ Previous", callback_data=f"{p}{f}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(B("➡️ Next", callback_data=f"{p}{f}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([B("🟡 Active Cases", callback_data=f"{p}a:0"), B("✅ Completed Cases", callback_data=f"{p}c:0")])
+    if f != "x":
+        rows.append([B("📁 All Cases", callback_data=f"{p}x:0")])
+    rows.append([B("🔍 Search Case", callback_data=f"{p}sc:0"), B("👤 Search Accused", callback_data=f"{p}sa:0")])
+    rows.append([B("↩️ Back", callback_data=f"tr:m:{owner}:main"), B("❌ Close", callback_data=f"tr:m:{owner}:close")])
+    await _t_edit(bot, chat.id, mid, text, KB(rows))
+
+
+async def _t_h_hist(q, context, p):
+    bot, chat, uid = context.bot, q.message.chat, q.from_user.id
+    owner, f = int(p[2]), p[3]
+    if uid != owner:
+        return await _t_ans(q, "That's someone else's menu. Send /trialhistory for your own.", True)
+    await _t_ans(q)
+    mid = q.message.message_id
+    if f in ("sc", "sa"):
+        what = "a case number, e.g. <code>42</code>" if f == "sc" else "the accused's name (or reply/tag them)"
+        _t_S[(chat.id, uid)] = {"kind": "search", "await": "s_case" if f == "sc" else "s_acc", "chat_id": chat.id,
+                              "user_id": uid, "mid": mid, "ts": time.time()}
+        return await _t_edit(bot, chat.id, mid, f"🔍 Send {what}.", KB([[
+            B("↩️ Back", callback_data=f"tr:h:{owner}:x:0"), B("❌ Cancel", callback_data=f"tr:h:{owner}:x:0")]]))
+    if f not in ("a", "c", "x"):
+        return
+    _t_S.pop((chat.id, uid), None)
+    try:
+        page = int(p[4])
+    except (IndexError, ValueError):
+        page = 0
+    await _t_hist_show(bot, chat, mid, owner, f, page)
+
+
+async def _t_trialhistory_cmd(update, context):
+    if not await _t_group_only(update):
+        return
+    _t_ensure_sweeper()
+    owner = update.effective_user.id
+    sent = await update.effective_message.reply_text("📁 Loading...")
+    await _t_hist_show(context.bot, update.effective_chat, sent.message_id, owner, "x", 0)
+
+
+async def _t_case_cmd(update, context):
+    msg = update.effective_message
+    if not await _t_group_only(update):
+        return
+    arg = (context.args[0] if context.args else "").lstrip("#")
+    if not re.fullmatch(r"\d{1,9}", arg) or int(arg) < 1:
+        return await msg.reply_text("Usage: /case <number>  (for example /case 42)")
+    c = _t_get(int(arg))
+    if not c or c["chat_id"] != update.effective_chat.id:
+        return await msg.reply_text(f"❌ Case Not Found: there is no Case #{int(arg)} in this group.")
+    await msg.reply_html(_t_details_text(c))
+
+
+# ------------------------------------------------------------------ leaderboard
+async def _t_lead_show(bot, chat, mid, owner, which):
+    if which == "c":
+        rows = _t_top_creators(chat.id)
+        text = "🏆 <b>TOP TRIAL CREATORS</b>\n\n" + ("\n".join(
+            f"{k}. {_t_mention(r['_id'], r['name'])} — {r['n']} Trial{'s' if r['n'] != 1 else ''}"
+            for k, r in enumerate(rows, 1)) or "No trials have been created here yet.")
+    else:
+        rows = _t_top_rated(chat.id)
+        text = "⭐ <b>TOP RATED CREATORS</b>\n\n" + ("\n".join(
+            f"{k}. {_t_mention(r['_id'], r['name'])} — {r['avg']:.1f}/5, {r['n']} Ratings"
+            for k, r in enumerate(rows, 1)) or f"No creator has {_t_MIN_RATINGS}+ ratings yet.")
+        text += f"\n\n<i>Creators need at least {_t_MIN_RATINGS} ratings to be listed.</i>"
+    other = ("r", "⭐ Top Rated Creators") if which == "c" else ("c", "🏆 Top Creators")
+    await _t_edit(bot, chat.id, mid, text, KB([
+        [B(other[1], callback_data=f"tr:l:{owner}:{other[0]}")],
+        [B("↩️ Back", callback_data=f"tr:m:{owner}:main"), B("❌ Close", callback_data=f"tr:m:{owner}:close")]]))
+
+
+async def _t_h_lead(q, context, p):
+    owner = int(p[2])
+    if q.from_user.id != owner:
+        return await _t_ans(q, "That's someone else's menu. Send /trialleaderboard for your own.", True)
+    await _t_ans(q)
+    await _t_lead_show(context.bot, q.message.chat, q.message.message_id, owner, "r" if p[3] == "r" else "c")
+
+
+async def _t_trialleaderboard_cmd(update, context):
+    if not await _t_group_only(update):
+        return
+    sent = await update.effective_message.reply_text("🏆 Loading...")
+    await _t_lead_show(context.bot, update.effective_chat, sent.message_id, update.effective_user.id, "c")
+
+
+# ------------------------------------------------------------------ create wizard
+def _t_next_stage(d, cur):
+    if d["from_preview"]:
+        d["from_preview"] = False
+        return "preview"
+    for s in _t_ORDER[_t_ORDER.index(cur) + 1:]:
+        if not d["accused_id" if s == "accused" else s]:
+            return s
+    return "preview"
+
+
+def _t_prev_stage(d, cur):
+    if cur == "preview":
+        return "duration"
+    i = _t_ORDER.index(cur)
+    return _t_ORDER[i - 1] if i else None
+
+
+def _t_bottom(o, stage, d, keep=False):
+    rows = []
+    if keep:
+        rows.append([B("➡️ Keep current", callback_data=f"tr:w:{o}:keep")])
+    rows.append([B("↩️ Back", callback_data=f"tr:w:{o}:back"), B("❌ Cancel", callback_data=f"tr:w:{o}:cancel")])
+    return rows
+
+
+def _t_preview_text(d):
+    return ("⚖️ <b>TRIAL PREVIEW</b>\n\n"
+            f"👤 <b>Accused:</b> {_t_mention(d['accused_id'], d['accused_name'])}\n"
+            f"🧑‍⚖️ <b>Created By:</b> {_t_mention(d['user_id'], d['creator_name'])}\n"
+            f"⚖️ <b>Crime:</b> {_t_esc(d['crime'])}\n"
+            f"📜 <b>Charges:</b> {_t_esc(d['charges'])}\n"
+            f"⏱️ <b>Voting Duration:</b> {_t_fmt_duration(d['duration'])}\n\n"
+            "<i>No case number is used until you press Start Trial.</i>")
+
+
+def _t_wz_view(d, stage, note=""):
+    o = d["user_id"]
+    w = f"tr:w:{o}:"
+    extra = f"\n\n{note}" if note else ""
+    if stage == "accused":
+        rows, row = [], []
+        for uid, name in _t_recent_users(d["chat_id"], 6):
+            if uid == _t_BOT.id:
+                continue
+            row.append(B(name[:22], callback_data=f"{w}ac:{uid}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([B("📂 Use Saved Template", callback_data=f"tr:t:{o}:use")])
+        rows.append([B("🗑️ Delete My Template", callback_data=f"tr:t:{o}:dl")])
+        rows.append([B("↩️ Back", callback_data=f"tr:m:{o}:main"), B("❌ Cancel", callback_data=f"{w}cancel")])
+        if d["accused_id"]:
+            rows.insert(0, [B(f"➡️ Keep: {d['accused_name'][:24]}", callback_data=f"{w}keep")])
+        return ("👤 <b>Who is the accused?</b>  (step 1/4)\n\nReply to one of their messages, tag them, or send "
+                "their @username. Telegram doesn't let bots list every member, so recently active members "
+                "are shown below." + extra), KB(rows)
+    if stage == "crime":
+        rows = [[B(_t_CRIMES["theft"][0], callback_data=f"{w}cr:theft"), B(_t_CRIMES["lying"][0], callback_data=f"{w}cr:lying")],
+                [B(_t_CRIMES["betray"][0], callback_data=f"{w}cr:betray"), B(_t_CRIMES["mischief"][0], callback_data=f"{w}cr:mischief")],
+                [B(_t_CRIMES["rule"][0], callback_data=f"{w}cr:rule"), B("🎭 Other Custom Crime", callback_data=f"{w}crc")]]
+        rows += _t_bottom(o, stage, d, bool(d["crime"]))
+        return ("⚖️ <b>Choose the alleged crime</b>  (step 2/4)\n\nFor fun and fictional trials only." + extra), KB(rows)
+    if stage == "charges":
+        keys = list(_t_CHARGES)
+        rows = [[B(_t_CHARGES[keys[0]], callback_data=f"{w}cg:{keys[0]}"), B(_t_CHARGES[keys[1]], callback_data=f"{w}cg:{keys[1]}")],
+                [B(_t_CHARGES[keys[2]], callback_data=f"{w}cg:{keys[2]}"), B(_t_CHARGES[keys[3]], callback_data=f"{w}cg:{keys[3]}")],
+                [B("✍️ Custom Charges", callback_data=f"{w}cgc")]]
+        rows += _t_bottom(o, stage, d, bool(d["charges"]))
+        return ("📜 <b>What are the charges?</b>  (step 3/4)" + extra), KB(rows)
+    if stage == "duration":
+        default = _t_settings(d["chat_id"])["default_secs"]
+        btns = [B(f"{x // 60} Minute{'s' if x != 60 else ''}" + (" ⭐" if x == default else ""),
+                  callback_data=f"{w}du:{x}") for x in _t_DURATIONS]
+        rows = [btns[:2], btns[2:], [B("✍️ Custom Duration", callback_data=f"{w}duc")]]
+        rows += _t_bottom(o, stage, d, bool(d["duration"]))
+        return ("⏱️ <b>Select the voting duration</b>  (step 4/4)\n\n"
+                f"⭐ = this group's default. Custom range: {_t_fmt_duration(_t_MIN_SECS)} to {_t_fmt_duration(_t_MAX_SECS)}." + extra), KB(rows)
+    rows = [[B("✅ Start Trial", callback_data=f"{w}start")],
+            [B("✏️ Edit Details", callback_data=f"{w}edit"), B("💾 Save as Template", callback_data=f"tr:t:{o}:save")],
+            [B("❌ Cancel", callback_data=f"{w}cancel")]]
+    return _t_preview_text(d) + extra, KB(rows)
+
+
+async def _t_wz_render(bot, d, stage, note=""):
+    d["stage"], d["await"], d["ts"] = stage, ("accused" if stage == "accused" else None), time.time()
+    text, kb = _t_wz_view(d, stage, note)
+    if not await _t_edit(bot, d["chat_id"], d["mid"], text, kb):
+        sent = await _t_send(bot, d["chat_id"], text, kb)
+        if sent:
+            d["mid"] = sent.message_id
+
+
+def _t_wz_state(q):
+    d = _t_S.get((q.message.chat.id, q.from_user.id))
+    if not d or d.get("kind") != "wiz" or d["mid"] != q.message.message_id or time.time() - d["ts"] > _t_STATE_TTL:
+        return None
+    return d
+
+
+async def _t_h_wiz(q, context, p):
+    bot, chat, uid = context.bot, q.message.chat, q.from_user.id
+    if uid != int(p[2]):
+        return await _t_ans(q, "This isn't your trial form. Send /trial to start your own.", True)
+    d = _t_wz_state(q)
+    if not d:
+        await _t_ans(q, "This form expired or was already used. Send /trial to start again.", True)
+        return
+    act = p[3]
+    arg = p[4] if len(p) > 4 else None
+    stage = d["stage"]
+    if act == "cancel":
+        _t_S.pop((chat.id, uid), None)
+        await _t_ans(q, "Cancelled.")
+        return await _t_edit(bot, chat.id, d["mid"], "❌ Trial creation cancelled. No case was created.")
+    if act == "back":
+        await _t_ans(q)
+        if d["from_preview"] or stage == "preview":
+            d["from_preview"] = False
+            return await _t_wz_render(bot, d, "preview" if stage != "preview" else "duration")
+        prev = _t_prev_stage(d, stage)
+        if prev is None:
+            _t_S.pop((chat.id, uid), None)
+            return await _t_show_menu(bot, q, uid)
+        return await _t_wz_render(bot, d, prev)
+    if act == "keep":
+        await _t_ans(q)
+        return await _t_wz_render(bot, d, _t_next_stage(d, stage))
+    if act == "ac":
+        try:
+            target = int(arg)
+        except (TypeError, ValueError):
+            return await _t_ans(q)
+        aid, name, err = await _t_validate_accused(bot, chat.id, target)
+        if err:
+            return await _t_ans(q, err, True)
+        d["accused_id"], d["accused_name"] = aid, name
+        await _t_ans(q)
+        return await _t_wz_render(bot, d, _t_next_stage(d, "accused"))
+    if act == "cr" and arg in _t_CRIMES:
+        d["crime"] = _t_CRIMES[arg][1]
+        await _t_ans(q)
+        return await _t_wz_render(bot, d, _t_next_stage(d, "crime"))
+    if act == "cg" and arg in _t_CHARGES:
+        d["charges"] = _t_CHARGES[arg]
+        await _t_ans(q)
+        return await _t_wz_render(bot, d, _t_next_stage(d, "charges"))
+    if act == "du" and arg and arg.isdigit() and int(arg) in _t_DURATIONS:
+        d["duration"] = int(arg)
+        await _t_ans(q)
+        return await _t_wz_render(bot, d, _t_next_stage(d, "duration"))
+    if act in ("crc", "cgc", "duc"):
+        field = {"crc": "crime", "cgc": "charges", "duc": "duration"}[act]
+        d["await"], d["ts"] = field, time.time()
+        await _t_ans(q)
+        hint = {"crime": f"Send a short description of the crime (max {_t_CRIME_MAX} characters).",
+                "charges": f"Send the charges (max {_t_CHARGES_MAX} characters).",
+                "duration": f"Send a duration like <code>7</code> (minutes), <code>90s</code>, <code>2h</code> or "
+                            f"<code>1h30m</code>. Allowed: {_t_fmt_duration(_t_MIN_SECS)} to {_t_fmt_duration(_t_MAX_SECS)}."}[field]
+        return await _t_edit(bot, chat.id, d["mid"], "✍️ " + hint, KB([[
+            B("↩️ Back", callback_data=f"tr:w:{uid}:redo"), B("❌ Cancel", callback_data=f"tr:w:{uid}:cancel")]]))
+    if act == "redo":
+        await _t_ans(q)
+        return await _t_wz_render(bot, d, stage)
+    if act == "edit":
+        await _t_ans(q)
+        return await _t_edit(bot, chat.id, d["mid"], "✏️ <b>Which detail do you want to change?</b>", KB([
+            [B("👤 Accused", callback_data=f"tr:w:{uid}:ef:accused"), B("⚖️ Crime", callback_data=f"tr:w:{uid}:ef:crime")],
+            [B("📜 Charges", callback_data=f"tr:w:{uid}:ef:charges"), B("⏱️ Duration", callback_data=f"tr:w:{uid}:ef:duration")],
+            [B("↩️ Back", callback_data=f"tr:w:{uid}:pv")]]))
+    if act == "ef" and arg in _t_ORDER:
+        d["from_preview"] = True
+        await _t_ans(q)
+        return await _t_wz_render(bot, d, arg)
+    if act == "pv":
+        await _t_ans(q)
+        return await _t_wz_render(bot, d, "preview")
+    if act == "start":
+        return await _t_start_trial(q, context, d)
+    await _t_ans(q)
+
+
+async def _t_start_trial(q, context, d):
+    bot, chat, uid = context.bot, q.message.chat, q.from_user.id
+    key = (chat.id, uid)
+    if _t_S.get(key) is not d or d["stage"] != "preview":
+        return await _t_ans(q, "Already submitted.", True)
+    if not all((d["accused_id"], d["crime"], d["charges"], d["duration"])):
+        return await _t_ans(q, "Some details are missing.", True)
+    _t_S.pop(key, None)              # synchronous pop: a second tap finds nothing, so no duplicate case
+    aid, aname, err = await _t_validate_accused(bot, chat.id, d["accused_id"])
+    if err:
+        _t_S[key] = d
+        return await _t_ans(q, "The accused is no longer a member here. Pick someone else.", True)
+    await _t_ans(q, "Starting the trial...")
+    now = _t_now()
+    case_no = _t_next("case_no")     # reserved only now: previews/cancels never consume a number
+    c = {"case_no": case_no, "chat_id": chat.id, "creator_id": uid, "creator_name": d["creator_name"],
+         "accused_id": aid, "accused_name": aname, "crime": d["crime"], "charges": d["charges"],
+         "duration": d["duration"], "created": now, "deadline": now + d["duration"], "epoch": 0,
+         "status": "open", "message_id": None, "pinned": False, "edits": [], "last_refresh": now,
+         "verdict": None, "guilty": 0, "innocent": 0, "completed_at": None}
+    _t_col("trial_cases").insert_one(dict(c))
+    sent = await _t_send(bot, chat.id, _t_trial_text(c), _t_trial_kb(c))
+    if not sent:
+        _t_col("trial_cases").update_one({"case_no": case_no}, {"$set": {"status": "cancelled"}})
+        return await _t_edit(bot, chat.id, d["mid"], "⚠️ I couldn't post the trial message. Nothing is running. "
+                           "Check my permissions and try again.")
+    c["message_id"] = sent.message_id
+    pinned = False
+    if _t_settings(chat.id)["auto_pin"]:
+        try:                       # one attempt only; failure never affects the case
+            await bot.pin_chat_message(chat.id, sent.message_id, disable_notification=True)
+            pinned = True
+        except TelegramError as e:
+            _t_log.info("couldn't pin case %s: %s", case_no, e)
+    _t_col("trial_cases").update_one({"case_no": case_no}, {"$set": {"message_id": sent.message_id, "pinned": pinned}})
+    await _t_edit(bot, chat.id, d["mid"], f"✅ Trial started: Case #{case_no}.")
+    _t_ensure_sweeper()
+
+
+# ------------------------------------------------------------------ templates
+def _t_tpl_label(t):
+    secs = t["duration"]
+    return f"{t['crime'][:18]} · " + (f"{secs // 60}m" if secs % 60 == 0 else f"{secs}s")
+
+
+async def _t_h_tpl(q, context, p):
+    bot, chat, uid = context.bot, q.message.chat, q.from_user.id
+    if uid != int(p[2]):
+        return await _t_ans(q, "This isn't your form.", True)
+    d = _t_wz_state(q)
+    if not d:
+        return await _t_ans(q, "This form expired. Send /trial to start again.", True)
+    act = p[3]
+    o = uid
+    back = [B("↩️ Back", callback_data=f"tr:w:{o}:redo")]
+    if act == "save":
+        if not all((d["crime"], d["charges"], d["duration"])):
+            return await _t_ans(q, "Finish the details first.", True)
+        mine = list(_t_col("trial_templates").find({"creator_id": uid}, {"_id": 0}))
+        if any(t["crime"] == d["crime"] and t["charges"] == d["charges"] and t["duration"] == d["duration"] for t in mine):
+            return await _t_ans(q, "You already saved this template.", True)
+        if len(mine) >= _t_MAX_TEMPLATES:
+            return await _t_ans(q, f"You can keep {_t_MAX_TEMPLATES} templates. Delete one first (🗑️ Delete My Template).", True)
+        _t_col("trial_templates").insert_one({"id": _t_next("template_id"), "creator_id": uid, "crime": d["crime"],
+                                            "charges": d["charges"], "duration": d["duration"], "created": _t_now()})
+        return await _t_ans(q, "Template saved.")
+    mine = list(_t_col("trial_templates").find({"creator_id": uid}, {"_id": 0}, sort=[("id", 1)], limit=_t_MAX_TEMPLATES))
+    if act in ("use", "dl"):
+        await _t_ans(q)
+        if not mine:
+            return await _t_edit(bot, chat.id, d["mid"], "📂 You have no saved templates yet.\nSave one from the trial preview.",
+                               KB([back]))
+        verb, title = ("u", "📂 <b>Pick a template</b>\nA template only fills in crime, charges and duration. "
+                              "It always creates a brand-new case.") if act == "use" else \
+                      ("x", "🗑️ <b>Delete one of your templates</b>")
+        rows = [[B(("" if act == "use" else "🗑️ ") + _t_tpl_label(t), callback_data=f"tr:t:{o}:{verb}:{t['id']}")] for t in mine]
+        return await _t_edit(bot, chat.id, d["mid"], title, KB(rows + [back]))
+    if act in ("u", "x") and len(p) > 4 and p[4].isdigit():
+        tid = int(p[4])
+        if act == "u":
+            t = next((t for t in mine if t["id"] == tid), None)
+            if not t:
+                return await _t_ans(q, "Template not found.", True)
+            d["crime"], d["charges"], d["duration"] = t["crime"], t["charges"], t["duration"]
+            await _t_ans(q, "Template loaded.")
+            return await _t_wz_render(bot, d, "accused", "Template loaded. Now pick the accused.")
+        _t_col("trial_templates").delete_one({"id": tid, "creator_id": uid})   # creator-scoped delete
+        await _t_ans(q, "Template deleted.")
+        return await _t_h_tpl(q, context, ["tr", "t", str(o), "dl"])
+    await _t_ans(q)
+
+
+# ------------------------------------------------------------------ editing (creator only)
+def _t_apply_edit(case_no, uid, field, value, new_name=None):
+    """Returns (message, ok). Creator-only, open cases only, optimistic-concurrency update."""
+    c = _t_get(case_no)
+    if not c:
+        return "Case not found.", False
+    if c["creator_id"] != uid:
+        return "Only the person who created this trial can edit it.", False
+    if c["status"] != "open":
+        return "This trial has already ended and can't be edited.", False
+    now, sets, reset, old = _t_now(), {}, False, None
+    if field == "accused":
+        old = c["accused_name"]
+        sets["accused_name"] = new_name
+        if value != c["accused_id"]:
+            sets["accused_id"], reset = value, True
+    elif field in ("crime", "charges"):
+        old = c[field]
+        sets[field] = value
+        reset = _t_norm(value) != _t_norm(old)
+    elif field == "duration":
+        old = c["duration"]
+        sets["duration"], sets["deadline"] = value, now + value   # votes kept, clock restarts
+    else:
+        return "Unknown field.", False
+    if reset:
+        sets.update(epoch=c.get("epoch", 0) + 1, deadline=now + c["duration"])
+    entry = {"ts": now, "field": field, "old": old, "new": new_name if field == "accused" else value, "reset": reset}
+    r = _t_col("trial_cases").update_one(
+        {"case_no": case_no, "creator_id": uid, "status": "open", "epoch": c.get("epoch", 0)},
+        {"$set": sets, "$push": {"edits": entry}})
+    if not r.matched_count:
+        return "The trial changed while you were editing. Please try again.", False
+    if reset:
+        _t_col("trial_votes").delete_many({"case_no": case_no, "epoch": c.get("epoch", 0)})
+    return ("Updated. Votes were reset and the voting clock restarted." if reset else "Updated."), True
+
+
+def _t_edit_menu(n):
+    p = f"tr:e:{n}:"
+    return ("✏️ <b>EDIT TRIAL</b>  (Case #%d)\n\nChoose what to change. Changing the accused, crime or charges "
+            "resets all votes and restarts the voting clock." % n), KB([
+        [B("👤 Edit Accused", callback_data=p + "acc"), B("⚖️ Edit Crime", callback_data=p + "crime")],
+        [B("📜 Edit Charges", callback_data=p + "chg"), B("⏱️ Edit Duration", callback_data=p + "dur")],
+        [B("↩️ Back", callback_data=p + "close"), B("❌ Cancel", callback_data=p + "close")]])
+
+
+def _t_edit_field_view(n, field):
+    p = f"tr:e:{n}:"
+    back = [B("↩️ Back", callback_data=p + "menu2"), B("❌ Cancel", callback_data=p + "close")]
+    if field == "crime":
+        rows = [[B(_t_CRIMES["theft"][0], callback_data=p + "cr:theft"), B(_t_CRIMES["lying"][0], callback_data=p + "cr:lying")],
+                [B(_t_CRIMES["betray"][0], callback_data=p + "cr:betray"), B(_t_CRIMES["mischief"][0], callback_data=p + "cr:mischief")],
+                [B(_t_CRIMES["rule"][0], callback_data=p + "cr:rule"), B("🎭 Custom", callback_data=p + "crc")], back]
+        return "⚖️ <b>New crime?</b>", KB(rows)
+    if field == "charges":
+        k = list(_t_CHARGES)
+        rows = [[B(_t_CHARGES[k[0]], callback_data=p + "cg:" + k[0]), B(_t_CHARGES[k[1]], callback_data=p + "cg:" + k[1])],
+                [B(_t_CHARGES[k[2]], callback_data=p + "cg:" + k[2]), B(_t_CHARGES[k[3]], callback_data=p + "cg:" + k[3])],
+                [B("✍️ Custom Charges", callback_data=p + "cgc")], back]
+        return "📜 <b>New charges?</b>", KB(rows)
+    if field == "duration":
+        btns = [B(f"{x // 60} Minute{'s' if x != 60 else ''}", callback_data=p + f"du:{x}") for x in _t_DURATIONS]
+        return "⏱️ <b>New voting duration?</b>\nThe clock restarts from now; votes are kept.", KB(
+            [btns[:2], btns[2:], [B("✍️ Custom Duration", callback_data=p + "duc")], back])
+    rows, row = [], []
+    for uid, name in _t_recent_users(_t_S_chat_hint.get(n, 0), 6):
+        row.append(B(name[:22], callback_data=p + f"ac:{uid}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return ("👤 <b>New accused?</b>\nReply to one of their messages, tag them, or send their @username."), KB(rows + [back])
+
+
+_t_S_chat_hint = {}   # case_no -> chat_id, only used to list recent members in the accused editor
+
+
+async def _t_after_edit(bot, st, note):
+    await _t_refresh(bot, st["case_no"])
+    text, kb = _t_edit_menu(st["case_no"])
+    st["await"], st["ts"] = None, time.time()
+    await _t_edit(bot, st["chat_id"], st["mid"], f"{note}\n\n{text}", kb)
+
+
+async def _t_h_edit(q, context, p):
+    bot, chat, uid = context.bot, q.message.chat, q.from_user.id
+    try:
+        n = int(p[2])
+    except ValueError:
+        return await _t_ans(q)
+    c = _t_get(n)
+    if not c or c["chat_id"] != chat.id:
+        return await _t_ans(q, "Case not found.", True)
+    if uid != c["creator_id"]:                 # ID comparison only; admins and the bot owner get no bypass
+        return await _t_ans(q, "Only the person who created this trial can edit it.", True)
+    if c["status"] != "open":
+        return await _t_ans(q, "This trial has already ended and can't be edited.", True)
+    act, arg = p[3], (p[4] if len(p) > 4 else None)
+    key = (chat.id, uid)
+    if act == "menu":
+        old = _t_S.get(key)
+        if old and old.get("kind") == "edit" and old["mid"] != q.message.message_id:
+            try:
+                await bot.delete_message(chat.id, old["mid"])
+            except TelegramError:
+                pass
+        _t_S_chat_hint[n] = chat.id
+        text, kb = _t_edit_menu(n)
+        sent = await _t_send(bot, chat.id, text, kb)
+        await _t_ans(q)
+        if sent:
+            _t_S[key] = {"kind": "edit", "case_no": n, "chat_id": chat.id, "user_id": uid, "mid": sent.message_id,
+                       "await": None, "ts": time.time()}
+        return
+    st = _t_S.get(key)
+    if not st or st.get("kind") != "edit" or st["case_no"] != n or st["mid"] != q.message.message_id:
+        await _t_ans(q, "This edit menu expired. Press ✏️ Edit Trial again.", True)
+        return
+    st["ts"] = time.time()
+    if act == "close":
+        _t_S.pop(key, None)
+        await _t_ans(q)
+        try:
+            await q.message.delete()
+        except TelegramError:
+            await _t_edit(bot, chat.id, st["mid"], "Edit menu closed.")
+        return
+    if act == "menu2":
+        st["await"] = None
+        await _t_ans(q)
+        text, kb = _t_edit_menu(n)
+        return await _t_edit(bot, chat.id, st["mid"], text, kb)
+    if act in ("acc", "crime", "chg", "dur"):
+        st["await"] = None
+        await _t_ans(q)
+        text, kb = _t_edit_field_view(n, {"acc": "accused", "chg": "charges", "dur": "duration"}.get(act, act))
+        if act == "acc":
+            st["await"] = "e_acc"
+        return await _t_edit(bot, chat.id, st["mid"], text, kb)
+    if act in ("crc", "cgc", "duc"):
+        st["await"] = {"crc": "e_crime", "cgc": "e_charges", "duc": "e_dur"}[act]
+        await _t_ans(q)
+        hint = {"crc": f"Send the new crime (max {_t_CRIME_MAX} characters).",
+                "cgc": f"Send the new charges (max {_t_CHARGES_MAX} characters).",
+                "duc": "Send the new duration, e.g. <code>7</code> (minutes), <code>90s</code> or <code>1h30m</code>."}[act]
+        return await _t_edit(bot, chat.id, st["mid"], "✍️ " + hint, KB([[
+            B("↩️ Back", callback_data=f"tr:e:{n}:menu2"), B("❌ Cancel", callback_data=f"tr:e:{n}:close")]]))
+    field = value = new_name = None
+    if act == "cr" and arg in _t_CRIMES:
+        field, value = "crime", _t_CRIMES[arg][1]
+    elif act == "cg" and arg in _t_CHARGES:
+        field, value = "charges", _t_CHARGES[arg]
+    elif act == "du" and arg and arg.isdigit() and int(arg) in _t_DURATIONS:
+        field, value = "duration", int(arg)
+    elif act == "ac" and arg and arg.isdigit():
+        aid, new_name, err = await _t_validate_accused(bot, chat.id, int(arg))
+        if err:
+            return await _t_ans(q, err, True)
+        field, value = "accused", aid
+    if not field:
+        return await _t_ans(q)
+    msg, ok = _t_apply_edit(n, uid, field, value, new_name)
+    await _t_ans(q, msg, not ok)
+    if ok:
+        await _t_after_edit(bot, st, "✅ " + msg)
+
+
+# ------------------------------------------------------------------ text input (wizard / edit / search)
+async def _t_on_message(update, context):
+    msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    if not msg or not user or not chat or user.is_bot:
+        return
+    try:
+        _t_note_seen(chat.id, user)
+        if msg.reply_to_message and msg.reply_to_message.from_user:
+            _t_note_seen(chat.id, msg.reply_to_message.from_user)
+    except Exception:
+        _t_log.exception("seen tracking failed")
+    _t_ensure_sweeper()
+    key = (chat.id, user.id)
+    st = _t_S.get(key)
+    if not st or not st.get("await"):
+        return
+    if time.time() - st["ts"] > _t_STATE_TTL:
+        _t_S.pop(key, None)
+        return
+    bot, kind, text = context.bot, st["await"], msg.text
+    if kind in ("accused", "e_acc"):
+        aid, name, err = await _t_resolve_accused(bot, chat.id, msg)
+        if err:
+            return await msg.reply_text(err)
+        if kind == "accused":
+            st["accused_id"], st["accused_name"] = aid, name
+            return await _t_wz_render(bot, st, _t_next_stage(st, "accused"))
+        res, ok = _t_apply_edit(st["case_no"], user.id, "accused", aid, name)
+        return await (_t_after_edit(bot, st, ("✅ " if ok else "⚠️ ") + res))
+    if text is None:
+        return
+    if kind in ("crime", "charges", "e_crime", "e_charges"):
+        field = kind.replace("e_", "")
+        val, err = _t_clean_text(text, _t_CRIME_MAX if field == "crime" else _t_CHARGES_MAX)
+        if err:
+            return await msg.reply_text(err + " Try again.")
+        if kind.startswith("e_"):
+            res, ok = _t_apply_edit(st["case_no"], user.id, field, val)
+            return await _t_after_edit(bot, st, ("✅ " if ok else "⚠️ ") + res)
+        st[field] = val
+        return await _t_wz_render(bot, st, _t_next_stage(st, field))
+    if kind in ("duration", "e_dur"):
+        secs = _t_parse_duration(text)
+        if secs is None:
+            return await msg.reply_text("I couldn't read that. Try 5, 90s, 2h or 1h30m.")
+        if not _t_valid_duration(secs):
+            return await msg.reply_text(f"Duration must be between {_t_fmt_duration(_t_MIN_SECS)} and "
+                                        f"{_t_fmt_duration(_t_MAX_SECS)}. Try again.")
+        if kind == "e_dur":
+            res, ok = _t_apply_edit(st["case_no"], user.id, "duration", secs)
+            return await _t_after_edit(bot, st, ("✅ " if ok else "⚠️ ") + res)
+        st["duration"] = secs
+        return await _t_wz_render(bot, st, _t_next_stage(st, "duration"))
+    if kind == "s_case":
+        arg = text.strip().lstrip("#")
+        if not re.fullmatch(r"\d{1,9}", arg) or int(arg) < 1:
+            return await msg.reply_text("Please send a valid case number, like 42.")
+        c = _t_get(int(arg))
+        _t_S.pop(key, None)
+        if not c or c["chat_id"] != chat.id:
+            return await msg.reply_text(f"❌ Case Not Found: there is no Case #{int(arg)} in this group.")
+        return await msg.reply_html(_t_details_text(c))
+    if kind == "s_acc":
+        flt = {"chat_id": chat.id, "status": {"$ne": "cancelled"}}
+        q = text.strip()
+        if msg.reply_to_message and msg.reply_to_message.from_user:
+            flt["accused_id"] = msg.reply_to_message.from_user.id
+        elif q.isdigit():
+            flt["accused_id"] = int(q)
+        else:
+            flt["accused_name"] = {"$regex": re.escape(q.lstrip("@")[:40]), "$options": "i"}
+        rows = list(_t_col("trial_cases").find(flt, {"_id": 0}, sort=[("case_no", -1)], limit=10))
+        _t_S.pop(key, None)
+        if not rows:
+            return await msg.reply_text("No cases found for that accused.")
+        grid = [_t_view_row(rows[i:i + 5]) for i in range(0, len(rows), 5)]
+        return await msg.reply_html("👤 <b>CASES FOR THAT ACCUSED</b>\n\n" + "\n\n".join(_t_case_lines(c) for c in rows),
+                                    reply_markup=KB(grid))
+
+
+# ------------------------------------------------------------------ dispatch + registration
+_t_HANDLERS = {"m": _t_h_menu, "w": _t_h_wiz, "t": _t_h_tpl, "h": _t_h_hist, "v": _t_h_vote, "c": _t_h_view, "e": _t_h_edit,
+             "k": _t_h_rate, "l": _t_h_lead, "s": _t_h_settings}
+
+
+async def _t_on_callback(update, context):
+    q = update.callback_query
+    if not q or not q.data or not q.message:
+        if q:
+            await _t_ans(q)
+        return
+    _t_ensure_sweeper()
+    p = q.data.split(":")
+    try:
+        h = _t_HANDLERS.get(p[1]) if len(p) > 1 else None
+        if h:
+            await h(q, context, p)
+        else:
+            await _t_ans(q)
+    except Exception:
+        _t_log.exception("trial callback failed: %s", q.data)
+        await _t_ans(q, "Something went wrong. Please try again.", True)
+
+
+def _t_register(app, deps, random_trial, legacy_trial):
+    global _t_D, _t_BOT, _t_random_trial, _t_legacy_trial
+    _t_D, _t_BOT, _t_random_trial, _t_legacy_trial = deps, app.bot, random_trial, legacy_trial
+    _t_setup()
+    for name, fn in (("trial", _t_trial_cmd), ("trialhistory", _t_trialhistory_cmd), ("case", _t_case_cmd),
+                     ("trialleaderboard", _t_trialleaderboard_cmd)):
+        app.add_handler(CommandHandler(name, fn))
+    app.add_handler(CallbackQueryHandler(_t_on_callback, pattern=r"^tr:"))
+    # group=3: tracks active members + reads wizard text input without blocking normal handlers
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, _t_on_message), group=3)
+    prev = getattr(app, "post_init", None)
+
+    async def _post_init(application):
+        if prev:
+            await prev(application)
+        _t_ensure_sweeper()    # resumes closing/refreshing open trials after a restart
+    app.post_init = _post_init
+
+
 # ------------------------------------------------------------ registration
 def register(app, deps):
     """deps needs: is_admin, admin_only."""
@@ -1471,13 +2870,15 @@ def register(app, deps):
         "finisher": finisher_cmd, "comeback": comeback_cmd, "roastbattle": roastbattle_cmd,
         "roastvote": roastvote_cmd, "roastscore": roastscore_cmd, "roaststats": roaststats_cmd,
         "roastking": roastking_cmd,
-        "court": court_cmd, "trial": court_cmd, "guilty": guilty_cmd, "innocent": innocent_cmd,
+        "court": court_cmd, "guilty": guilty_cmd, "innocent": innocent_cmd,
         "verdict": verdict_cmd, "crime": crime_cmd, "evidence": evidence_cmd, "alibi": alibi_cmd,
         "sentence": sentence_cmd, "bail": bail_cmd, "pardon": pardon_cmd, "appeal": appeal_cmd,
         "execute": execute_cmd, "wanted": wanted_cmd,
     }
     for name, fn in commands.items():
         app.add_handler(CommandHandler(name, fn))
+    # /trial menu + custom trials; "/trial @user" (or a reply) still opens the old random trial
+    _t_register(app, deps, random_trial=_open_random_trial, legacy_trial=court_cmd)
     app.add_handler(CallbackQueryHandler(roast_callback, pattern=r"^rb:"))
     app.add_handler(CallbackQueryHandler(court_callback, pattern=r"^ct:"))
     # group=2: listens for the fighters' roasts without ever blocking the normal handlers
