@@ -122,7 +122,7 @@ def _sign(chat_id, req, ts):
 
 def menu_button():
     """The '📊 Message Count' button for the main /help menu."""
-    return B("📊 Message Count", callback_data="mc:d")
+    return B("📊 Count", callback_data="mc:d")
 
 
 # ------------------------------------------------------------------ database (synchronous, run in threads)
