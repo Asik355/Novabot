@@ -105,6 +105,7 @@ except ModuleNotFoundError:  # the file was saved as extras.py: accept it instea
     import extras as extra
     sys.modules["extra"] = extra
 import fun_systems  # roast + court entertainment (wired up in main())
+import msgcount  # message count / leaderboard / milestones (wired up in main())
 import migrate_to_mongo as store  # the MongoDB data layer (the only file that talks to the database)
 from extra import (  # pure helpers (no bot state): see extra.py
     fmt_duration,
@@ -1230,6 +1231,7 @@ def help_main_keyboard(chat=None):
         InlineKeyboardButton(HELP_SECTIONS[key][0], callback_data=f"help:{key}")
         for key in HELP_ORDER
     ]
+    buttons.append(msgcount.menu_button())  # "📊 Message Count" (handled by msgcount.mc_callback)
     buttons.append(extra.ai_menu_button())  # "🤖 AI Commands" (handled by extra.ai_menu_callback)
     buttons.append(extra.blocking_menu_button())  # "🔒 Blocking" (handled by extra.blocking_callback)
     rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
@@ -4490,6 +4492,7 @@ async def post_init(app):
     await extra.refresh_identity(app.bot, force=True)  # current Telegram name/username (bot.get_me())
     logging.info("Bot identity: name=%r username=@%s id=%s", extra.bot_name(), extra.bot_username(), _BOT_ID)
     app.bot_data["captcha_task"] = asyncio.create_task(captcha_sweeper(app))
+    app.bot_data["msgcount_task"] = asyncio.create_task(msgcount.outbox_sweeper(app))  # pending milestone messages
     app.bot_data["startup_task"] = asyncio.create_task(_startup_sync_safe(app))
 
 
@@ -4869,6 +4872,7 @@ def main():
         log_action=log_action, MUTED=MUTED, is_super_admin=is_super_admin, owner_ids=OWNER_IDS,
         get_setting=store.get_setting, set_setting=store.set_setting,
         block_words=store.block_words))  # the Blocklist is the shared word source for NSFW Word
+    msgcount.register(app)  # /rank /top /today /week /overall /me /radmin /resetrank + counter + 📊 menu
     app.add_handler(CallbackQueryHandler(captcha_callback, pattern=r"^cap:"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:"))
     app.add_handler(CallbackQueryHandler(edit_callback, pattern=r"^(gedit|bedit):"))
