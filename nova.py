@@ -1016,7 +1016,7 @@ HELP_SECTIONS = {
         ]),
     ),
     "roast": (
-        "🟩 Roast",
+        "🔥 Roast",
         "<b>Roast</b> (playful fun: no hate, threats or low blows)\n\n" + _numbered([
             "/roast @user: Roast someone (or reply to their message).",
             "/roastme: Roast yourself.",
@@ -1036,7 +1036,7 @@ HELP_SECTIONS = {
         "• Win +10 points, loss +2, draw +5. All scores are tracked per chat.",
     ),
     "court": (
-        "🟩 Court",
+        "⚖️ Court",
         "<b>Court</b> (a comedy minigame: it never bans, mutes or kicks anyone)\n\n" + _numbered([
             "/court @user: Put someone on trial with absurd charges.",
             "/trial @user: Same as /court.",
@@ -1057,8 +1057,14 @@ HELP_SECTIONS = {
         "• Everyone else is the jury. The trial closes by itself after 5 minutes.\n"
         "• Verdicts: INNOCENT, GUILTY, NOT PROVEN or CHAOS VERDICT. Cases are tracked per chat.",
     ),
+    # the 🎂 Birthday button opens the interactive Birthday System menu (see help_callback / fun_systems.py);
+    # this text is only a fallback and has no numbered "/command" lines, so the "/" suggestion list is unchanged
+    "birthday": (
+        "🎂 Birthday",
+        "<b>Birthday</b>\n\nSend /wish to open the Birthday System menu.",
+    ),
 }
-HELP_ORDER = ["mod", "warn", "flood", "captcha", "greet", "rules", "notes", "locks", "purge", "log", "reports", "approval", "disabling", "groupedit", "botedit", "other", "info", "extras", "roast", "court"]
+HELP_ORDER = ["mod", "warn", "flood", "captcha", "greet", "rules", "notes", "locks", "purge", "log", "reports", "approval", "disabling", "groupedit", "botedit", "other", "info", "extras", "roast", "court", "birthday"]
 
 
 def _build_bot_commands():
@@ -1293,6 +1299,9 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = q.data.partition(":")[2]
     if key in EDIT_HELP_KEYS:
         await open_edit_menu(update, context, EDIT_HELP_KEYS[key])
+        return
+    if key == "birthday":  # 🎂 Birthday: the same interactive menu that /wish opens
+        await fun_systems.birthday_menu_from_help(update, context)
         return
     await q.answer()
     if key == "main" or key not in HELP_SECTIONS:

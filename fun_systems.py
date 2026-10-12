@@ -3066,6 +3066,589 @@ def _t_register(app, deps, random_trial, legacy_trial):
     app.post_init = _post_init
 
 
+# =====================================================================
+#  BIRTHDAY SYSTEM  (/wish, the 🎂 Birthday button, automatic group announcements)
+# =====================================================================
+# Storage reuses the existing `settings` collection (no new collection, no schema change):
+#   chat 0  "bday:<user id>"      {"d": day, "m": month, "n": last known name}   ONE global record per user
+#   chat 0  "bdayopt:<user id>"   {"pm": 0|1, "grp": 0|1}  the user's two separate preferences (default ON)
+#   chat 0  "bdaysent:<user id>"  "YYYY-MM-DD"  day the private wish was last sent
+#   group   "bdaygrp"             "1"|"0"       this group's announcement switch (default ON)
+#   group   "bdayann:<user id>"   "YYYY-MM-DD"  day this user was last announced in this group
+# Only day + month are stored (never a year). Feb 29 is celebrated on Feb 28 in non-leap years.
+# Groups come from the list nova.py already keeps for /stats (settings chat 0, key "stats_groups").
+# Telegram bots cannot list the groups a user is in, so a group is "eligible" only when the bot knows
+# it (list above), the group switch is on, and getChatMember confirms the user is a member.
+import calendar as _bd_cal
+import json as _bd_json
+from datetime import date as _bd_date
+from telegram.error import Forbidden as _BdForbidden, RetryAfter as _BdRetryAfter
+
+BDAY_HOUR = 0                  # announcements start at this hour (bot timezone); 0 = right at midnight
+BDAY_TICK_SECS = 60            # scheduler wake-up; cheap, and nothing is ever sent twice
+BDAY_GROUPS_KEY = "stats_groups"
+BDAY_STATE_TTL = 600           # a pending "send me your DD-MM" expires after 10 minutes
+BDAY_RETRY_SECS = 300          # transient send failure: try again after this long
+BDAY_RECHECK_SECS = 3600       # user not in a group / group unreachable: look again after this long
+BDAY_MESSAGE = (
+    "🎉🎂 <b>HAPPY BIRTHDAY!</b> 🎂🎉\n\n"
+    "Everyone, let's wish a very Happy Birthday to {user_mention}! 🥳🎈\n\n"
+    "May your day be filled with happiness, success, and wonderful memories! 🎁✨\n\n"
+    "Enjoy your special day! 🎂🎉"
+)
+BDAY_PM_MESSAGE = (
+    "🎂 <b>Happy Birthday, {name}!</b> 🎉\n\n"
+    "Wishing you a day full of happiness and wonderful memories! 🎁✨"
+)
+
+_bd_S = {}            # (chat_id, user_id) -> {"mid": menu message id, "ts": time}  waiting for a DD-MM
+_bd_retry = {}        # (user_id, group_id) -> monotonic time before which that pair isn't looked at again
+_bd_task = None
+
+
+# ------------------------------------------------------------------ dates
+def _bd_valid(d, m):
+    try:
+        _bd_date(2000, int(m), int(d))     # 2000 is a leap year, so 29-02 is accepted
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _bd_parse(text):
+    """'25-12' (also 25/12 or 25.12) -> (25, 12); None when it isn't a real date."""
+    m = re.fullmatch(r"\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*", text or "")
+    if not m or not _bd_valid(m.group(1), m.group(2)):
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _bd_eff(d, m, year):
+    """The day it is celebrated in `year`: 29 Feb becomes 28 Feb in a non-leap year."""
+    if (d, m) == (29, 2) and not _bd_cal.isleap(year):
+        return 28, 2
+    return d, m
+
+
+def _bd_next(d, m, today):
+    """The first celebration strictly after `today` (rolls over month and year boundaries)."""
+    for year in (today.year, today.year + 1):
+        ed, em = _bd_eff(d, m, year)
+        cand = _bd_date(year, em, ed)
+        if cand > today:
+            return cand
+
+
+def _bd_fmt(d, m):
+    return f"{d} {_bd_cal.month_name[m]}"
+
+
+def _bd_fmt_long(d, m):
+    s = _bd_fmt(d, m)
+    return s + " (celebrated on 28 February in non-leap years)" if (d, m) == (29, 2) else s
+
+
+def _bd_today():
+    now = datetime.now(extra._tzinfo())        # the project timezone (BOT_TIMEZONE, default Asia/Kolkata)
+    return now.date() if now.hour >= BDAY_HOUR else None
+
+
+# ------------------------------------------------------------------ storage (global, one record per user)
+def _bd_rec(uid):
+    raw = M.get_setting(0, f"bday:{uid}")
+    if not raw:
+        return None
+    try:
+        r = _bd_json.loads(raw)
+        return r if isinstance(r, dict) and _bd_valid(r.get("d"), r.get("m")) else None
+    except ValueError:
+        return None
+
+
+def _bd_save(uid, d, m, name):
+    M.set_setting(0, f"bday:{uid}", _bd_json.dumps({"d": int(d), "m": int(m), "n": (name or "")[:80]},
+                                                   ensure_ascii=False))
+
+
+def _bd_all():
+    out = []
+    for key, raw in M.settings_with_prefix(0, "bday:").items():
+        try:
+            uid, r = int(key.split(":", 1)[1]), _bd_json.loads(raw)
+            if isinstance(r, dict) and _bd_valid(r.get("d"), r.get("m")):
+                out.append((uid, r))
+        except (ValueError, IndexError, TypeError):
+            log.warning("birthday: ignoring an unreadable record %r", key)
+    return out
+
+
+def _bd_opts(uid):
+    try:
+        o = _bd_json.loads(M.get_setting(0, f"bdayopt:{uid}") or "{}")
+    except ValueError:
+        o = {}
+    o = o if isinstance(o, dict) else {}
+    return {"pm": bool(o.get("pm", 1)), "grp": bool(o.get("grp", 1))}
+
+
+def _bd_set_opt(uid, which, value):
+    o = _bd_opts(uid)
+    o[which] = bool(value)                     # only the one preference changes
+    M.set_setting(0, f"bdayopt:{uid}", _bd_json.dumps({"pm": int(o["pm"]), "grp": int(o["grp"])}))
+
+
+def _bd_group_on(chat_id):
+    return str(M.get_setting(chat_id, "bdaygrp", "1")) != "0"
+
+
+def _bd_known_groups():
+    try:
+        data = _bd_json.loads(M.get_setting(0, BDAY_GROUPS_KEY, "{}") or "{}")
+        return [int(k) for k in data if int(k) < 0] if isinstance(data, dict) else []
+    except (ValueError, TypeError):
+        return []
+
+
+# ------------------------------------------------------------------ views
+def _bd_menu_view(owner):
+    p = f"bd:{owner}:"
+    return ("🎂 <b>BIRTHDAY SYSTEM</b>\n\nRegister your birthday once and I'll wish you in every group we share.",
+            KB([[B("🎂 Set My Birthday", callback_data=p + "set")],
+                [B("📅 View My Birthday", callback_data=p + "view")],
+                [B("✏️ Update My Birthday", callback_data=p + "upd")],
+                [B("🗑️ Remove My Birthday", callback_data=p + "rm")],
+                [B("🎉 Today's Birthdays", callback_data=p + "today")],
+                [B("📆 Upcoming Birthdays", callback_data=p + "up")],
+                [B("🔔 Personal Wish Settings", callback_data=p + "pw")],
+                [B("⚙️ Group Birthday Settings", callback_data=p + "gs")],
+                [B("❌ Close", callback_data=p + "x")]]))
+
+
+def _bd_back(owner, *first):
+    """Keyboard: optional extra button rows, then « Back to the Birthday menu."""
+    return KB([*first, [B("« Back", callback_data=f"bd:{owner}:m")]])
+
+
+def _bd_saved_text(d, m, updated):
+    return (f"✅ <b>Birthday {'updated' if updated else 'saved'}!</b>\n\n📅 {_bd_fmt_long(d, m)}\n\n"
+            "It is registered once for every group: no need to repeat it anywhere. I'll wish you in the "
+            "groups we share that have birthday announcements on. You can change this any time in "
+            "🔔 Personal Wish Settings.")
+
+
+async def _bd_profile_birthday(bot, uid):
+    """(day, month) from the user's Telegram profile when Telegram shares it with the bot (private-chat
+    getChat -> ChatFullInfo.birthdate, python-telegram-bot 21.1+), else None. Only used when the user taps the button."""
+    try:
+        b = getattr(await bot.get_chat(uid), "birthdate", None)
+    except TelegramError:
+        return None
+    d, m = getattr(b, "day", None), getattr(b, "month", None)
+    return (d, m) if b is not None and _bd_valid(d, m) else None
+
+
+async def _bd_shared_groups(bot, uid):
+    """Known groups the bot can confirm `uid` is in (used for lists in a private chat)."""
+    out = []
+    for gid in _bd_known_groups()[:40]:
+        if await _t_is_member(bot, gid, uid):
+            out.append(gid)
+    return out
+
+
+async def _bd_visible(bot, chat, requester, items, limit):
+    """Birthdays that may be listed to `requester`: their own, plus people who allow group announcements
+    and are members of this group (or, in a private chat, of a group the requester is also in)."""
+    out, shared = [], None
+    for uid, rec in items[:80]:
+        if len(out) >= limit:
+            break
+        if uid == requester:
+            out.append((uid, rec))
+            continue
+        if not _bd_opts(uid)["grp"]:
+            continue
+        if chat.type == "private":
+            if shared is None:
+                shared = await _bd_shared_groups(bot, requester)
+            ok = False
+            for gid in shared:
+                if await _t_is_member(bot, gid, uid):
+                    ok = True
+                    break
+        else:
+            ok = await _t_is_member(bot, chat.id, uid)
+        if ok:
+            out.append((uid, rec))
+    return out
+
+
+async def _bd_today_view(bot, chat, requester, owner):
+    today = extra._today()
+    items = sorted((u, r) for u, r in _bd_all() if _bd_eff(r["d"], r["m"], today.year) == (today.day, today.month))
+    shown = await _bd_visible(bot, chat, requester, items, 20)
+    head = f"🎉 <b>TODAY'S BIRTHDAYS</b>\n📅 {today.day} {_bd_cal.month_name[today.month]} {today.year}\n\n"
+    if not shown:
+        return head + "No birthdays to celebrate today 🎈\nRegister yours with 🎂 Set My Birthday!", _bd_back(owner)
+    lines = [f"🎂 {_mention(u, r.get('n'))} — {_bd_fmt(*_bd_eff(r['d'], r['m'], today.year))}" for u, r in shown]
+    return head + "\n".join(lines), _bd_back(owner)
+
+
+async def _bd_upcoming_view(bot, chat, requester, owner):
+    today = extra._today()
+    dated = sorted((_bd_next(r["d"], r["m"], today), u, r) for u, r in _bd_all())
+    by_uid = {u: (c, r) for c, u, r in dated}
+    shown = await _bd_visible(bot, chat, requester, [(u, r) for _, u, r in dated], 10)
+    head = "📆 <b>UPCOMING BIRTHDAYS</b>\n\n"
+    if not shown:
+        return head + "No upcoming birthdays yet 🎈\nRegister yours with 🎂 Set My Birthday!", _bd_back(owner)
+    lines = []
+    for u, r in shown:
+        cand = by_uid[u][0]
+        n = (cand - today).days
+        when = "tomorrow" if n == 1 else f"in {n} days"
+        lines.append(f"🎂 {_mention(u, r.get('n'))} — {cand.day} {_bd_cal.month_name[cand.month]} ({when})")
+    return head + "\n".join(lines), _bd_back(owner)
+
+
+def _bd_pw_view(owner, uid):
+    o = _bd_opts(uid)
+    onoff = lambda v: "ON ✅" if v else "OFF ❌"
+    p = f"bd:{owner}:"
+    text = ("🔔 <b>PERSONAL WISH SETTINGS</b>\n\n"
+            f"💌 <b>Personal birthday wishes: {onoff(o['pm'])}</b>\n"
+            "I send you a private birthday message on your day. I can only do this if you have started a "
+            "chat with me.\n\n"
+            f"👥 <b>Group announcements: {onoff(o['grp'])}</b>\n"
+            "Your registered birthday may be announced in the groups we share (where admins have "
+            "announcements on) and shown in the birthday lists.\n\n"
+            "The two switches are independent.")
+    if not _bd_rec(uid):
+        text += "\n\n<i>You haven't registered a birthday yet; your choices are saved for when you do.</i>"
+    return text, _bd_back(owner,
+                          [B(f"💌 Personal wishes: {onoff(o['pm'])}", callback_data=p + "pwp")],
+                          [B(f"👥 Group announcements: {onoff(o['grp'])}", callback_data=p + "pwg")])
+
+
+async def _bd_bot_can_post(bot, chat_id):
+    """True / False, or None when Telegram won't say."""
+    try:
+        m = await bot.get_chat_member(chat_id, bot.id)
+    except TelegramError:
+        return None
+    if m.status in ("left", "kicked"):
+        return False
+    if m.status == "restricted":
+        return bool(getattr(m, "can_send_messages", True))
+    return True
+
+
+async def _bd_gs_view(bot, chat, owner, note=""):
+    on = _bd_group_on(chat.id)
+    can = await _bd_bot_can_post(bot, chat.id)
+    perm = {True: "✅ I can post here", False: "⚠️ I can't send messages in this group",
+            None: "❔ I couldn't check my permissions here"}[can]
+    p = f"bd:{owner}:"
+    toggle = B("🚫 Disable announcements", callback_data=p + "goff") if on else \
+        B("✅ Enable announcements", callback_data=p + "gon")
+    text = ("⚙️ <b>GROUP BIRTHDAY SETTINGS</b>\n\n"
+            f"Automatic birthday announcements in this group: <b>{'ON ✅' if on else 'OFF ❌'}</b>\n{perm}\n\n"
+            "Only members who registered a birthday (and allow group announcements) are announced. "
+            "Telegram lets a bot confirm other members reliably only where it is an admin.")
+    return (text + (f"\n\n{note}" if note else "")), _bd_back(owner, [toggle])
+
+
+# ------------------------------------------------------------------ menu / callbacks
+async def wish_cmd(update, context):
+    """/wish opens the same menu as the 🎂 Birthday button in /help."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or user.is_bot or not await _cool(update, 3):
+        return
+    text, kb = _bd_menu_view(user.id)
+    await msg.reply_html(text, reply_markup=kb, disable_web_page_preview=True)
+
+
+async def birthday_menu_from_help(update, context):
+    """The 🎂 Birthday button in /help (nova.help_callback): turns the help message into the menu."""
+    q = update.callback_query
+    await _t_ans(q)
+    text, kb = _bd_menu_view(q.from_user.id)
+    await _t_edit(context.bot, q.message.chat.id, q.message.message_id, text, kb)
+
+
+async def _bd_prompt(q, context, owner, uid, rec):
+    if len(_bd_S) > 2000:
+        _bd_S.clear()
+    _bd_S[(q.message.chat.id, uid)] = {"mid": q.message.message_id, "ts": time.time()}
+    cur = f"Your current birthday: <b>{_bd_fmt_long(rec['d'], rec['m'])}</b>\n\n" if rec else ""
+    text = (f"🎂 {cur}Please send your birthday in <b>DD-MM</b> format.\nExample: <code>25-12</code>\n\n"
+            "No year is needed.")
+    extra_rows = []
+    pb = await _bd_profile_birthday(context.bot, uid)
+    if pb:
+        extra_rows.append([B(f"📥 Use my Telegram profile birthday ({_bd_fmt(*pb)})",
+                             callback_data=f"bd:{owner}:imp")])
+    await _t_edit(context.bot, q.message.chat.id, q.message.message_id, text, _bd_back(owner, *extra_rows))
+
+
+async def _bd_commit(q, context, owner, uid, d, m):
+    updated = _bd_rec(uid) is not None
+    _bd_save(uid, d, m, q.from_user.full_name or q.from_user.first_name)
+    _bd_S.pop((q.message.chat.id, uid), None)
+    await _t_edit(context.bot, q.message.chat.id, q.message.message_id, _bd_saved_text(d, m, updated),
+                  _bd_back(owner))
+
+
+async def _bd_on_callback(update, context):
+    q = update.callback_query
+    try:
+        p = (q.data or "").split(":")
+        owner, act = int(p[1]), p[2]
+        bot, chat, uid, mid = context.bot, q.message.chat, q.from_user.id, q.message.message_id
+        if uid != owner:
+            return await _t_ans(q, _t_NOT_YOURS, True)
+        key = (chat.id, uid)
+        show = lambda text, kb: _t_edit(bot, chat.id, mid, text, kb)
+        if act == "m":
+            _bd_S.pop(key, None)
+            await _t_ans(q)
+            text, kb = _bd_menu_view(owner)
+            return await show(text, kb)
+        if act == "x":
+            _bd_S.pop(key, None)
+            await _t_ans(q)
+            try:
+                return await q.message.delete()
+            except TelegramError:
+                return await show("Menu closed.", None)
+        await _t_ans(q)
+        rec = _bd_rec(uid)
+        if act == "set":
+            if rec:
+                return await show(f"🎂 You already have a birthday registered: <b>{_bd_fmt_long(rec['d'], rec['m'])}</b>"
+                                  "\n\nWould you like to update it?",
+                                  _bd_back(owner, [B("✏️ Update it", callback_data=f"bd:{owner}:go")]))
+            return await _bd_prompt(q, context, owner, uid, None)
+        if act == "upd":
+            if not rec:
+                return await show("You haven't registered a birthday yet.",
+                                  _bd_back(owner, [B("🎂 Set My Birthday", callback_data=f"bd:{owner}:go")]))
+            return await _bd_prompt(q, context, owner, uid, rec)
+        if act == "go":
+            return await _bd_prompt(q, context, owner, uid, rec)
+        if act in ("imp", "impy"):
+            pb = await _bd_profile_birthday(bot, uid)
+            if not pb:
+                return await _t_ans(q, "Telegram isn't sharing a birthday from your profile.", True)
+            if act == "imp" and rec and (rec["d"], rec["m"]) != pb:
+                return await show(f"Replace your saved birthday <b>{_bd_fmt_long(rec['d'], rec['m'])}</b> with your "
+                                  f"Telegram profile birthday <b>{_bd_fmt_long(*pb)}</b>?",
+                                  _bd_back(owner, [B("✅ Yes, replace it", callback_data=f"bd:{owner}:impy")]))
+            return await _bd_commit(q, context, owner, uid, *pb)
+        if act == "view":
+            if not rec:
+                return await show("📅 You haven't registered a birthday yet.",
+                                  _bd_back(owner, [B("🎂 Set My Birthday", callback_data=f"bd:{owner}:go")]))
+            return await show(f"📅 <b>Your birthday</b>\n\n{_bd_fmt_long(rec['d'], rec['m'])}",
+                              _bd_back(owner, [B("✏️ Update My Birthday", callback_data=f"bd:{owner}:go")]))
+        if act == "rm":
+            if not rec:
+                return await show("🗑️ You have no registered birthday to remove.", _bd_back(owner))
+            return await show(f"🗑️ Remove your birthday (<b>{_bd_fmt(rec['d'], rec['m'])}</b>)?\n\n"
+                              "It is removed for every group and I will stop announcing it.",
+                              _bd_back(owner, [B("🗑️ Yes, remove it", callback_data=f"bd:{owner}:rmy")]))
+        if act == "rmy":
+            if rec:
+                M.del_setting(0, f"bday:{uid}")      # only this user's record; nobody else's data is touched
+            return await show("🗑️ Your birthday was removed. I will not announce it anywhere.\n"
+                              "Your wish preferences were kept.", _bd_back(owner))
+        if act == "today":
+            return await show(*await _bd_today_view(bot, chat, uid, owner))
+        if act == "up":
+            return await show(*await _bd_upcoming_view(bot, chat, uid, owner))
+        if act == "pw":
+            return await show(*_bd_pw_view(owner, uid))
+        if act in ("pwp", "pwg"):
+            which = "pm" if act == "pwp" else "grp"
+            _bd_set_opt(uid, which, not _bd_opts(uid)[which])
+            return await show(*_bd_pw_view(owner, uid))
+        if act in ("gs", "gon", "goff"):
+            if chat.type == "private":
+                return await show("⚙️ <b>GROUP BIRTHDAY SETTINGS</b>\n\nOpen this menu inside a group "
+                                  "(with /wish) as one of its admins to change that group's setting.",
+                                  _bd_back(owner))
+            if not await D.is_admin(chat, uid):
+                return await _t_ans(q, "Only group admins can use the group birthday settings.", True)
+            note = ""
+            if act in ("gon", "goff"):
+                M.set_setting(chat.id, "bdaygrp", "1" if act == "gon" else "0")   # this group only
+                note = "✅ Announcements enabled." if act == "gon" else "🚫 Announcements disabled."
+            return await show(*await _bd_gs_view(bot, chat, owner, note))
+    except M.DBError as e:
+        log.warning("birthday: database error on %s (%s)", q.data, type(e).__name__)   # type only: no URIs/secrets in logs
+        await _t_ans(q, "⚠️ The database isn't answering right now. Please try again in a moment.", True)
+    except Exception as e:
+        log.warning("birthday callback failed: %s (%s)", q.data, type(e).__name__)
+        await _t_ans(q, "Something went wrong. Please try again.", True)
+
+
+async def _bd_on_text(update, context):
+    """Receives the DD-MM after 'Set / Update My Birthday' (group=5: never blocks the other handlers)."""
+    msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    if not msg or not user or not chat or user.is_bot or not msg.text:
+        return
+    st = _bd_S.get((chat.id, user.id))
+    if not st:
+        return
+    if time.time() - st["ts"] > BDAY_STATE_TTL:
+        _bd_S.pop((chat.id, user.id), None)
+        return
+    parsed = _bd_parse(msg.text)
+    if parsed is None:
+        replied = msg.reply_to_message is not None and msg.reply_to_message.message_id == st["mid"]
+        if replied or (re.search(r"\d", msg.text) and len(msg.text) <= 12):            # looks like an attempt
+            if re.fullmatch(r"\s*\d{1,2}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{2,4}\s*", msg.text):
+                err = "I only need the day and month: DD-MM, for example <code>25-12</code>."
+            else:
+                err = "That isn't a valid date. Please send it as <b>DD-MM</b>, for example <code>25-12</code>."
+            await msg.reply_html(err)
+        return
+    try:
+        updated = _bd_rec(user.id) is not None
+        _bd_save(user.id, parsed[0], parsed[1], user.full_name or user.first_name)
+    except M.DBError as e:
+        log.warning("birthday: couldn't save a birthday (%s)", type(e).__name__)
+        await msg.reply_text("⚠️ I couldn't save that right now. Please send it again in a moment.")
+        return
+    _bd_S.pop((chat.id, user.id), None)
+    text, kb = _bd_saved_text(parsed[0], parsed[1], updated), _bd_back(user.id)
+    if not await _t_edit(context.bot, chat.id, st["mid"], text, kb):
+        await msg.reply_html(text, reply_markup=kb)
+
+
+# ------------------------------------------------------------------ scheduler + announcements
+async def _bd_announce(bot, uid, rec, gid, today):
+    """Announce one user in one group. Returns quietly when they are not eligible there."""
+    stamp, key = today.isoformat(), f"bdayann:{uid}"
+    pair = (uid, gid)
+    if M.get_setting(gid, key) == stamp or not _bd_group_on(gid):
+        return
+    if _bd_retry.get(pair, 0) > time.monotonic():
+        return
+    member = await _t_member_user(bot, gid, uid)       # Telegram is the source of truth for membership
+    if member is None or member.is_bot:
+        _bd_retry[pair] = time.monotonic() + BDAY_RECHECK_SECS
+        return
+    if _bd_rec(uid) is None or not _bd_opts(uid)["grp"]:      # removed / switched off while we were working
+        return
+    name = member.full_name or member.first_name or rec.get("n") or "friend"
+    if name != rec.get("n"):
+        try:
+            _bd_save(uid, rec["d"], rec["m"], name)
+        except Exception:
+            log.warning("birthday: couldn't refresh a stored name")
+    prev = M.get_setting(gid, key)
+    M.set_setting(gid, key, stamp)             # claim first (synchronous): two runs can't both send
+    try:
+        await bot.send_message(gid, BDAY_MESSAGE.replace("{user_mention}", _mention(uid, name)),
+                               parse_mode="HTML", disable_web_page_preview=True)
+    except _BdRetryAfter as e:
+        _bd_release(gid, key, prev)
+        wait = getattr(e, "retry_after", BDAY_RETRY_SECS)       # int, or a timedelta in newer versions
+        _bd_retry[pair] = time.monotonic() + float(getattr(wait, "total_seconds", lambda: wait)()) + 1
+    except (_BdForbidden, BadRequest) as e:        # bot removed / muted / no rights: don't hammer the group
+        _bd_release(gid, key, prev)
+        _bd_retry[pair] = time.monotonic() + BDAY_RECHECK_SECS * 6
+        log.warning("birthday: can't post in chat %s: %s", gid, e)
+    except TelegramError as e:                     # network hiccup: try again soon
+        _bd_release(gid, key, prev)
+        _bd_retry[pair] = time.monotonic() + BDAY_RETRY_SECS
+        log.warning("birthday: send to chat %s failed (will retry): %s", gid, e)
+
+
+def _bd_release(gid, key, prev):
+    if prev:
+        M.set_setting(gid, key, prev)
+    else:
+        M.del_setting(gid, key)
+
+
+async def _bd_private_wish(bot, uid, rec, today):
+    stamp, key = today.isoformat(), f"bdaysent:{uid}"
+    pair = (uid, 0)
+    if M.get_setting(0, key) == stamp or _bd_retry.get(pair, 0) > time.monotonic():
+        return
+    prev = M.get_setting(0, key)
+    M.set_setting(0, key, stamp)
+    try:
+        await bot.send_message(uid, BDAY_PM_MESSAGE.replace("{name}", _esc(rec.get("n") or "friend")),
+                               parse_mode="HTML")
+    except _BdForbidden:
+        pass                                       # never started the bot / blocked it: nothing to do, don't retry
+    except TelegramError as e:
+        _bd_release(0, key, prev)
+        _bd_retry[pair] = time.monotonic() + BDAY_RETRY_SECS
+        log.warning("birthday: private wish failed (will retry): %s", e)
+
+
+async def _bd_sweep_once(bot):
+    today = _bd_today()
+    if today is None:
+        return
+    due = [(u, r) for u, r in _bd_all() if _bd_eff(r["d"], r["m"], today.year) == (today.day, today.month)]
+    if not due:
+        return
+    groups = _bd_known_groups()
+    for uid, rec in due:
+        try:
+            opts = _bd_opts(uid)
+            if opts["pm"]:
+                await _bd_private_wish(bot, uid, rec, today)
+            if not opts["grp"]:
+                continue
+            for gid in groups:
+                try:
+                    await _bd_announce(bot, uid, rec, gid, today)    # one group failing never stops the rest
+                except Exception as e:
+                    log.warning("birthday: group %s skipped (%s)", gid, type(e).__name__)
+                await asyncio.sleep(0.05)
+        except Exception as e:
+            log.warning("birthday: user %s skipped (%s)", uid, type(e).__name__)
+
+
+async def _bd_loop(bot):
+    while True:
+        try:
+            await _bd_sweep_once(bot)
+        except Exception as e:
+            log.warning("birthday scheduler error (%s)", type(e).__name__)
+        await asyncio.sleep(BDAY_TICK_SECS)
+
+
+def _bd_ensure_task(bot):
+    global _bd_task
+    if _bd_task and not _bd_task.done():
+        return                                      # one scheduler only
+    try:
+        _bd_task = asyncio.get_running_loop().create_task(_bd_loop(bot))
+    except RuntimeError:
+        pass
+
+
+def _bd_register(app):
+    app.add_handler(CommandHandler("wish", wish_cmd))
+    app.add_handler(CallbackQueryHandler(_bd_on_callback, pattern=r"^bd:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND
+                                   & (filters.ChatType.PRIVATE | filters.ChatType.GROUPS), _bd_on_text), group=5)
+    prev = getattr(app, "post_init", None)
+
+    async def _post_init(application):
+        if prev:
+            await prev(application)
+        _bd_ensure_task(application.bot)           # resumes after every restart; same-day sends are never repeated
+    app.post_init = _post_init
+
+
 # ------------------------------------------------------------ registration
 def register(app, deps):
     """deps needs: is_admin, admin_only."""
@@ -3095,3 +3678,4 @@ def register(app, deps):
     # group=2: listens for the fighters' roasts without ever blocking the normal handlers
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, battle_input),
                     group=2)
+    _bd_register(app)    # /wish, the 🎂 Birthday menu and the daily announcements
