@@ -1672,7 +1672,7 @@ def _t_top_rated(chat_id):
 
 
 # ------------------------------------------------------------------ telegram helpers
-_t_NOT_YOURS = "🔒 Yeh kisi aur ka hai! Tum apna menu khud kholo, phir apna kaam karo. 😎"
+_t_NOT_YOURS = "🔒 This menu belongs to someone else! Please open your own menu and continue your work. 😎"
 _t_rate_skipped = set()    # (case_no, user_id): members who skipped that case's rating (per member only)
 
 
@@ -3210,31 +3210,57 @@ def _bd_known_groups():
 
 
 # ------------------------------------------------------------------ views
+_BD_ADMIN_ONLY = "🔒 This menu is for group owners and admins only! Please open your own menu and continue your work. 😎"
+
+
 def _bd_menu_view(owner):
     p = f"bd:{owner}:"
     return ("🎂 <b>BIRTHDAY SYSTEM</b>\n\nRegister your birthday once and I'll wish you in every group we share.",
-            KB([[B("🎂 Set My Birthday", callback_data=p + "set")],
-                [B("📅 View My Birthday", callback_data=p + "view")],
-                [B("✏️ Update My Birthday", callback_data=p + "upd")],
-                [B("🗑️ Remove My Birthday", callback_data=p + "rm")],
-                [B("🎉 Today's Birthdays", callback_data=p + "today")],
-                [B("📆 Upcoming Birthdays", callback_data=p + "up")],
-                [B("🔔 Personal Wish Settings", callback_data=p + "pw")],
-                [B("⚙️ Group Birthday Settings", callback_data=p + "gs")],
-                [B("✍️ Customize Birthday Wish", callback_data=p + "cw")],
-                [B("❌ Close", callback_data=p + "x")]]))
+            KB([[B("🎂 My Birthday", callback_data=p + "mb"), B("🎉 Birthdays", callback_data=p + "bl")],
+                [B("⚙️ Birthday Settings", callback_data=p + "gs")],
+                [B("◀️ Back", callback_data="help:main")]]))
 
 
-def _bd_back(owner, *first):
-    """Keyboard: optional extra button rows, then « Back to the Birthday menu."""
-    return KB([*first, [B("« Back", callback_data=f"bd:{owner}:m")]])
+def _bd_mb_view(owner, uid):
+    """🎂 My Birthday submenu. The toggle shows (and flips) the existing personal-wish preference."""
+    p = f"bd:{owner}:"
+    on = _bd_opts(uid)["pm"]
+    text = ("<b>🎂 MY BIRTHDAY</b>\n\n"
+            "Manage your personal birthday information using the buttons below.\n\n"
+            "<b>🎂 Set Birthday</b>\n➜ Register your birthday for the first time.\n\n"
+            "<b>✏️ Edit Birthday</b>\n➜ Change your previously saved birthday.\n\n"
+            "<b>🗑️ Remove Birthday</b>\n➜ Delete your registered birthday.\n\n"
+            "<b>📅 View My Birthday</b>\n➜ View your currently saved birthday.\n\n"
+            "<b>🔔 Birthday Wishes ON/OFF</b>\n➜ Enable or disable your personal birthday wishes.\n\n"
+            "Choose an option below.")
+    return text, KB([[B("🎂 Set Birthday", callback_data=p + "set"), B("✏️ Edit Birthday", callback_data=p + "upd")],
+                     [B("🗑️ Remove Birthday", callback_data=p + "rm"), B("📅 View My Birthday", callback_data=p + "view")],
+                     [B(f"🔔 Birthday Wishes: {'🟢 ON' if on else '🔴 OFF'}", callback_data=p + "mbt")],
+                     [B("◀️ Back", callback_data=p + "m")]])
+
+
+def _bd_bl_view(owner):
+    """🎉 Birthdays submenu."""
+    p = f"bd:{owner}:"
+    text = ("<b>🎉 BIRTHDAYS</b>\n\n"
+            "Check birthday information using these options.\n\n"
+            "<b>🎉 Today's Birthdays</b>\n➜ View registered users whose birthday is today.\n\n"
+            "<b>📅 Upcoming Birthdays</b>\n➜ View upcoming registered birthdays.\n\n"
+            "Choose an option below.")
+    return text, KB([[B("🎉 Today's Birthdays", callback_data=p + "today"), B("📅 Upcoming Birthdays", callback_data=p + "up")],
+                     [B("◀️ Back", callback_data=p + "m")]])
+
+
+def _bd_back(owner, *first, to="mb"):
+    """Keyboard: optional extra button rows, then ◀️ Back (default: the 🎂 My Birthday submenu)."""
+    return KB([*first, [B("◀️ Back", callback_data=f"bd:{owner}:{to}")]])
 
 
 def _bd_saved_text(d, m, updated):
     return (f"✅ <b>Birthday {'updated' if updated else 'saved'}!</b>\n\n📅 {_bd_fmt_long(d, m)}\n\n"
             "It is registered once for every group: no need to repeat it anywhere. I'll wish you in the "
             "groups we share that have birthday announcements on. You can change this any time in "
-            "🔔 Personal Wish Settings.")
+            "🎂 My Birthday → 🔔 Birthday Wishes.")
 
 
 async def _bd_profile_birthday(bot, uid):
@@ -3290,9 +3316,9 @@ async def _bd_today_view(bot, chat, requester, owner):
     shown = await _bd_visible(bot, chat, requester, items, 20)
     head = f"🎉 <b>TODAY'S BIRTHDAYS</b>\n📅 {today.day} {_bd_cal.month_name[today.month]} {today.year}\n\n"
     if not shown:
-        return head + "No birthdays to celebrate today 🎈\nRegister yours with 🎂 Set My Birthday!", _bd_back(owner)
+        return head + "No birthdays to celebrate today 🎈\nRegister yours with 🎂 My Birthday → 🎂 Set Birthday!", _bd_back(owner, to="bl")
     lines = [f"🎂 {_mention(u, r.get('n'))} — {_bd_fmt(*_bd_eff(r['d'], r['m'], today.year))}" for u, r in shown]
-    return head + "\n".join(lines), _bd_back(owner)
+    return head + "\n".join(lines), _bd_back(owner, to="bl")
 
 
 async def _bd_upcoming_view(bot, chat, requester, owner):
@@ -3302,33 +3328,14 @@ async def _bd_upcoming_view(bot, chat, requester, owner):
     shown = await _bd_visible(bot, chat, requester, [(u, r) for _, u, r in dated], 10)
     head = "📆 <b>UPCOMING BIRTHDAYS</b>\n\n"
     if not shown:
-        return head + "No upcoming birthdays yet 🎈\nRegister yours with 🎂 Set My Birthday!", _bd_back(owner)
+        return head + "No upcoming birthdays yet 🎈\nRegister yours with 🎂 My Birthday → 🎂 Set Birthday!", _bd_back(owner, to="bl")
     lines = []
     for u, r in shown:
         cand = by_uid[u][0]
         n = (cand - today).days
         when = "tomorrow" if n == 1 else f"in {n} days"
         lines.append(f"🎂 {_mention(u, r.get('n'))} — {cand.day} {_bd_cal.month_name[cand.month]} ({when})")
-    return head + "\n".join(lines), _bd_back(owner)
-
-
-def _bd_pw_view(owner, uid):
-    o = _bd_opts(uid)
-    onoff = lambda v: "ON ✅" if v else "OFF ❌"
-    p = f"bd:{owner}:"
-    text = ("🔔 <b>PERSONAL WISH SETTINGS</b>\n\n"
-            f"💌 <b>Personal birthday wishes: {onoff(o['pm'])}</b>\n"
-            "I send you a private birthday message on your day. I can only do this if you have started a "
-            "chat with me.\n\n"
-            f"👥 <b>Group announcements: {onoff(o['grp'])}</b>\n"
-            "Your registered birthday may be announced in the groups we share (where admins have "
-            "announcements on) and shown in the birthday lists.\n\n"
-            "The two switches are independent.")
-    if not _bd_rec(uid):
-        text += "\n\n<i>You haven't registered a birthday yet; your choices are saved for when you do.</i>"
-    return text, _bd_back(owner,
-                          [B(f"💌 Personal wishes: {onoff(o['pm'])}", callback_data=p + "pwp")],
-                          [B(f"👥 Group announcements: {onoff(o['grp'])}", callback_data=p + "pwg")])
+    return head + "\n".join(lines), _bd_back(owner, to="bl")
 
 
 async def _bd_bot_can_post(bot, chat_id):
@@ -3350,13 +3357,16 @@ async def _bd_gs_view(bot, chat, owner, note=""):
     perm = {True: "✅ I can post here", False: "⚠️ I can't send messages in this group",
             None: "❔ I couldn't check my permissions here"}[can]
     p = f"bd:{owner}:"
-    toggle = B("🚫 Disable announcements", callback_data=p + "goff") if on else \
-        B("✅ Enable announcements", callback_data=p + "gon")
-    text = ("⚙️ <b>GROUP BIRTHDAY SETTINGS</b>\n\n"
-            f"Automatic birthday announcements in this group: <b>{'ON ✅' if on else 'OFF ❌'}</b>\n{perm}\n\n"
-            "Only members who registered a birthday (and allow group announcements) are announced. "
-            "Telegram lets a bot confirm other members reliably only where it is an admin.")
-    return (text + (f"\n\n{note}" if note else "")), _bd_back(owner, [toggle])
+    text = ("<b>⚙️ BIRTHDAY SETTINGS</b>\n\n"
+            "Manage birthday announcements and messages for this group.\n\n"
+            "<b>📝 Customize Birthday Wish</b>\n➜ Set a custom birthday greeting for this group.\n\n"
+            "<b>🔄 Reset Birthday</b>\n➜ Restore the default birthday greeting for this group.\n\n"
+            "<b>🎂 Birthday Status: ON/OFF</b>\n➜ Enable or disable automatic birthday announcements in this group.\n\n"
+            f"Choose an option below.\n\n{perm}")
+    return (text + (f"\n{note}" if note else "")), KB([
+        [B("📝 Customize Birthday Wish", callback_data=p + "cwm:c"), B("🔄 Reset Birthday", callback_data=p + "cwr:c")],
+        [B(f"🎂 Birthday Status: {'🟢 ON' if on else '🔴 OFF'}", callback_data=p + ("goff" if on else "gon"))],
+        [B("◀️ Back", callback_data=p + "m")]])
 
 
 # ------------------------------------------------------------------ menu / callbacks
@@ -3366,7 +3376,8 @@ async def wish_cmd(update, context):
     if not msg or not user or user.is_bot or not await _cool(update, 3):
         return
     text, kb = _bd_menu_view(user.id)
-    await msg.reply_html(text, reply_markup=kb, disable_web_page_preview=True)
+    sent = await msg.reply_html(text, reply_markup=kb, disable_web_page_preview=True)
+    extra.remember_menu_owner(sent, user.id)      # so ◀️ Back (to /help) works for this message too
 
 
 async def birthday_menu_from_help(update, context):
@@ -3423,20 +3434,27 @@ async def _bd_on_callback(update, context):
                 return await q.message.delete()
             except TelegramError:
                 return await show("Menu closed.", None)
+        if act in ("mb", "bl"):                  # 🎂 My Birthday / 🎉 Birthdays submenus
+            _bd_S.pop(key, None)
+            await _t_ans(q)
+            return await show(*(_bd_mb_view(owner, uid) if act == "mb" else _bd_bl_view(owner)))
         if act.startswith("cw"):                 # ✍️ Customize Birthday Wish (answers the callback itself)
             return await _bd_cw_callback(q, context, owner, act, arg)
         await _t_ans(q)
         rec = _bd_rec(uid)
+        if act == "mbt":                         # flips the existing personal-wish preference ("pm")
+            _bd_set_opt(uid, "pm", not _bd_opts(uid)["pm"])
+            return await show(*_bd_mb_view(owner, uid))
         if act == "set":
             if rec:
                 return await show(f"🎂 You already have a birthday registered: <b>{_bd_fmt_long(rec['d'], rec['m'])}</b>"
                                   "\n\nWould you like to update it?",
-                                  _bd_back(owner, [B("✏️ Update it", callback_data=f"bd:{owner}:go")]))
+                                  _bd_back(owner, [B("✏️ Edit Birthday", callback_data=f"bd:{owner}:go")]))
             return await _bd_prompt(q, context, owner, uid, None)
         if act == "upd":
             if not rec:
                 return await show("You haven't registered a birthday yet.",
-                                  _bd_back(owner, [B("🎂 Set My Birthday", callback_data=f"bd:{owner}:go")]))
+                                  _bd_back(owner, [B("🎂 Set Birthday", callback_data=f"bd:{owner}:go")]))
             return await _bd_prompt(q, context, owner, uid, rec)
         if act == "go":
             return await _bd_prompt(q, context, owner, uid, rec)
@@ -3452,9 +3470,9 @@ async def _bd_on_callback(update, context):
         if act == "view":
             if not rec:
                 return await show("📅 You haven't registered a birthday yet.",
-                                  _bd_back(owner, [B("🎂 Set My Birthday", callback_data=f"bd:{owner}:go")]))
+                                  _bd_back(owner, [B("🎂 Set Birthday", callback_data=f"bd:{owner}:go")]))
             return await show(f"📅 <b>Your birthday</b>\n\n{_bd_fmt_long(rec['d'], rec['m'])}",
-                              _bd_back(owner, [B("✏️ Update My Birthday", callback_data=f"bd:{owner}:go")]))
+                              _bd_back(owner, [B("✏️ Edit Birthday", callback_data=f"bd:{owner}:go")]))
         if act == "rm":
             if not rec:
                 return await show("🗑️ You have no registered birthday to remove.", _bd_back(owner))
@@ -3470,19 +3488,15 @@ async def _bd_on_callback(update, context):
             return await show(*await _bd_today_view(bot, chat, uid, owner))
         if act == "up":
             return await show(*await _bd_upcoming_view(bot, chat, uid, owner))
-        if act == "pw":
-            return await show(*_bd_pw_view(owner, uid))
-        if act in ("pwp", "pwg"):
-            which = "pm" if act == "pwp" else "grp"
-            _bd_set_opt(uid, which, not _bd_opts(uid)[which])
-            return await show(*_bd_pw_view(owner, uid))
+        if act in ("pw", "pwp", "pwg"):          # buttons of the removed old settings screen (stale messages): show the new menu
+            return await show(*_bd_mb_view(owner, uid))
         if act in ("gs", "gon", "goff"):
             if chat.type == "private":
-                return await show("⚙️ <b>GROUP BIRTHDAY SETTINGS</b>\n\nOpen this menu inside a group "
+                return await show("<b>⚙️ BIRTHDAY SETTINGS</b>\n\nOpen this menu inside a group "
                                   "(with /wish) as one of its admins to change that group's setting.",
-                                  _bd_back(owner))
+                                  _bd_back(owner, to="m"))
             if not await D.is_admin(chat, uid):
-                return await _t_ans(q, "Only group admins can use the group birthday settings.", True)
+                return await _t_ans(q, _BD_ADMIN_ONLY, True)
             note = ""
             if act in ("gon", "goff"):
                 M.set_setting(chat.id, "bdaygrp", "1" if act == "gon" else "0")   # this group only
@@ -3635,17 +3649,7 @@ async def _bd_wish_perm(chat, uid, scope):
         return False, "Open this menu inside a group (with /wish) to change that group's message."
     if await D.is_admin(chat, uid):
         return True, ""
-    return False, "Only group admins can change this group's birthday message."
-
-
-def _bd_cw_chooser(owner):
-    p = f"bd:{owner}:"
-    return ("✍️ <b>CUSTOMIZE BIRTHDAY WISH</b>\n\n"
-            "👥 <b>Group Birthday Message</b>: this group's own birthday announcement (group admins only). "
-            "Other groups are never affected. Without a custom message the built-in default is used.",
-            KB([[B("👥 Group Birthday Message", callback_data=p + "cwm:c")],
-                [B("🔙 Back", callback_data=p + "m")],
-                [B("❌ Cancel", callback_data=p + "cwx")]]))
+    return False, _BD_ADMIN_ONLY
 
 
 def _bd_cw_menu(owner, scope, chat_id):
@@ -3659,8 +3663,7 @@ def _bd_cw_menu(owner, scope, chat_id):
     return text, KB([[B("✍️ Set Custom Message", callback_data=f"{p}cws:{scope}")],
                      [B("👁️ Preview Current Message", callback_data=f"{p}cwp:{scope}")],
                      [B("♻️ Reset to Default", callback_data=f"{p}cwr:{scope}")],
-                     [B("🔙 Back", callback_data=f"{p}cw")],
-                     [B("❌ Cancel", callback_data=f"{p}cwx")]])
+                     [B("🔙 Back", callback_data=f"{p}gs")]])
 
 
 def _bd_confirm_view(owner, scope, tpl, user, replacing):
@@ -3677,20 +3680,19 @@ async def _bd_cw_callback(q, context, owner, act, arg):
     bot, chat, uid, mid = context.bot, q.message.chat, q.from_user.id, q.message.message_id
     key, p = (chat.id, uid), f"bd:{owner}:"
     show = lambda text, kb: _t_edit(bot, chat.id, mid, text, kb)
-    if act == "cwx":
-        _bd_S.pop(key, None)
-        await _t_ans(q, "Cancelled.")
-        return await show(*_bd_menu_view(owner))
-    if act == "cw":
-        _bd_S.pop(key, None)
-        await _t_ans(q)
-        return await show(*_bd_cw_chooser(owner))
     scope = arg if arg in _BDAY_SCOPE else None
+    if scope is None and act in ("cw", "cwx"):     # buttons of the removed old chooser (stale messages)
+        scope = "c"
     if scope is None:
         return await _t_ans(q)
-    ok, why = await _bd_wish_perm(chat, uid, scope)
+    ok, why = await _bd_wish_perm(chat, uid, scope)      # owner/admin only, checked on every action
     if not ok:
-        return await _t_ans(q, "⛔ " + why, True)
+        _bd_S.pop(key, None)
+        return await _t_ans(q, why, True)
+    if act in ("cw", "cwx"):
+        _bd_S.pop(key, None)
+        await _t_ans(q)
+        return await show(*await _bd_gs_view(bot, chat, owner))
     target = chat.id                      # always the group this menu was opened in
     label = _BDAY_SCOPE[scope]
     back = KB([[B("🔙 Back", callback_data=f"{p}cwm:{scope}")]])
@@ -3731,7 +3733,7 @@ async def _bd_cw_callback(q, context, owner, act, arg):
         if (not st or st.get("kind") != "msg" or st.get("step") != "confirm" or st.get("scope") != scope
                 or st.get("mid") != mid or time.time() - st["ts"] > BDAY_STATE_TTL):
             _bd_S.pop(key, None)
-            return await _t_ans(q, "This form expired. Open ✍️ Customize Birthday Wish again.", True)
+            return await _t_ans(q, "This form expired. Open 📝 Customize Birthday Wish again.", True)
         try:
             M.set_setting(target, BDAY_MSG_KEY, st["draft"])
         except Exception as e:
@@ -3750,14 +3752,15 @@ async def _bd_cw_callback(q, context, owner, act, arg):
             return await _t_ans(q, "⚠️ The database isn't answering right now. Please try again.", True)
         await _t_ans(q)
         restored = "the built-in default message"
+        back_gs = KB([[B("🔙 Back", callback_data=f"{p}gs")]])
         if not has:
-            return await show(f"ℹ️ There is no custom {label.lower()} message to reset.", back)
+            return await show(f"ℹ️ There is no custom {label.lower()} message to reset.", back_gs)
         if act == "cwr":
             return await show(f"🔄 Reset the {label.lower()} message?\n\nIt will go back to {restored}. "
                               "Birthdays, preferences and announcement history are not affected.",
                               KB([[B("♻️ Yes, reset it", callback_data=f"{p}cwry:{scope}")],
-                                  [B("❌ No", callback_data=f"{p}cwm:{scope}")]]))
-        return await show(f"♻️ <b>{label} message reset.</b>\n\nNow using {restored}.", back)
+                                  [B("❌ No", callback_data=f"{p}gs")]]))
+        return await show(f"♻️ <b>{label} message reset.</b>\n\nNow using {restored}.", back_gs)
     await _t_ans(q)
 
 
@@ -3775,7 +3778,7 @@ async def _bd_wish_input(update, context, st):
     ok, why = await _bd_wish_perm(chat, user.id, scope)
     if not ok:
         _bd_S.pop(key, None)
-        await msg.reply_text("⛔ " + why)
+        await msg.reply_text(why)
         return
     tpl, err = _bd_validate_wish(msg)
     if err:

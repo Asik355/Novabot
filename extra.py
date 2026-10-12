@@ -2223,7 +2223,7 @@ AI_MENU_TEXT = (
 )
 
 
-MENU_NOT_YOURS = "🔒 Yeh kisi aur ka hai! Tum apna menu khud kholo, phir apna kaam karo. 😎"
+MENU_NOT_YOURS = "🔒 This menu belongs to someone else! Please open your own menu and continue your work. 😎"
 _MENU_ANON_ID = 1087968824    # Telegram's "Group Anonymous Bot": the real admin can't be told apart
 _menu_owners = {}             # (chat_id, message_id) -> Telegram user ID of whoever opened that menu
 
