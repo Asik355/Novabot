@@ -3221,6 +3221,7 @@ def _bd_menu_view(owner):
                 [B("📆 Upcoming Birthdays", callback_data=p + "up")],
                 [B("🔔 Personal Wish Settings", callback_data=p + "pw")],
                 [B("⚙️ Group Birthday Settings", callback_data=p + "gs")],
+                [B("✍️ Customize Birthday Wish", callback_data=p + "cw")],
                 [B("❌ Close", callback_data=p + "x")]]))
 
 
@@ -3404,6 +3405,7 @@ async def _bd_on_callback(update, context):
     try:
         p = (q.data or "").split(":")
         owner, act = int(p[1]), p[2]
+        arg = p[3] if len(p) > 3 else ""
         bot, chat, uid, mid = context.bot, q.message.chat, q.from_user.id, q.message.message_id
         if uid != owner:
             return await _t_ans(q, _t_NOT_YOURS, True)
@@ -3421,6 +3423,8 @@ async def _bd_on_callback(update, context):
                 return await q.message.delete()
             except TelegramError:
                 return await show("Menu closed.", None)
+        if act.startswith("cw"):                 # ✍️ Customize Birthday Wish (answers the callback itself)
+            return await _bd_cw_callback(q, context, owner, act, arg)
         await _t_ans(q)
         rec = _bd_rec(uid)
         if act == "set":
@@ -3503,6 +3507,8 @@ async def _bd_on_text(update, context):
     if time.time() - st["ts"] > BDAY_STATE_TTL:
         _bd_S.pop((chat.id, user.id), None)
         return
+    if st.get("kind") == "msg":                 # waiting for a custom wish text, not a DD-MM
+        return await _bd_wish_input(update, context, st)
     parsed = _bd_parse(msg.text)
     if parsed is None:
         replied = msg.reply_to_message is not None and msg.reply_to_message.message_id == st["mid"]
@@ -3524,6 +3530,271 @@ async def _bd_on_text(update, context):
     text, kb = _bd_saved_text(parsed[0], parsed[1], updated), _bd_back(user.id)
     if not await _t_edit(context.bot, chat.id, st["mid"], text, kb):
         await msg.reply_html(text, reply_markup=kb)
+
+
+# ------------------------------------------------------------------ custom birthday wish
+# Templates live in the existing `settings` collection under the key "bdaymsg" (no new collection):
+#   a group id  -> that group's OWN announcement (every group is fully independent)
+# Used at announce time as: this group's message, else the built-in BDAY_MESSAGE. There is no global
+# or cross-group fallback (any old chat-0 "bdaymsg" value is simply ignored and left untouched).
+# Templates are stored as Telegram HTML taken from msg.text_html, so the author's own formatting is kept
+# and all plain text is already escaped. Resetting only deletes this one key: birthdays, preferences and
+# the "already announced today" stamps are never touched.
+BDAY_MSG_KEY = "bdaymsg"
+BDAY_MSG_MAX = 700             # plain-text characters
+BDAY_MSG_HTML_MAX = 2000       # stored HTML length (formatting tags included)
+BDAY_MSG_MAX_PLACEHOLDERS = 5  # keeps the rendered text far below Telegram's 4096 limit
+BDAY_PLACEHOLDERS = ("{user_mention}", "{first_name}", "{date}")
+_BDAY_PH_RE = re.compile(r"\{(user_mention|first_name|date)\}")
+_BDAY_BRACE_RE = re.compile(r"\{[^{}]*\}")
+_BDAY_SCOPE = {"c": "Group"}
+_BDAY_SRC = {"group": "this group's custom message", "default": "the built-in default message"}
+_BDAY_EXAMPLE = ("🎉🎂 HAPPY BIRTHDAY, {first_name}! 🎂🎉\n\n"
+                 "Everyone, please wish {user_mention} a wonderful birthday! 🥳\n\n"
+                 "May your day be full of happiness, success, and amazing memories! 🎁✨")
+
+
+def _bd_msg_get(chat_id):
+    """The custom template stored for this group chat id, or None."""
+    raw = M.get_setting(chat_id, BDAY_MSG_KEY)
+    raw = str(raw) if raw else ""
+    return raw if raw.strip() else None
+
+
+def _bd_effective(scope, chat_id):
+    """(template, source) that applies to this group: its own custom message, else the built-in default."""
+    t = _bd_msg_get(chat_id)
+    if t:
+        return t, "group"
+    return BDAY_MESSAGE, "default"
+
+
+def _bd_template(gid):
+    try:
+        return _bd_effective("c", gid)
+    except Exception as e:                                    # a DB hiccup must never stop a birthday wish
+        log.warning("birthday: couldn't read the custom message (%s); using the default", type(e).__name__)
+        return BDAY_MESSAGE, "default"
+
+
+def _bd_render_wish(tpl, uid, name, first, date_text):
+    """Fill the placeholders in ONE pass (a name can never inject another placeholder)."""
+    vals = {"user_mention": _mention(uid, name), "first_name": _esc(first or name or "friend"),
+            "date": _esc(date_text)}
+    return _BDAY_PH_RE.sub(lambda m: vals[m.group(1)], tpl)
+
+
+async def _bd_send_wish(bot, gid, uid, name, first, rec, today):
+    tpl, src = _bd_template(gid)
+    date_text = _bd_fmt(*_bd_eff(rec["d"], rec["m"], today.year))
+    try:
+        return await bot.send_message(gid, _bd_render_wish(tpl, uid, name, first, date_text),
+                                      parse_mode="HTML", disable_web_page_preview=True)
+    except BadRequest as e:
+        if src == "default":
+            raise
+        log.warning("birthday: the custom message for chat %s was rejected (%s); sending the default", gid, e)
+        return await bot.send_message(gid, _bd_render_wish(BDAY_MESSAGE, uid, name, first, date_text),
+                                      parse_mode="HTML", disable_web_page_preview=True)
+
+
+def _bd_preview_html(tpl, user):
+    rec = _bd_rec(user.id)
+    date_text = _bd_fmt(*_bd_eff(rec["d"], rec["m"], extra._today().year)) if rec else "25 December"
+    return _bd_render_wish(tpl, user.id, user.full_name or user.first_name or "friend", user.first_name, date_text)
+
+
+def _bd_validate_wish(msg):
+    """(html_template, error_html) for a message the user sent as their custom wish."""
+    ph_help = ", ".join(f"<code>{x}</code>" for x in BDAY_PLACEHOLDERS)
+    plain = (msg.text or "").strip()
+    if not plain:
+        return None, "⚠️ The message can't be empty. Please send your birthday message."
+    if len(plain) > BDAY_MSG_MAX:
+        return None, f"⚠️ That's too long ({len(plain)} characters). The limit is {BDAY_MSG_MAX}."
+    if "{" in _BDAY_BRACE_RE.sub("", plain) or "}" in _BDAY_BRACE_RE.sub("", plain):
+        return None, f"⚠️ There is an unmatched curly brace. Placeholders must look like {ph_help}."
+    found = _BDAY_BRACE_RE.findall(plain)
+    bad = sorted({f for f in found if f not in BDAY_PLACEHOLDERS})
+    if bad:
+        return None, (f"⚠️ Unsupported placeholder(s): {', '.join(f'<code>{_esc(b)}</code>' for b in bad)}.\n"
+                      f"Supported: {ph_help}.")
+    if len(found) > BDAY_MSG_MAX_PLACEHOLDERS:
+        return None, f"⚠️ Please use at most {BDAY_MSG_MAX_PLACEHOLDERS} placeholders in total."
+    tpl = (msg.text_html or "").strip()
+    if len(_BDAY_PH_RE.findall(tpl)) != len(found):
+        return None, "⚠️ Don't apply bold/italic/links to only part of a placeholder. Format the whole placeholder or none of it."
+    if len(tpl) > BDAY_MSG_HTML_MAX:
+        return None, f"⚠️ With its formatting that message is too long. Please shorten it."
+    return tpl, None
+
+
+async def _bd_wish_perm(chat, uid, scope):
+    """(allowed, reason). Only an admin of the group this menu was opened in."""
+    if chat.type == "private":
+        return False, "Open this menu inside a group (with /wish) to change that group's message."
+    if await D.is_admin(chat, uid):
+        return True, ""
+    return False, "Only group admins can change this group's birthday message."
+
+
+def _bd_cw_chooser(owner):
+    p = f"bd:{owner}:"
+    return ("✍️ <b>CUSTOMIZE BIRTHDAY WISH</b>\n\n"
+            "👥 <b>Group Birthday Message</b>: this group's own birthday announcement (group admins only). "
+            "Other groups are never affected. Without a custom message the built-in default is used.",
+            KB([[B("👥 Group Birthday Message", callback_data=p + "cwm:c")],
+                [B("🔙 Back", callback_data=p + "m")],
+                [B("❌ Cancel", callback_data=p + "cwx")]]))
+
+
+def _bd_cw_menu(owner, scope, chat_id):
+    p = f"bd:{owner}:"
+    try:
+        src = _bd_effective(scope, chat_id)[1]
+    except Exception:
+        src = "default"
+    text = (f"✍️ <b>GROUP BIRTHDAY MESSAGE</b>\n\nCurrently using {_BDAY_SRC[src]}.\n\n"
+            "Placeholders: " + ", ".join(f"<code>{x}</code>" for x in BDAY_PLACEHOLDERS))
+    return text, KB([[B("✍️ Set Custom Message", callback_data=f"{p}cws:{scope}")],
+                     [B("👁️ Preview Current Message", callback_data=f"{p}cwp:{scope}")],
+                     [B("♻️ Reset to Default", callback_data=f"{p}cwr:{scope}")],
+                     [B("🔙 Back", callback_data=f"{p}cw")],
+                     [B("❌ Cancel", callback_data=f"{p}cwx")]])
+
+
+def _bd_confirm_view(owner, scope, tpl, user, replacing):
+    p = f"bd:{owner}:"
+    note = "⚠️ This will <b>replace</b> the current custom message.\n\n" if replacing else ""
+    text = (f"👀 <b>PREVIEW</b> ({_BDAY_SCOPE[scope]} message)\n\n{note}{_bd_preview_html(tpl, user)}\n\n"
+            "<i>Shown with your own name. Save this message?</i>")
+    return text, KB([[B("✅ Save Message", callback_data=f"{p}cwsave:{scope}")],
+                     [B("✏️ Edit Again", callback_data=f"{p}cws:{scope}")],
+                     [B("❌ Cancel", callback_data=f"{p}cwm:{scope}")]])
+
+
+async def _bd_cw_callback(q, context, owner, act, arg):
+    bot, chat, uid, mid = context.bot, q.message.chat, q.from_user.id, q.message.message_id
+    key, p = (chat.id, uid), f"bd:{owner}:"
+    show = lambda text, kb: _t_edit(bot, chat.id, mid, text, kb)
+    if act == "cwx":
+        _bd_S.pop(key, None)
+        await _t_ans(q, "Cancelled.")
+        return await show(*_bd_menu_view(owner))
+    if act == "cw":
+        _bd_S.pop(key, None)
+        await _t_ans(q)
+        return await show(*_bd_cw_chooser(owner))
+    scope = arg if arg in _BDAY_SCOPE else None
+    if scope is None:
+        return await _t_ans(q)
+    ok, why = await _bd_wish_perm(chat, uid, scope)
+    if not ok:
+        return await _t_ans(q, "⛔ " + why, True)
+    target = chat.id                      # always the group this menu was opened in
+    label = _BDAY_SCOPE[scope]
+    back = KB([[B("🔙 Back", callback_data=f"{p}cwm:{scope}")]])
+    if act == "cwm":
+        _bd_S.pop(key, None)
+        await _t_ans(q)
+        return await show(*_bd_cw_menu(owner, scope, chat.id))
+    if act == "cwp":
+        await _t_ans(q)
+        try:
+            tpl, src = _bd_effective(scope, chat.id)
+        except Exception as e:
+            log.warning("birthday: couldn't read the custom message (%s)", type(e).__name__)
+            return await show("⚠️ The database isn't answering right now. Please try again in a moment.", back)
+        text = (f"👀 <b>CURRENT MESSAGE</b> ({label})\nUsing {_BDAY_SRC[src]}.\n\n"
+                f"{_bd_preview_html(tpl, q.from_user)}\n\n<i>Shown with your own name.</i>")
+        if not await show(text, back):
+            await show("⚠️ Telegram couldn't display the stored message, so it won't be announced as written "
+                       "(the default is used instead). Please set a new one.", back)
+        return
+    if act == "cws":
+        await _t_ans(q)
+        if len(_bd_S) > 2000:
+            _bd_S.clear()
+        _bd_S[key] = {"kind": "msg", "scope": scope, "mid": mid, "ts": time.time(), "step": "input"}
+        how = ("Send it as a <b>reply to this message</b>." if chat.type != "private"
+               else "Send it now as a normal message.")
+        text = (f"✍️ <b>SET {label.upper()} MESSAGE</b>\n\nPlease send the birthday announcement. {how}\n\n"
+                "Placeholders: " + ", ".join(f"<code>{x}</code>" for x in BDAY_PLACEHOLDERS) + "\n"
+                f"• <code>{{user_mention}}</code> mentions the birthday person\n"
+                f"• <code>{{first_name}}</code> their first name\n"
+                f"• <code>{{date}}</code> their birthday date\n\n"
+                f"You can use Telegram formatting (bold, italic...). Max {BDAY_MSG_MAX} characters. "
+                f"You'll see a preview before anything is saved.\n\nExample:\n<code>{_esc(_BDAY_EXAMPLE)}</code>")
+        return await show(text, KB([[B("❌ Cancel", callback_data=f"{p}cwm:{scope}")]]))
+    if act == "cwsave":
+        st = _bd_S.get(key)
+        if (not st or st.get("kind") != "msg" or st.get("step") != "confirm" or st.get("scope") != scope
+                or st.get("mid") != mid or time.time() - st["ts"] > BDAY_STATE_TTL):
+            _bd_S.pop(key, None)
+            return await _t_ans(q, "This form expired. Open ✍️ Customize Birthday Wish again.", True)
+        try:
+            M.set_setting(target, BDAY_MSG_KEY, st["draft"])
+        except Exception as e:
+            log.warning("birthday: couldn't save the custom message (%s)", type(e).__name__)
+            return await _t_ans(q, "⚠️ I couldn't save that right now. Please try again.", True)
+        _bd_S.pop(key, None)
+        await _t_ans(q, "Saved ✅")
+        return await show(f"✅ <b>{label} birthday message saved.</b>\n\nIt now applies to this group only.", back)
+    if act in ("cwr", "cwry"):
+        try:
+            has = _bd_msg_get(target)
+            if act == "cwry" and has:
+                M.del_setting(target, BDAY_MSG_KEY)       # only the message: birthdays/history stay
+        except Exception as e:
+            log.warning("birthday: couldn't reset the custom message (%s)", type(e).__name__)
+            return await _t_ans(q, "⚠️ The database isn't answering right now. Please try again.", True)
+        await _t_ans(q)
+        restored = "the built-in default message"
+        if not has:
+            return await show(f"ℹ️ There is no custom {label.lower()} message to reset.", back)
+        if act == "cwr":
+            return await show(f"🔄 Reset the {label.lower()} message?\n\nIt will go back to {restored}. "
+                              "Birthdays, preferences and announcement history are not affected.",
+                              KB([[B("♻️ Yes, reset it", callback_data=f"{p}cwry:{scope}")],
+                                  [B("❌ No", callback_data=f"{p}cwm:{scope}")]]))
+        return await show(f"♻️ <b>{label} message reset.</b>\n\nNow using {restored}.", back)
+    await _t_ans(q)
+
+
+async def _bd_wish_input(update, context, st):
+    """The text a user sends after 'Set Custom Message'."""
+    msg, user, chat, bot = update.effective_message, update.effective_user, update.effective_chat, context.bot
+    key = (chat.id, user.id)
+    if st.get("step") != "input":
+        return
+    if chat.type != "private":          # in groups only a reply to the menu message counts (no chat hijacking)
+        rep = msg.reply_to_message
+        if rep is None or rep.message_id != st["mid"]:
+            return
+    scope = st["scope"]
+    ok, why = await _bd_wish_perm(chat, user.id, scope)
+    if not ok:
+        _bd_S.pop(key, None)
+        await msg.reply_text("⛔ " + why)
+        return
+    tpl, err = _bd_validate_wish(msg)
+    if err:
+        await msg.reply_html(err)
+        return
+    try:
+        replacing = _bd_msg_get(chat.id) is not None
+    except Exception as e:
+        log.warning("birthday: couldn't read the custom message (%s)", type(e).__name__)
+        await msg.reply_text("⚠️ The database isn't answering right now. Please send it again in a moment.")
+        return
+    text, kb = _bd_confirm_view(user.id, scope, tpl, user, replacing)
+    if not await _t_edit(bot, chat.id, st["mid"], text, kb):
+        sent = await _t_send(bot, chat.id, text, kb)       # menu message gone? try a fresh one
+        if not sent:
+            await msg.reply_text("⚠️ Telegram couldn't display that formatting. Please simplify the message and send it again.")
+            return
+        st["mid"] = sent.message_id
+    st.update(draft=tpl, step="confirm", ts=time.time())
 
 
 # ------------------------------------------------------------------ scheduler + announcements
@@ -3550,8 +3821,7 @@ async def _bd_announce(bot, uid, rec, gid, today):
     prev = M.get_setting(gid, key)
     M.set_setting(gid, key, stamp)             # claim first (synchronous): two runs can't both send
     try:
-        await bot.send_message(gid, BDAY_MESSAGE.replace("{user_mention}", _mention(uid, name)),
-                               parse_mode="HTML", disable_web_page_preview=True)
+        await _bd_send_wish(bot, gid, uid, name, member.first_name, rec, today)
     except _BdRetryAfter as e:
         _bd_release(gid, key, prev)
         wait = getattr(e, "retry_after", BDAY_RETRY_SECS)       # int, or a timedelta in newer versions
