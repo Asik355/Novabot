@@ -453,7 +453,15 @@ def _dash_text(title, g):
             f"🏆 <b>Last Milestone:</b> {f'{last:,}' if last else 'None yet'}\n\n"
             f"🎯 <b>Next Milestone:</b> {nxt:,}\n\n"
             f"📨 <b>Messages Until Next Milestone:</b> {max(nxt - total, 0):,}\n\n"
-            f"🔔 <b>Message Counting:</b> {'ON' if on else 'OFF'}")
+            f"🔔 <b>Message Counting:</b> {'ON' if on else 'OFF'}\n\n"
+            "📖 <b>Commands</b>\n"
+            "/rank (or /top) — leaderboard\n"
+            "/today — today's leaderboard\n"
+            "/week — this week's leaderboard\n"
+            "/overall — all-time leaderboard\n"
+            "/me — your messages and rank\n"
+            "/radmin — admins' message count today\n"
+            "/resetrank — reset this group's counts (admins only)")
 
 
 def _dash_kb(g):
