@@ -339,7 +339,7 @@ BL_IMG_MAX_BYTES = 3 * 1024 * 1024
 BL_IMG_MODE = os.environ.get("BLOCKING_AI_IMAGE_MODE", "all").strip().lower()
 BL_TRUST_MSGS = 10           # a member who has sent this many messages in the group is treated as established
 _bl_activity = OrderedDict()  # (chat_id, user_id) -> messages seen since the bot started (in memory only)
-_bl_img_seen = OrderedDict()  # image file_unique_id -> (set of senders, time)
+_bl_img_seen = OrderedDict()  # (chat_id, image file_unique_id) -> (set of senders, time): per group, never shared
 BL_IMG_PER_CHAT_PER_MIN = 6  # image checks per group per minute (beyond it: allowed, no call)
 BL_IMG_PER_USER_PER_MIN = 3  # ... and per sender, so one member can't burn the quota
 _BL_IMG_MIMES = ("image/jpeg", "image/png", "image/webp")
@@ -410,11 +410,15 @@ def _image_suspicious(msg, ctx, verdict, image, prior_msgs, user_id):
     """Why this image deserves a vision call, or None for an ordinary picture (it is then simply allowed).
     Ordinary pictures from established members - memes, anime, screenshots, photos - are never sent to Gemini."""
     now = time.time()
-    seen = _bl_img_seen.pop(image["unique_id"], None)
+    _cid = getattr(getattr(msg, "chat", None), "id", None)
+    if _cid is None:
+        _cid = getattr(msg, "chat_id", None)
+    img_key = (_cid, image["unique_id"])  # per group: posts elsewhere must not count here
+    seen = _bl_img_seen.pop(img_key, None)
     users = set(seen[0]) if seen and now - seen[1] < 3600 else set()
     repeated = bool(users - {user_id})
     users.add(user_id)
-    _bl_img_seen[image["unique_id"]] = (users, now)
+    _bl_img_seen[img_key] = (users, now)
     while len(_bl_img_seen) > 5000:
         _bl_img_seen.popitem(last=False)
     if BL_IMG_MODE == "all":

@@ -1672,6 +1672,10 @@ def _t_top_rated(chat_id):
 
 
 # ------------------------------------------------------------------ telegram helpers
+_t_NOT_YOURS = "🔒 Yeh kisi aur ka hai! Tum apna menu khud kholo, phir apna kaam karo. 😎"
+_t_rate_skipped = set()    # (case_no, user_id): members who skipped that case's rating (per member only)
+
+
 async def _t_ans(q, text=None, alert=False):
     try:
         await q.answer(text, show_alert=alert)
@@ -1958,7 +1962,16 @@ async def _t_h_rate(q, context, p):
     if not c or c["chat_id"] != chat.id:
         return await _t_ans(q, "Case not found.", True)
     if p[3] == "s":
-        return await _t_ans(q, "Skipped. Nothing was recorded.")
+        if c["status"] != "completed":
+            return await _t_ans(q, "You can rate once the trial is over.", True)
+        if (n, uid) in _t_rate_skipped:
+            return await _t_ans(q, "You already skipped this case.", True)
+        if _t_col("trial_ratings").find_one({"case_no": n, "rater_id": uid}, {"_id": 1}):
+            return await _t_ans(q, "You already rated this case.", True)
+        if len(_t_rate_skipped) > 20000:
+            _t_rate_skipped.clear()
+        _t_rate_skipped.add((n, uid))
+        return await _t_ans(q, "⏭️ RATING SKIPPED\n\nNo worries! You can participate in the next trial. ⚖️", True)
     if p[3] not in ("1", "2", "3", "4", "5"):
         return await _t_ans(q)
     if c["status"] != "completed":
@@ -1967,12 +1980,15 @@ async def _t_h_rate(q, context, p):
         return await _t_ans(q, "You can't rate your own trial.", True)
     if not await _t_is_member(bot, chat.id, uid):
         return await _t_ans(q, "Only group members can rate.", True)
+    if (n, uid) in _t_rate_skipped:
+        return await _t_ans(q, "You already skipped this case.", True)
     try:
         _t_col("trial_ratings").insert_one({"case_no": n, "chat_id": chat.id, "rater_id": uid,
                                           "creator_id": c["creator_id"], "rating": int(p[3]), "ts": _t_now()})
     except DuplicateKeyError:
         return await _t_ans(q, "You already rated this case.", True)
-    await _t_ans(q, f"Thanks! You gave {p[3]}⭐")
+    await _t_ans(q, "🌟 RATING SUBMITTED!\n\n✅ Your rating has been recorded successfully!\n\n"
+                    "🏛️ Thanks for helping make the trial system better.\n\n⚖️ The verdict remains unchanged.", True)
     await _t_edit(bot, chat.id, q.message.message_id, _t_rating_text(c), _t_rating_kb(n))
 
 
@@ -2056,7 +2072,7 @@ async def _t_h_menu(q, context, p):
     bot, chat, uid = context.bot, q.message.chat, q.from_user.id
     owner, act = int(p[2]), p[3]
     if uid != owner:
-        return await _t_ans(q, "That's someone else's menu. Send /trial to open your own.", True)
+        return await _t_ans(q, _t_NOT_YOURS, True)
     mid = q.message.message_id
     if act == "main":
         _t_S.pop((chat.id, uid), None)
@@ -2149,7 +2165,7 @@ async def _t_h_settings(q, context, p):
     bot, chat, uid = context.bot, q.message.chat, q.from_user.id
     owner, act = int(p[2]), p[3]
     if uid != owner:
-        return await _t_ans(q, "That's someone else's menu.", True)
+        return await _t_ans(q, _t_NOT_YOURS, True)
     if not await _t_D.is_admin(chat, uid):
         return await _t_ans(q, "Only group admins can change trial settings.", True)
     if act == "pin":
@@ -2222,7 +2238,7 @@ async def _t_h_hist(q, context, p):
     bot, chat, uid = context.bot, q.message.chat, q.from_user.id
     owner, f = int(p[2]), p[3]
     if uid != owner:
-        return await _t_ans(q, "That's someone else's menu. Send /trialhistory for your own.", True)
+        return await _t_ans(q, _t_NOT_YOURS, True)
     await _t_ans(q)
     mid = q.message.message_id
     if f in ("sc", "sa"):
@@ -2285,7 +2301,7 @@ async def _t_lead_show(bot, chat, mid, owner, which):
 async def _t_h_lead(q, context, p):
     owner = int(p[2])
     if q.from_user.id != owner:
-        return await _t_ans(q, "That's someone else's menu. Send /trialleaderboard for your own.", True)
+        return await _t_ans(q, _t_NOT_YOURS, True)
     await _t_ans(q)
     await _t_lead_show(context.bot, q.message.chat, q.message.message_id, owner, "r" if p[3] == "r" else "c")
 
@@ -2402,7 +2418,7 @@ def _t_wz_state(q):
 async def _t_h_wiz(q, context, p):
     bot, chat, uid = context.bot, q.message.chat, q.from_user.id
     if uid != int(p[2]):
-        return await _t_ans(q, "This isn't your trial form. Send /trial to start your own.", True)
+        return await _t_ans(q, _t_NOT_YOURS, True)
     d = _t_wz_state(q)
     if not d:
         await _t_ans(q, "This form expired or was already used. Send /trial to start again.", True)
@@ -2529,7 +2545,7 @@ def _t_tpl_label(t):
 async def _t_h_tpl(q, context, p):
     bot, chat, uid = context.bot, q.message.chat, q.from_user.id
     if uid != int(p[2]):
-        return await _t_ans(q, "This isn't your form.", True)
+        return await _t_ans(q, _t_NOT_YOURS, True)
     d = _t_wz_state(q)
     if not d:
         return await _t_ans(q, "This form expired. Send /trial to start again.", True)
@@ -2923,6 +2939,10 @@ async def _t_settle(bot, case_no):
     sent = await _t_send(bot, c["chat_id"], _t_rating_text(c), _t_rating_kb(c["case_no"]))
     if sent:
         _t_col("trial_cases").update_one({"case_no": case_no}, {"$set": {"rating_message_id": sent.message_id}})
+        try:   # pin exactly the rating-request message; no permission / API error may stop the flow
+            await bot.pin_chat_message(c["chat_id"], sent.message_id, disable_notification=True)
+        except TelegramError as e:
+            _t_log.info("couldn't pin rating message of case %s: %s", case_no, e)
 
 
 def _t_ranked(rows):
@@ -2988,7 +3008,7 @@ async def _t_pts_show(bot, chat, mid, owner, page):
 async def _t_h_pts(q, context, p):
     owner = int(p[2])
     if q.from_user.id != owner:
-        return await _t_ans(q, "That's someone else's menu. Send /trialpoints for your own.", True)
+        return await _t_ans(q, _t_NOT_YOURS, True)
     await _t_ans(q)
     try:
         page = int(p[3])
