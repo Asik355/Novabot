@@ -214,7 +214,7 @@ def _count_sync(chat_id, user_id, name, title, now):
     return doc, created
 
 
-def _board_sync(chat_id, kind, page):
+def _board_page_sync(chat_id, kind, page):
     size = FULL_PAGE_SIZE if kind == "full" else PAGE_SIZE
     c = M.col(COUNTS)
     today, wk0, wk1 = periods()
@@ -237,12 +237,19 @@ def _board_sync(chat_id, kind, page):
     total = res[0]["meta"][0]["c"] if res and res[0]["meta"] else 0
     pages = max(1, -(-total // size))
     if page > pages - 1:
-        return _board_sync(chat_id, kind, pages - 1)
+        return _board_page_sync(chat_id, kind, pages - 1)
     rows = [(r["_id"], None, r["n"]) for r in (res[0]["rows"] if res else [])]
     names = {d["user_id"]: d.get("name") for d in
              c.find({"chat_id": chat_id, "scope": "all", "user_id": {"$in": [r[0] for r in rows]}}, {"user_id": 1, "name": 1})}
     rows = [(u, names.get(u), n) for u, _, n in rows]
     return {"rows": rows, "total": total, "pages": pages, "page": max(page, 0), "size": size}
+
+
+def _board_sync(chat_id, kind, page):
+    """One leaderboard page plus this group's summary (shown above every leaderboard)."""
+    data = _board_page_sync(chat_id, kind, page)
+    data["group"] = _group_sync(chat_id)
+    return data
 
 
 def _me_sync(chat_id, user_id):
@@ -389,6 +396,9 @@ async def outbox_sweeper(app):
 
 
 # ------------------------------------------------------------------ the counter
+_CONTENT_ATTRS = ("text", "caption", "photo", "video", "audio", "voice", "document", "sticker", "animation",
+                  "video_note", "contact", "location", "venue", "poll", "dice", "game", "story", "invoice",
+                  "paid_media", "checklist")
 _seen = OrderedDict()          # (chat_id, message_id) of recently counted messages (bounded)
 _off_until = {}                # chat_id -> monotonic time until which "counting is OFF" is trusted (bounded)
 
@@ -402,6 +412,8 @@ async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if msg.sender_chat is not None or getattr(msg, "is_automatic_forward", None):
         return                                  # channel posts / anonymous-admin posts: no human to credit
+    if not any(getattr(msg, attr, None) for attr in _CONTENT_ATTRS):
+        return                                  # service message (tag/setting changes...): not a message
     until = _off_until.get(chat.id)
     if until and until > time.monotonic():
         return
@@ -441,7 +453,7 @@ async def _is_group_admin(bot, chat_id, user_id):
 
 
 # ------------------------------------------------------------------ texts and keyboards
-def _dash_text(title, g):
+def _dash_text(title, g, commands=True):
     total, initial, interval = int(g.get("total", 0)), int(g.get("initial", DEFAULT_INITIAL)), int(g.get("interval", DEFAULT_INTERVAL))
     last = int(g.get("last_milestone", 0))
     nxt = next_milestone(last, initial, interval)
@@ -453,15 +465,15 @@ def _dash_text(title, g):
             f"🏆 <b>Last Milestone:</b> {f'{last:,}' if last else 'None yet'}\n\n"
             f"🎯 <b>Next Milestone:</b> {nxt:,}\n\n"
             f"📨 <b>Messages Until Next Milestone:</b> {max(nxt - total, 0):,}\n\n"
-            f"🔔 <b>Message Counting:</b> {'ON' if on else 'OFF'}\n\n"
-            "📖 <b>Commands</b>\n"
-            "/rank (or /top) — leaderboard\n"
-            "/today — today's leaderboard\n"
-            "/week — this week's leaderboard\n"
-            "/overall — all-time leaderboard\n"
-            "/me — your messages and rank\n"
-            "/radmin — admins' message count today\n"
-            "/resetrank — reset this group's counts (admins only)")
+            f"🔔 <b>Message Counting:</b> {'ON' if on else 'OFF'}"
+            + ("\n\n📖 <b>Commands</b>\n"
+               "/rank (or /top) — leaderboard\n"
+               "/today — today's leaderboard\n"
+               "/week — this week's leaderboard\n"
+               "/overall — all-time leaderboard\n"
+               "/me — your messages and rank\n"
+               "/radmin — admins' message count today\n"
+               "/resetrank — reset this group's counts (admins only)" if commands else ""))
 
 
 def _dash_kb(g):
@@ -482,7 +494,9 @@ def _settings_text(title, g, draft):
     return ("⚙️ <b>GROUP MILESTONE SETTINGS</b>\n\n"
             f"👥 <b>Group:</b> {_esc(title, 64)}\n\n"
             f"📊 <b>Initial Milestone:</b> {int(g.get('initial', DEFAULT_INITIAL)):,} messages\n\n"
-            f"🔔 <b>Current Interval:</b> {draft:,} messages{note}")
+            f"🔔 <b>Current Interval:</b> {draft:,} messages{note}\n\n"
+            "📖 These settings are changed with the buttons below (group admins only). "
+            "/resetrank resets this group's counts.")
 
 
 def _settings_kb(draft):
@@ -499,6 +513,10 @@ _MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 _KIND_TITLE = {"all": "🏆 Overall", "full": "📊 Complete Leaderboard", "today": "✅ Today", "week": "📅 This Week"}
 
 
+def _chat_title_of(title, data):
+    return title or data["group"].get("name") or "this group"
+
+
 def _board_text(title, kind, data):
     today, wk0, wk1 = periods()
     sub = _KIND_TITLE[kind]
@@ -506,7 +524,7 @@ def _board_text(title, kind, data):
         sub += f" ({today} IST)"
     elif kind == "week":
         sub += f" ({wk0} to {wk1}, IST)"
-    lines = ["📈 <b>LEADERBOARD</b>", "", f"👥 {_esc(title, 64)}", sub, ""]
+    lines = [_dash_text(_chat_title_of(title, data), data["group"], commands=False), "", "📈 <b>LEADERBOARD</b>", "", sub, ""]
     if not data["rows"]:
         lines.append("No messages recorded yet for this period.")
     base = data["page"] * data["size"]
@@ -514,6 +532,8 @@ def _board_text(title, kind, data):
         lines.append(f"{_MEDALS.get(i, f'{i}.')} {_esc(name or f'User {uid}')} — {n:,}")
     if data["pages"] > 1:
         lines += ["", f"Page {data['page'] + 1}/{data['pages']}"]
+    lines += ["", "📖 <b>Commands</b>", "/rank (or /top): all-time leaderboard", "/today: today's leaderboard",
+              "/week: this week's leaderboard", "/me: your messages and rank"]
     return "\n".join(lines)
 
 

@@ -3037,7 +3037,20 @@ BL_MENU_TEXT = ("<b>🔒 Blocking</b>\n\n"
                 "<b>⚖️ Punishment for ads &amp; promotion</b> (admins)\n\n"
                 "1. /adpunish: Set the punishment for ads and promotion in this group, "
                 "for example /adpunish mute 1h\n"
-                "2. /protection: Set the action for Protection (Word and Content) in this group, for example /protection mute 10m")
+                "2. /protection: Set the action for Protection (Word and Content) in this group, for example /protection mute 10m\n\n"
+                "<b>🚫 Words</b> (admins)\n\n"
+                "3. /addblocklist word: Auto-delete messages with this word.\n"
+                "4. /unblocklist word: Remove a blocklisted word.\n"
+                "5. /blocklist: List all blocklisted words.\n"
+                "6. /okword word: Allow a built-in bad word in this group.\n"
+                "7. /unokword word: Block it again.\n"
+                "8. /okwords: List the allowed words.")
+
+
+_BL_CATEGORY_CMDS = {  # "📖 Commands" footer of the Ads / Promotion screens (plain /commands show up highlighted)
+    "ads": "\n\n<b>📖 Commands</b> (admins)\n/adpunish: Set the punishment for ads, for example /adpunish mute 1h.",
+    "promo": "\n\n<b>📖 Commands</b> (admins)\n/adpunish: Set the punishment for promotion, for example /adpunish mute 1h.",
+}
 
 
 def blocking_menu_button():
@@ -3070,6 +3083,7 @@ def _bl_category_screen(chat, key):
     if not AUTOADS_ENABLED:
         text += ("\n\n⚠️ The blocker is switched off for the whole bot (AUTOADS_ENABLED=0), "
                  "so nothing is removed until the bot owner turns it back on.")
+    text += _BL_CATEGORY_CMDS.get(key, "")
     toggle = (InlineKeyboardButton("🔴 Turn OFF", callback_data=f"bl:s:{key}:0") if on
               else InlineKeyboardButton("🟢 Turn ON", callback_data=f"bl:s:{key}:1"))
     rows = [[toggle]] + [list(r) for r in _BL_EXTRA_BUTTONS.get(key, [])]
@@ -3167,6 +3181,28 @@ async def blocking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _BD.set_setting(chat.id, NSFW_CATEGORIES[parts[2]][1], "1" if parts[3] == "1" else "0")
             toast = "Turned ON." if parts[3] == "1" else "Turned OFF."
             text, markup = _bl_nsfw_category_screen(chat, parts[2])
+        elif action == "nw":
+            _bl_allow_pending.pop((chat.id, q.from_user.id), None)
+            text, markup = _bl_allow_screen(chat)
+        elif action == "nwa":
+            for k_ in [k_ for k_, v_ in _bl_allow_pending.items() if v_ < time.time()]:
+                _bl_allow_pending.pop(k_, None)
+            _bl_allow_pending[(chat.id, q.from_user.id)] = time.time() + BL_PENDING_SECS
+            text, markup = _bl_allow_add_screen()
+        elif action == "nwx":
+            _bl_allow_pending.pop((chat.id, q.from_user.id), None)
+            text, markup = _bl_allow_screen(chat)
+        elif action == "nwl":
+            text, markup = _bl_allow_remove_screen(chat)
+        elif action == "nwr" and len(parts) == 3:
+            items = nsfw_allow_list(chat.id)
+            keep = [w for w in items if f"{zlib.crc32(w.encode()):08x}" != parts[2]]
+            if len(keep) != len(items):
+                _nsfw_allow_save(chat.id, keep)
+                toast = "Blocked again."
+            else:
+                toast = "Already removed."
+            text, markup = _bl_allow_screen(chat)
         elif action == "auth":
             _bl_pending.pop((chat.id, q.from_user.id), None)
             text, markup = _bl_auth_screen(chat)
@@ -3201,9 +3237,12 @@ async def blocking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bl_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Group -6: takes the link an admin sends after tapping ➕ Add Promotion (nothing else sees that message)."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not _bl_pending or not msg or not user or not msg.text or chat.type == "private":
+    if not (_bl_pending or _bl_allow_pending) or not msg or not user or not msg.text or chat.type == "private":
         return
     key = (chat.id, user.id)
+    if key in _bl_allow_pending:
+        await _bl_allow_input(msg, chat, user, key)
+        return
     deadline = _bl_pending.get(key)
     if deadline is None:
         return
@@ -3231,6 +3270,26 @@ async def bl_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await msg.reply_html(reply, reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("⭐ Authorized Promotions", callback_data="bl:auth")]]))
+    except TelegramError as e:
+        log.warning("Blocking: couldn't reply in chat %s: %s", chat.id, e)
+    raise ApplicationHandlerStop
+
+
+async def _bl_allow_input(msg, chat, user, key):
+    """The word an admin sends after tapping ➕ Allow a Word (only that admin, only in this group)."""
+    if _bl_allow_pending.get(key, 0) < time.time() or not await _bl_can_manage(chat, user.id):
+        _bl_allow_pending.pop(key, None)
+        return
+    try:
+        ok, reply = _allow_add(chat.id, msg.text)
+    except Exception:
+        log.exception("Blocking: couldn't save an allowed word in chat %s", chat.id)
+        ok, reply = False, "⚠️ I couldn't save that right now. Please try again."
+    if ok:
+        _bl_allow_pending.pop(key, None)
+    try:
+        await msg.reply_html(reply, reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Allowed Words", callback_data="bl:nw")]]))
     except TelegramError as e:
         log.warning("Blocking: couldn't reply in chat %s: %s", chat.id, e)
     raise ApplicationHandlerStop
@@ -3327,7 +3386,7 @@ NSFW_CATEGORIES = {
              "Checks text messages and captions for explicit sexual language and abusive or profane words. "
              "It is a local check that uses no AI. Normal conversation, jokes, names, questions about what "
              "a word means and rule reminders are left alone, and the message is only removed when two "
-             "checks agree. Every word on this group's /blocklist is applied too. "
+             "checks agree. Every word on this group's /blocklist is applied too, and words you allow with /okword are skipped. "
              "Removes it and applies the action set with /protection. Independent of Content."),
     "content": ("🖼️ Content", NSFW_CONTENT_KEY,
                 "Checks photos, videos, GIFs, animations and links for explicit 18+ material. Links are "
@@ -3427,8 +3486,9 @@ def _nsfw_forms(tok):
     return out
 
 
-def _nsfw_scan(text):
-    """-> (strong_hits, ambiguous_hits, phrase_hit) for already-normalised text."""
+def _nsfw_scan(text, allow=frozenset()):
+    """-> (strong_hits, ambiguous_hits, phrase_hit) for already-normalised text.
+    `allow`: built-in words this group allowed with /okword (never counted as hits)."""
     strong, ambig = set(), set()
     for tok in _NSFW_TOKEN_RE.findall(text):
         t = tok.strip("*")
@@ -3450,6 +3510,9 @@ def _nsfw_scan(text):
             if w in joined:
                 strong.add(w)
     leet = _NSFW_TOKEN_RE.sub(lambda m: m.group(0).translate(_NSFW_LEET) if any(c.isalpha() for c in m.group(0)) else m.group(0), text)
+    if allow:
+        strong -= allow
+        ambig -= allow
     return strong, ambig, bool(_NSFW_PHRASE_RE.search(text) or _NSFW_PHRASE_RE.search(leet))
 
 
@@ -3464,24 +3527,24 @@ def _nsfw_decide(strong, ambig, phrase):
 
 
 @lru_cache(maxsize=4096)
-def _nsfw_word_verdict(text):
+def _nsfw_word_verdict(text, allow=frozenset()):
     """'' when clean, otherwise a short reason. Pure local logic, cached per message text."""
     t = unicodedata.normalize("NFKC", text or "").lower()[:2000]
     t = _INVISIBLE_RE.sub("", t)
     t = _NSFW_URL_RE.sub(" ", t)
     # check 1: the whole text
-    if not _nsfw_decide(*_nsfw_scan(t)):
+    if not _nsfw_decide(*_nsfw_scan(t, allow)):
         return ""
     # check 2: only with the context rules applied (rule reminders, "what does X mean", harmless phrases)
     if _NSFW_META_RE.search(t):
         return ""
-    return _nsfw_decide(*_nsfw_scan(_NSFW_HARMLESS_RE.sub(" ", t)))
+    return _nsfw_decide(*_nsfw_scan(_NSFW_HARMLESS_RE.sub(" ", t), allow))
 
 
-def nsfw_word_check(text):
+def nsfw_word_check(text, allow=frozenset()):
     """Reason string if the text breaks the Word rules, else ''. Never raises."""
     try:
-        return _nsfw_word_verdict(text) if text and text.strip() else ""
+        return _nsfw_word_verdict(text, allow) if text and text.strip() else ""
     except Exception:
         log.exception("NSFW word check failed")
         return ""
@@ -3504,6 +3567,132 @@ def nsfw_blocklist_hit(chat_id, text):
     except Exception:
         log.exception("NSFW blocklist check failed")
         return ""
+
+
+# ------------------------------------------------------------ allowed words (per group)
+# Built-in bad words that THIS group decided are fine. Stored like the other per-group Blocking settings
+# (a JSON list in the setting `nsfw_allow`, keyed by chat id) - no new collection, other groups never see it.
+# The group's own /blocklist always wins: a blocklisted word can't be allowed.
+NSFW_ALLOW_KEY = "nsfw_allow"
+NSFW_ALLOW_MAX = 50
+_bl_allow_pending = {}  # (chat_id, user_id) -> deadline: an admin is about to send a word to allow
+
+
+def nsfw_allow_list(chat_id):
+    try:
+        data = json.loads(_BD.get_setting(chat_id, NSFW_ALLOW_KEY, "[]") or "[]")
+    except Exception:
+        return []
+    return [x for x in data if isinstance(x, str) and x] if isinstance(data, list) else []
+
+
+def _nsfw_allow_save(chat_id, items):
+    _BD.set_setting(chat_id, NSFW_ALLOW_KEY, json.dumps(items))
+
+
+def parse_allowed_word(text):
+    """What an admin typed -> (typed_word, [built-in words it stands for], error). Exactly one word."""
+    raw = unicodedata.normalize("NFKC", (text or "").strip()).lower().strip("\"'")
+    if not raw or len(raw.split()) != 1:
+        return None, [], "Please send exactly ONE word."
+    if len(raw) > 30 or not _NSFW_TOKEN_RE.fullmatch(raw):
+        return None, [], "That doesn't look like a single word (letters and numbers only)."
+    hits = sorted(set(_nsfw_forms(raw)) & (_NSFW_STRONG | _NSFW_AMBIG))
+    if not hits:
+        return raw, [], (f"\"{raw}\" isn't in the built-in bad-word list, so NSFW Word doesn't block it. "
+                         "(Words you added yourself are managed with /unblocklist.)")
+    return raw, hits, None
+
+
+def _allow_add(chat_id, text):
+    """-> (ok, html reply). Validates, then saves for THIS chat only."""
+    raw, hits, err = parse_allowed_word(text)
+    if err:
+        return False, html.escape(err)
+    if nsfw_blocklist_hit(chat_id, raw):
+        return False, (f"<code>{html.escape(raw)}</code> is on this group's blocklist, and the blocklist always wins. "
+                       f"Remove it first with /unblocklist {html.escape(raw)}.")
+    items = nsfw_allow_list(chat_id)
+    new = [h for h in hits if h not in items]
+    if not new:
+        return False, f"ℹ️ <code>{html.escape(raw)}</code> is already allowed in this group."
+    if len(items) + len(new) > NSFW_ALLOW_MAX:
+        return False, f"⚠️ This group already has {NSFW_ALLOW_MAX} allowed words. Remove one first."
+    _nsfw_allow_save(chat_id, items + new)
+    return True, (f"✅ Allowed in this group: <code>{html.escape(', '.join(new))}</code>. NSFW Word will no longer "
+                  "count it. Other groups are not affected.")
+
+
+async def _allow_cmd_ok(update):
+    """Same rule as /protection: groups only; a real admin of THIS group (anonymous admins count)."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if msg is None or chat is None or user is None:
+        return False
+    if chat.type == "private":
+        await msg.reply_text("Use this command in a group.")
+        return False
+    anonymous_admin = msg.sender_chat is not None and msg.sender_chat.id == chat.id
+    if not anonymous_admin and not await _bl_can_manage(chat, user.id):
+        await msg.reply_text("Only group admins can use this command.")
+        return False
+    return True
+
+
+async def allowword_cmd(update, context):
+    """/okword word - stop NSFW Word from counting a built-in bad word in THIS group (admins)."""
+    if not await _allow_cmd_ok(update):
+        return
+    msg, chat = update.effective_message, update.effective_chat
+    arg = msg.text.partition(" ")[2]
+    if not arg.strip():
+        await msg.reply_text("Usage: /okword word\nExample: /okword bastard\nSee the list with /okwords.")
+        return
+    try:
+        ok, reply = _allow_add(chat.id, arg)
+    except Exception:
+        log.exception("Blocking: couldn't save an allowed word in chat %s", chat.id)
+        await msg.reply_text("⚠️ I couldn't save that right now, so nothing was changed. Please try again.")
+        return
+    await msg.reply_html(reply)
+    if ok:
+        await _BD.log_action(chat, "blocklist", f"✅ {update.effective_user.mention_html()} allowed the word '{html.escape(arg.strip()[:40])}'.")
+
+
+async def unallowword_cmd(update, context):
+    """/unokword word - block it again (admins)."""
+    if not await _allow_cmd_ok(update):
+        return
+    msg, chat = update.effective_message, update.effective_chat
+    arg = msg.text.partition(" ")[2]
+    if not arg.strip():
+        await msg.reply_text("Usage: /unokword word")
+        return
+    raw, hits, _err = parse_allowed_word(arg)
+    try:
+        items = nsfw_allow_list(chat.id)
+        drop = set(hits) | ({raw} if raw else set())
+        keep = [x for x in items if x not in drop]
+        if len(keep) == len(items):
+            await msg.reply_text("That word isn't on this group's allowed list.")
+            return
+        _nsfw_allow_save(chat.id, keep)
+    except Exception:
+        log.exception("Blocking: couldn't remove an allowed word in chat %s", chat.id)
+        await msg.reply_text("⚠️ I couldn't save that right now, so nothing was changed. Please try again.")
+        return
+    await msg.reply_html(f"✅ <code>{html.escape(raw or arg.strip()[:30])}</code> is blocked again in this group.")
+    await _BD.log_action(chat, "blocklist", f"➖ {update.effective_user.mention_html()} un-allowed '{html.escape(arg.strip()[:40])}'.")
+
+
+async def allowedwords_cmd(update, context):
+    """/okwords - the words this group allowed (admins)."""
+    if not await _allow_cmd_ok(update):
+        return
+    items = nsfw_allow_list(update.effective_chat.id)
+    body = "\n".join(f"{i}. {html.escape(w)}" for i, w in enumerate(items, 1)) or "No allowed words yet."
+    await update.effective_message.reply_html(
+        f"<b>✅ Allowed words</b> (this group only)\n\n{body}\n\n"
+        "Add: /okword word\nRemove: /unokword word")
 
 
 # ------------------------------------------------------------ AI protection (/ask /search /imagine)
@@ -3658,7 +3847,11 @@ def _bl_nsfw_menu_screen():
     text = ("<b>🔞 Protection</b>\n\n"
             "Choose what to manage. Settings apply to this group only. Word and Content are separate "
             "switches.\n\n<b>⚖️ Action</b> (admins)\n\n"
-            "1. /protection: Show or set the action, for example /protection mute 10m")
+            "1. /protection: Show or set the action, for example /protection mute 10m\n\n"
+            "<b>✅ Allowed words</b> (admins)\n\n"
+            "2. /okword word: Allow a built-in bad word in this group.\n"
+            "3. /unokword word: Block it again.\n"
+            "4. /okwords: List the allowed words.")
     rows = [[InlineKeyboardButton(NSFW_CATEGORIES[k][0], callback_data=f"bl:nc:{k}") for k in ("word", "content")],
             [InlineKeyboardButton("🔙 Back", callback_data="bl:menu")]]
     return text, InlineKeyboardMarkup(rows)
@@ -3667,12 +3860,52 @@ def _bl_nsfw_menu_screen():
 def _bl_nsfw_category_screen(chat, key):
     label, setting, desc = NSFW_CATEGORIES[key]
     on = _nsfw_on(chat.id, setting)
-    cmds = "/addblocklist\n/unblocklist\n/blocklist\n\n" if key == "word" else ""
+    cmds = ("<b>📖 Commands</b> (admins)\n"
+            "/protection: Show or set the action, for example /protection mute 10m.\n"
+            "/addblocklist word: Block a word of your own.\n"
+            "/unblocklist word: Remove a blocklisted word.\n"
+            "/blocklist: List the blocklisted words.\n"
+            "/okword word: Allow a built-in bad word in this group.\n"
+            "/unokword word: Block it again.\n"
+            "/okwords: List the allowed words.\n\n") if key == "word" else (
+            "<b>📖 Commands</b> (admins)\n/protection: Show or set the action, for example /protection mute 10m.\n\n")
     text = f"<b>{label} Settings</b>\n\n{cmds}{html.escape(desc)}\n\nStatus: {'🟢 ON' if on else '🔴 OFF'}"
     text += f"\nAction: {html.escape(_nsfw_summary(chat.id))}"
     toggle = (InlineKeyboardButton("🔴 Turn OFF", callback_data=f"bl:ns:{key}:0") if on
               else InlineKeyboardButton("🟢 Turn ON", callback_data=f"bl:ns:{key}:1"))
-    return text, InlineKeyboardMarkup([[toggle], [InlineKeyboardButton("🔙 Back", callback_data="bl:n")]])
+    rows = [[toggle]]
+    if key == "word":
+        rows.append([InlineKeyboardButton(f"✅ Allowed Words ({len(nsfw_allow_list(chat.id))})", callback_data="bl:nw")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="bl:n")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _bl_allow_screen(chat):
+    items = nsfw_allow_list(chat.id)
+    body = ("\n".join(f"{i}. <code>{html.escape(w)}</code>" for i, w in enumerate(items, 1)) +
+            "\n\nNSFW Word does not count these words in this group.") if items else "No allowed words yet."
+    rows = [[InlineKeyboardButton("➕ Allow a Word", callback_data="bl:nwa")]]
+    if items:
+        rows[0].append(InlineKeyboardButton("🗑 Remove", callback_data="bl:nwl"))
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="bl:nc:word")])
+    return (f"<b>✅ Allowed Words</b>\n\nBad words from the built-in list that this group allows.\n\n{body}",
+            InlineKeyboardMarkup(rows))
+
+
+def _bl_allow_remove_screen(chat):
+    items = nsfw_allow_list(chat.id)
+    if not items:
+        return _bl_allow_screen(chat)
+    rows = [[InlineKeyboardButton(f"🗑 {i}. {w}", callback_data=f"bl:nwr:{zlib.crc32(w.encode()):08x}")]
+            for i, w in enumerate(items, 1)]
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="bl:nw")])
+    return "<b>🗑 Remove</b>\n\nTap a word to block it again.", InlineKeyboardMarkup(rows)
+
+
+def _bl_allow_add_screen():
+    text = ("<b>➕ Allow a Word</b>\n\nSend the ONE word to allow as your next message, for example "
+            f"<code>bastard</code>. It only applies to this group, and I'll wait {BL_PENDING_SECS // 60} minutes.")
+    return text, InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="bl:nwx")]])
 
 
 # ------------------------------------------------------------ Content: links + images
@@ -3905,7 +4138,7 @@ async def nsfw_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     exempt = None
     if word_on:
         word_text = msg.text or msg.caption or ""
-        why = nsfw_word_check(word_text)
+        why = nsfw_word_check(word_text, frozenset(nsfw_allow_list(chat.id)))  # this group's /okword list
         if not why and nsfw_blocklist_hit(chat.id, word_text):
             why = "blocklisted word"
         if why:
@@ -4004,6 +4237,9 @@ def register_blocking(app, deps):
                     group=-6)  # -5..-1 are already used by nova.py; PTB runs only one handler per group
     # "nsfw" is a hidden compatibility alias of /protection: same single handler, not shown in help or the "/" menu
     app.add_handler(CommandHandler(["protection", "nsfw"], nsfw_command, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("okword", allowword_cmd, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("unokword", unallowword_cmd, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("okwords", allowedwords_cmd, filters=filters.ChatType.GROUPS))
     # group=-8: NSFW Word / Content guard (a group of its own: nova.py uses -5..-1, -6 and -7 are above)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, nsfw_guard), group=-8)
     if AUTOADS_ENABLED:

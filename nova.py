@@ -3142,12 +3142,26 @@ async def lock_exempt(chat, msg, user, bot_id):
     return is_approved(chat.id, user.id)
 
 
+# Telegram service messages (someone changes a member tag, the group name/photo/settings, ...) carry no text and no
+# media. The library may not know the newest kinds, so they can't be told apart by type: a message with no content at
+# all is a service message. It must never count as flooding, spam or a locked item.
+_CONTENT_ATTRS = ("text", "caption", "photo", "video", "audio", "voice", "document", "sticker", "animation",
+                  "video_note", "contact", "location", "venue", "poll", "dice", "game", "story", "invoice",
+                  "paid_media", "checklist")
+
+
+def is_service_message(msg):
+    return not any(getattr(msg, attr, None) for attr in _CONTENT_ATTRS)
+
+
 async def lock_guard(update, context):
     """Runs before every other handler (group -2): deletes a locked item sent by a
     non-admin, optionally warns, and stops the update so nothing else acts on it."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if not msg or not user or chat.type == "private":
         return
+    if is_service_message(msg):
+        return  # group-setting / member-tag changes are not messages to police
     locked = locked_set(chat.id)
     if not locked:
         return  # fast path: no locks, no Telegram calls
@@ -3328,6 +3342,8 @@ async def watcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if not msg or not user or chat.type == "private":
         return
+    if is_service_message(msg):
+        return  # group-setting / member-tag changes must never count as flooding or spam
     if msg.forward_origin and await check_setlog_forward(update, context):
         return
     text = (msg.text or msg.caption or "").lower()
