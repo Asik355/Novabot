@@ -974,18 +974,18 @@ async def blocking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text, markup = _bl_nsfw_category_screen(chat, parts[2])
         elif action == "nw":
             _bl_allow_pending.pop((chat.id, q.from_user.id), None)
-            text, markup = _bl_allow_screen(chat)
+            text, markup = _bl_allow_screen(chat, _allow_origin(parts))
         elif action == "nwa":
             for k_ in [k_ for k_, v_ in _bl_allow_pending.items() if v_ < time.time()]:
                 _bl_allow_pending.pop(k_, None)
             _bl_allow_pending[(chat.id, q.from_user.id)] = time.time() + BL_PENDING_SECS
-            text, markup = _bl_allow_add_screen()
+            text, markup = _bl_allow_add_screen(_allow_origin(parts))
         elif action == "nwx":
             _bl_allow_pending.pop((chat.id, q.from_user.id), None)
-            text, markup = _bl_allow_screen(chat)
+            text, markup = _bl_allow_screen(chat, _allow_origin(parts))
         elif action == "nwl":
-            text, markup = _bl_allow_remove_screen(chat)
-        elif action == "nwr" and len(parts) == 3:
+            text, markup = _bl_allow_remove_screen(chat, _allow_origin(parts))
+        elif action == "nwr" and len(parts) in (3, 4):
             items = nsfw_allow_list(chat.id)
             keep = [w for w in items if f"{zlib.crc32(w.encode()):08x}" != parts[2]]
             if len(keep) != len(items):
@@ -993,7 +993,7 @@ async def blocking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 toast = "Blocked again."
             else:
                 toast = "Already removed."
-            text, markup = _bl_allow_screen(chat)
+            text, markup = _bl_allow_screen(chat, _allow_origin(parts))
         elif action == "auth":
             _bl_pending.pop((chat.id, q.from_user.id), None)
             text, markup = _bl_auth_screen(chat)
@@ -1661,6 +1661,7 @@ def _bl_nsfw_menu_screen(chat=None):
             [InlineKeyboardButton(BLOCK_CATEGORIES["promo"][0], callback_data="bl:c:promo"),
              InlineKeyboardButton(BLOCK_CATEGORIES["ads"][0], callback_data="bl:c:ads")],
             [InlineKeyboardButton("⭐ Authorized Promotions", callback_data="bl:auth")],
+            [InlineKeyboardButton("✅ Allowed Words", callback_data="bl:nw:n")],
             [InlineKeyboardButton("🔙 Back", callback_data="bl:menu")]]
     return text, InlineKeyboardMarkup(rows)
 
@@ -1680,32 +1681,37 @@ def _bl_nsfw_category_screen(chat, key):
     return text, InlineKeyboardMarkup(rows)
 
 
-def _bl_allow_screen(chat):
+def _allow_origin(parts):
+    """Where the Allowed Words screen was opened from: "n" = the Protection screen, "w" = the Word screen."""
+    return "n" if len(parts) > 2 and parts[-1] == "n" else "w"
+
+
+def _bl_allow_screen(chat, o="w"):
     items = nsfw_allow_list(chat.id)
     body = ("\n".join(f"{i}. <code>{html.escape(w)}</code>" for i, w in enumerate(items, 1)) +
             "\n\nNSFW Word does not count these words in this group.") if items else "No allowed words yet."
-    rows = [[InlineKeyboardButton("➕ Allow a Word", callback_data="bl:nwa")]]
+    rows = [[InlineKeyboardButton("➕ Allow a Word", callback_data=f"bl:nwa:{o}")]]
     if items:
-        rows[0].append(InlineKeyboardButton("🗑 Remove", callback_data="bl:nwl"))
-    rows.append([InlineKeyboardButton("🔙 Back", callback_data="bl:nc:word")])
+        rows[0].append(InlineKeyboardButton("🗑 Remove", callback_data=f"bl:nwl:{o}"))
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="bl:n" if o == "n" else "bl:nc:word")])
     return (f"<b>✅ Allowed Words</b>\n\nBad words from the built-in list that this group allows.\n\n{body}",
             InlineKeyboardMarkup(rows))
 
 
-def _bl_allow_remove_screen(chat):
+def _bl_allow_remove_screen(chat, o="w"):
     items = nsfw_allow_list(chat.id)
     if not items:
-        return _bl_allow_screen(chat)
-    rows = [[InlineKeyboardButton(f"🗑 {i}. {w}", callback_data=f"bl:nwr:{zlib.crc32(w.encode()):08x}")]
+        return _bl_allow_screen(chat, o)
+    rows = [[InlineKeyboardButton(f"🗑 {i}. {w}", callback_data=f"bl:nwr:{zlib.crc32(w.encode()):08x}:{o}")]
             for i, w in enumerate(items, 1)]
-    rows.append([InlineKeyboardButton("🔙 Back", callback_data="bl:nw")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data=f"bl:nw:{o}")])
     return "<b>🗑 Remove</b>\n\nTap a word to block it again.", InlineKeyboardMarkup(rows)
 
 
-def _bl_allow_add_screen():
+def _bl_allow_add_screen(o="w"):
     text = ("<b>➕ Allow a Word</b>\n\nSend the ONE word to allow as your next message, for example "
             f"<code>bastard</code>. It only applies to this group, and I'll wait {BL_PENDING_SECS // 60} minutes.")
-    return text, InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="bl:nwx")]])
+    return text, InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"bl:nwx:{o}")]])
 
 
 # ------------------------------------------------------------ Content: links + images
