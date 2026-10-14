@@ -30,6 +30,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
 import certifi
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReplaceOne, ReturnDocument
@@ -116,14 +117,17 @@ UNIQUE_INDEXES = {
     "roast_profiles": ["chat_id", "user_id"], "roast_battles": ["id"], "roast_results": ["id"],
     "roast_votes": ["battle_id", "voter_id"], "court_cases": ["id"],
     "court_votes": ["case_id", "voter_id"], "court_verdicts": ["id"],
-    "modlog": ["id"],
+    "modlog": ["id"], "notice_pending": ["chat_id", "message_id"],
 }
 PLAIN_INDEXES = {
     "warn_log": [["chat_id", "user_id"]], "captcha_pending": [["expires"]],
     "roast_battles": [["chat_id"]], "roast_profiles": [["chat_id", "points"]],
     "court_cases": [["chat_id", "case_no"], ["chat_id", "defendant_id"]], "court_verdicts": [["case_id"]],
-    "modlog": [["chat_id", "id"]],
+    "modlog": [["chat_id", "id"]], "notice_pending": [["delete_at"]],
 }
+# MongoDB deletes a document by itself once its "expire_at" date has passed (no bot code involved).
+# Documents without an expire_at (the old modlog rows) are never touched by this.
+TTL_INDEXES = ("modlog", "notice_pending")
 
 
 def _ensure_indexes():
@@ -138,6 +142,11 @@ def _ensure_indexes():
                 col(name).create_index([(k, ASCENDING) for k in keys])
             except PyMongoError as e:
                 log.warning("Couldn't create an index on %s%s: %s", name, keys, e)
+    for name in TTL_INDEXES:
+        try:
+            col(name).create_index("expire_at", expireAfterSeconds=0)
+        except PyMongoError as e:
+            log.warning("Couldn't create the automatic-cleanup index on %s: %s", name, e)
 
 
 # ------------------------------------------------------------------ settings
@@ -552,7 +561,8 @@ def sa_set_username(user_id, username):
 # ------------------------------------------------------------------ per-group moderation log
 # One row per moderation event, always stored under the chat_id of the group it happened in.
 # (The optional Telegram log channel still works exactly as before; this is the stored history.)
-MODLOG_KEEP = 1000  # newest rows kept per group
+MODLOG_KEEP = 1000  # newest rows kept per group (safety cap on top of the time limit below)
+HISTORY_KEEP_DAYS = 15  # action history rows are deleted automatically by MongoDB after this many days
 _MODLOG_PRUNE_EVERY = 50
 
 
@@ -560,7 +570,8 @@ def modlog_add(chat_id, category, text, ts):
     chat_id = int(chat_id)
     row_id = next_id("modlog")
     col("modlog").insert_one({"id": row_id, "chat_id": chat_id, "category": str(category),
-                              "text": str(text)[:2000], "ts": int(ts)})
+                              "text": str(text)[:2000], "ts": int(ts),
+                              "expire_at": datetime.fromtimestamp(int(ts), timezone.utc) + timedelta(days=HISTORY_KEEP_DAYS)})
     if row_id % _MODLOG_PRUNE_EVERY == 0:  # keep the history bounded, one group at a time
         cutoff = list(col("modlog").find({"chat_id": chat_id}, {"id": 1}, sort=[("id", DESCENDING)],
                                          skip=MODLOG_KEEP, limit=1))
@@ -580,6 +591,62 @@ def modlog_recent(chat_id, limit=20, category=None):
 
 def modlog_count(chat_id):
     return col("modlog").count_documents({"chat_id": int(chat_id)})
+
+
+# ------------------------------------------------------------------ action notices that delete themselves later
+# One row per bot notice that must disappear after NOTICE_LIFETIME. The row lives only until the notice is deleted
+# (notice_take_due removes it); "expire_at" is a safety net so an unprocessed row can never stay longer than
+# HISTORY_KEEP_DAYS after its delete time.
+NOTICE_LIFETIME = 24 * 60 * 60  # a notice is deleted 1 day after it was sent
+
+
+def notice_schedule(chat_id, message_id, delete_at=None):
+    chat_id, message_id = int(chat_id), int(message_id)
+    delete_at = int(delete_at or (time.time() + NOTICE_LIFETIME))
+    col("notice_pending").replace_one(
+        {"chat_id": chat_id, "message_id": message_id},
+        {"chat_id": chat_id, "message_id": message_id, "delete_at": delete_at,
+         "expire_at": datetime.fromtimestamp(delete_at, timezone.utc) + timedelta(days=HISTORY_KEEP_DAYS)},
+        upsert=True)
+
+
+def notice_take_due(now, limit=50):
+    """[(chat_id, message_id)] whose time has come; each row is removed atomically as it is claimed, so two
+    overlapping sweeps can never delete the same notice twice."""
+    out = []
+    for r in list(col("notice_pending").find({"delete_at": {"$lte": int(now)}}).limit(int(limit))):
+        if col("notice_pending").delete_one({"_id": r["_id"]}).deleted_count:
+            out.append((r["chat_id"], r["message_id"]))
+    return out
+
+
+# ------------------------------------------------------------------ owner-chosen defaults for NEW groups
+# {setting key: value} for every default the Bot Owner changed in the 👑 Owner panel. One small document for the
+# whole bot; loaded once and kept in step with every write (one bot process, so it cannot go stale).
+_OWNER_DEF = None
+
+
+def owner_defaults():
+    global _OWNER_DEF
+    with _lock:
+        if _OWNER_DEF is None:
+            _OWNER_DEF = dict((col("meta").find_one({"_id": "new_group_defaults"}) or {}).get("values") or {})
+        return dict(_OWNER_DEF)
+
+
+def set_owner_default(key, value):
+    with _lock:
+        owner_defaults()
+        col("meta").update_one({"_id": "new_group_defaults"}, {"$set": {f"values.{key}": value}}, upsert=True)
+        _OWNER_DEF[key] = value
+
+
+def del_owner_default(key):
+    """Back to the original value for this setting."""
+    with _lock:
+        owner_defaults()
+        col("meta").update_one({"_id": "new_group_defaults"}, {"$unset": {f"values.{key}": ""}})
+        _OWNER_DEF.pop(key, None)
 
 
 # ------------------------------------------------------------------ read-only inspection (Bot Owner panel)

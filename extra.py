@@ -29,7 +29,7 @@ from collections import OrderedDict
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
-from telegram.error import TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 try:  # needed for the AI commands and fun utilities (pure HTTP, no Google SDK)
@@ -2454,6 +2454,107 @@ async def _bl_delete_later(msg, secs):
         pass
 
 
+# ------------------------------------------------------------ action notices: reason + punishment, 1-day delete, 15-day history
+# One shared way to tell a group WHY the bot acted and WHAT the punishment is (temporary with its end time, or permanent).
+NOTICE_IST = timezone(timedelta(hours=5, minutes=30))
+ACTION_LABEL = {"ban": "Banned", "kick": "Kicked", "mute": "Muted", "delete": "Message deleted", "warn": "Warned"}
+
+
+def human_secs(secs):
+    """1800 -> '30 minutes', 5400 -> '1 hour 30 minutes'."""
+    secs, parts = int(secs), []
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60), ("second", 1)):
+        n, secs = divmod(secs, size)
+        if n:
+            parts.append(f"{n} {unit}{'s' if n != 1 else ''}")
+    return " ".join(parts[:2]) or "0 seconds"
+
+
+def mode_kind(mode):
+    """Stored mode string -> (kind, mute seconds): 'tmute:300' -> ('mute', 300), 'ban' -> ('ban', None)."""
+    kind, _, arg = (mode or "").partition(":")
+    if kind == "tmute":
+        try:
+            return "mute", int(arg)
+        except ValueError:
+            return "mute", None
+    return kind, None
+
+
+def punishment_text(kind, secs=None, now=None):
+    """The punishment in plain words: says if it is temporary or permanent and, for a mute, when it ends."""
+    if kind == "ban":
+        return "Banned permanently (can only return if an admin unbans)"
+    if kind == "kick":
+        return "Kicked out (temporary: can rejoin with an invite link)"
+    if kind == "mute":
+        if secs:
+            end = datetime.fromtimestamp((now or time.time()) + int(secs), NOTICE_IST)
+            when = end.strftime("%d %b %I:%M %p" if int(secs) >= 86400 else "%I:%M %p")
+            return f"Muted for {human_secs(secs)} (temporary, ends {when} IST)"
+        return "Muted permanently (until an admin unmutes)"
+    if kind == "delete":
+        return "Message deleted only (no mute or ban)"
+    return str(kind)
+
+
+def action_notice(mention, label, reason, punishment, by=None):
+    """The notice text (HTML). `mention` and `by` are already-safe HTML; reason and punishment are escaped here."""
+    lines = [f"🚫 <b>Action:</b> {html.escape(label)}", f"👤 <b>User:</b> {mention}"]
+    if by:
+        lines.append(f"👮 <b>By:</b> {by}")
+    lines.append(f"📋 <b>Reason:</b> {html.escape(reason or 'No reason given')}")
+    lines.append(f"⚖️ <b>Punishment:</b> {html.escape(punishment)}")
+    return "\n".join(lines)
+
+
+def _plain(text):
+    return html.unescape(re.sub(r"<[^>]+>", "", str(text or ""))).strip()
+
+
+async def track_notice(sent):
+    """Remember a sent notice so the sweeper deletes it 1 day later (the schedule is in MongoDB: restarts don't lose it)."""
+    if sent is None:
+        return
+    try:
+        import migrate_to_mongo as _m
+        await asyncio.to_thread(_m.notice_schedule, sent.chat_id, sent.message_id)
+    except Exception:
+        log.exception("Couldn't schedule the automatic deletion of a notice")
+
+
+async def record_action(chat_id, user_id, name, label, reason, punishment, by=None, category="mod"):
+    """One short history row (action, user, reason, punishment). MongoDB deletes it by itself after 15 days."""
+    line = (f"{label} | user {user_id} ({_plain(name) or 'unknown'}) | reason: {reason or 'none given'} | {punishment}"
+            + (f" | by {_plain(by)}" if by else ""))
+    try:
+        import migrate_to_mongo as _m
+        await asyncio.to_thread(_m.modlog_add, chat_id, category, line, int(time.time()))
+    except Exception:
+        log.exception("Couldn't save the action history row")
+
+
+async def notice_sweeper(app):
+    """Background loop: deletes bot notices that are 1 day old. The schedule is in MongoDB, so a restart loses nothing."""
+    import migrate_to_mongo as _m
+    await asyncio.sleep(20)
+    while True:
+        try:
+            for chat_id, message_id in await asyncio.to_thread(_m.notice_take_due, int(time.time())):
+                try:
+                    await app.bot.delete_message(chat_id, message_id)
+                except RetryAfter as e:
+                    ra = e.retry_after.total_seconds() if hasattr(e.retry_after, "total_seconds") else float(e.retry_after)
+                    await asyncio.to_thread(_m.notice_schedule, chat_id, message_id, time.time() + ra + 5)
+                except (BadRequest, Forbidden):
+                    pass  # already deleted by an admin, or the bot left that group: nothing more to do
+                except TelegramError:
+                    await asyncio.to_thread(_m.notice_schedule, chat_id, message_id, time.time() + 300)  # try again later
+        except Exception:
+            log.exception("Notice sweeper error")
+        await asyncio.sleep(60)
+
+
 # ------------------------------------------------------------ detection (pure, no Telegram calls)
 def _clean_url(u):
     return u.strip().rstrip(".,;:!?)]}>\"'")
@@ -2912,7 +3013,7 @@ def _bl_human(secs):
 
 
 async def ads_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Runs before every other handler (group -3). Deletes the ad, mutes the sender for 24h."""
+    """Runs before every other handler (group -3). Deletes the ad and punishes the sender (the group's /adpunish setting)."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if not msg or not user or chat.type == "private":
         return
@@ -3003,16 +3104,18 @@ async def ads_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except TelegramError as e:
             log.warning("Auto-ads: couldn't %s %s in chat %s: %s", action, user.id, chat.id, e)
     mention = user.mention_html() if msg.sender_chat is None else html.escape(getattr(msg.sender_chat, "title", None) or "that channel")
-    if deleted and muted:
-        done = {"mute": f"is muted for {_bl_human(mute_secs)}", "ban": "is banned", "kick": "was removed from the group"}[action]
-        text = f"🚫 <b>Ad removed.</b> {mention} {done}. <i>({html.escape(reason)})</i>"
-    elif deleted and action == "delete":
-        text = f"🚫 <b>Ad removed.</b> <i>({html.escape(reason)})</i>"
-    elif deleted and msg.sender_chat is not None:
-        text = f"🚫 <b>Ad removed</b> (posted as {mention}). <i>({html.escape(reason)})</i>"
-    elif deleted:
-        text = (f"🚫 <b>Ad removed.</b> I couldn't {action} {mention} - "
-                "please give me the 'Restrict members' admin right.")
+    if deleted:
+        why = f"{'Advertisement with media' if is_media else 'Promotional text'} ({reason})"
+        if muted:
+            label, punish = ACTION_LABEL[action], punishment_text(action, mute_secs if action == "mute" else None)
+        elif action == "delete":
+            label, punish = ACTION_LABEL["delete"], punishment_text("delete")
+        elif msg.sender_chat is not None:
+            label, punish = ACTION_LABEL["delete"], "Message deleted only (it was posted as a channel, so nobody can be muted)"
+        else:
+            label = ACTION_LABEL["delete"]
+            punish = f"Message deleted only. I couldn't {action} the user: please give me the 'Restrict members' admin right"
+        text = action_notice(mention, label, why, punish)
     else:
         if time.time() - _ads_notice.get(chat.id, 0) > 600:
             _ads_notice[chat.id] = time.time()
@@ -3020,8 +3123,8 @@ async def ads_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
                            "Please give me the 'Delete messages' and 'Restrict members' admin rights.")
         return  # nothing was enforced: let the other handlers (locks, filters...) run as usual
     sent = await _bl_send(context.bot, chat.id, text)
-    if sent:
-        _bl_spawn(_bl_delete_later(sent, 60))  # keep the chat clean
+    await track_notice(sent)  # the notice disappears 1 day later (reliable: the schedule is in MongoDB)
+    await record_action(chat.id, user.id, mention, label, why, punish, category="ads")
     await _BD.log_action(chat, "spam", f"🚫 Auto-ads: deleted a message from {mention} ({html.escape(reason)})"
                          + ({"mute": f" and muted them for {_bl_human(mute_secs)}.", "ban": " and banned them.",
                              "kick": " and kicked them."}.get(action, ".") if muted else "."))
@@ -3035,11 +3138,11 @@ BLOCK_CATEGORIES = {
     "ads": ("📢 Ads", BL_ADS_KEY,
             "Handles advertising that comes with an image, video or file: ad links, invite links, "
             "ad wording or referral codes in the caption or link buttons. A normal picture is not "
-            "an ad. Removes it and punishes the sender (24-hour mute unless an admin changed it with /adpunish). Independent of Promotion."),
+            "an ad. Removes it and punishes the sender (mute: 30 minutes in newly added groups, 24 hours in older groups, unless an admin changed it with /adpunish). Independent of Promotion."),
     "promo": ("📣 Promotion", BL_PROMO_KEY,
               "Handles text-only promotion: promotional wording, referral/coupon codes and promotional "
               "calls-to-action. A normal link (YouTube, Instagram, news...) is never promotion by itself. "
-              "Removes it and punishes the sender (24-hour mute unless an admin changed it with /adpunish). Independent of Ads."),
+              "Removes it and punishes the sender (mute: 30 minutes in newly added groups, 24 hours in older groups, unless an admin changed it with /adpunish). Independent of Ads."),
 }
 _BL_EXTRA_BUTTONS = {  # extra rows on a category screen
     "promo": [[InlineKeyboardButton("⭐ Authorized Promotions", callback_data="bl:auth")]],
@@ -4218,15 +4321,16 @@ async def nsfw_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.warning("NSFW: couldn't %s %s in chat %s: %s", action, user.id, chat.id, e)
     mention = user.mention_html() if msg.sender_chat is None else html.escape(
         getattr(msg.sender_chat, "title", None) or "that channel")
-    label = "inappropriate language" if kind == "word" else "18+ content"
+    label_why = "inappropriate language" if kind == "word" else "18+ content"
     if deleted:
-        head = f"🔞 <b>Message removed</b> ({label})."
+        why = f"Protection rule: {reason} ({label_why})"
         if punished:
-            head += " " + {"mute": f"{mention} is muted for {_nsfw_human(secs)}.", "ban": f"{mention} is banned.",
-                           "kick": f"{mention} was removed from the group."}[action]
-        elif failed:
-            head += f" I couldn't {action} {mention}. Please give me the 'Restrict members' admin right."
-        text = head
+            label, punish = ACTION_LABEL[action], punishment_text(action, secs if action == "mute" else None)
+        else:
+            label, punish = ACTION_LABEL["delete"], punishment_text("delete")
+            if failed:
+                punish = f"Message deleted only. I couldn't {action} the user: please give me the 'Restrict members' admin right"
+        text = action_notice(mention, label, why, punish)
     else:
         text = None
         if time.time() - _nsfw_notice.get(chat.id, 0) > 600:
@@ -4234,7 +4338,9 @@ async def nsfw_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = ("⚠️ I spotted 18+ content but couldn't delete it. "
                     "Please give me the 'Delete messages' and 'Restrict members' admin rights.")
     if text:
-        await _bl_send(context.bot, chat.id, text)  # the notice is kept: it is never auto-deleted
+        await track_notice(await _bl_send(context.bot, chat.id, text))  # the notice disappears 1 day later
+    if deleted:
+        await record_action(chat.id, user.id, mention, label, why, punish, category="protection")
     if not deleted:
         return  # nothing was removed: let the other handlers run as usual
     await _BD.log_action(chat, "spam", f"🔞 Protection ({kind}): deleted a message from {mention}"

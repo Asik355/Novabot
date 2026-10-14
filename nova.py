@@ -48,8 +48,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # =====================================================================
 # Comma/space separated list in the OWNER_IDS environment variable; the default keeps the old owner.
 # Only positive numbers count: Telegram user IDs are positive, group/channel IDs are negative.
-OWNER_IDS = [int(x) for x in re.split(r"[,\s]+", os.environ.get("OWNER_IDS", "5675165124").strip())
-             if x.isascii() and x.isdigit() and int(x) > 0]
+OWNER_IDS = [int(x) for x in re.findall(r"(?<![\d-])[0-9]+", os.environ.get("OWNER_IDS", "5675165124"))
+             if int(x) > 0]
 # =====================================================================
 
 import asyncio
@@ -62,7 +62,7 @@ import random
 import re
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from telegram import (
     BotCommand,
@@ -474,23 +474,32 @@ def warn_summary(chat_id, user_id):
     return f"{len(active_warns(chat_id, user_id))}/{limit}"
 
 
-async def add_warn(chat, user_id, mention, reason):
-    """Record a warning; at the limit, apply the chat's warn mode. Returns text to announce."""
+async def add_warn(chat, user_id, mention, reason, by=None):
+    """Record a warning; at the limit, apply the chat's warn mode. Returns the notice text to announce."""
     limit = int(get_setting(chat.id, "warn_limit", 3))
     store.warn_add(chat.id, user_id, reason, int(time.time()))
     count = len(active_warns(chat.id, user_id))
-    why = f"\nReason: {html.escape(reason)}" if reason else ""
-    if count < limit:
-        return f"Warned {mention} ({count}/{limit}).{why}"
-
     mode = get_setting(chat.id, "warn_mode", "ban")
+    why = reason or "No reason given"
+    if count < limit:
+        label = f"Warned ({count}/{limit})"
+        punish = (f"Warning {count}/{limit}: no mute or ban yet. At {limit}/{limit} warnings the action is "
+                  f"{describe_mode(mode)}")
+        await extra.record_action(chat.id, user_id, mention, label, why, punish, by, "warn")
+        return extra.action_notice(mention, label, why, punish, by)
+
     store.warn_clear(chat.id, user_id)
     done = await do_action(chat, user_id, mode)
     if done:
-        return f"{mention} reached {limit}/{limit} warnings and was {done}.{why}"
+        kind, secs = extra.mode_kind(mode)
+        label = f"{extra.ACTION_LABEL.get(kind, kind.title())} (warn limit reached)"
+        punish = extra.punishment_text(kind, secs)
+        why = f"Reached {limit}/{limit} warnings. Last warning: {why}"
+        await extra.record_action(chat.id, user_id, mention, label, why, punish, by, "warn")
+        return extra.action_notice(mention, label, why, punish, by)
     return (
         f"{mention} reached {limit}/{limit} warnings, but I couldn't "
-        f"{describe_mode(mode)}. Check my admin permissions.{why}"
+        f"{describe_mode(mode)}. Check my admin permissions.\nReason: {html.escape(why)}"
     )
 
 
@@ -503,7 +512,12 @@ async def enforce(chat, user_id, mention, mode, reason, category=None):
         text = await add_warn(chat, user_id, mention, reason)
     else:
         done = await do_action(chat, user_id, mode)
-        text = f"{mention} was {done}. Reason: {html.escape(reason)}" if done else None
+        text = None
+        if done:
+            kind, secs = extra.mode_kind(mode)
+            label, punish = extra.ACTION_LABEL.get(kind, kind.title()), extra.punishment_text(kind, secs)
+            text = extra.action_notice(mention, label, reason, punish)
+            await extra.record_action(chat.id, user_id, mention, label, reason, punish, None, category or "mod")
     if text and category:
         await log_action(chat, category, text)
     return text
@@ -517,9 +531,12 @@ async def announce(chat, text, uid=None):
     if uid is not None and time.time() - _recent_mutes.pop((chat.id, uid), 0) < 15:
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Unmute", callback_data=f"unmute:{uid}")]])
     try:
-        await chat.send_message(text, parse_mode="HTML", reply_markup=kb)
+        sent = await chat.send_message(text, parse_mode="HTML", reply_markup=kb)
     except TelegramError as e:
         logging.warning("Couldn't announce in chat %s: %s", chat.id, e)
+        return None
+    await extra.track_notice(sent)  # every action notice disappears 1 day later (schedule kept in MongoDB)
+    return sent
 
 
 async def try_delete(msg):
@@ -1004,6 +1021,7 @@ HELP_SECTIONS = {
             "/log category: Start logging that category (see /logcategories).",
             "/nolog category: Stop logging that category.",
             "/logcategories: List every loggable category and what it covers.",
+            "/modlog: Show the last bot and admin actions in this group (action, reason, punishment). Kept for 15 days.",
         ]),
     ),
     "reports": (
@@ -1288,7 +1306,7 @@ HELP_INTRO = (
 # - Never place any button after the Suggestion Bar.
 # - Never combine the Suggestion Bar with another button.
 # - Preserve these rules whenever the Help Menu is modified in the future.
-def help_main_keyboard(chat=None):
+def help_main_keyboard(chat=None, user_id=None):
     """Category buttons in a strict 3-column grid, then the command-suggestions
     toggle as a single full-width button on the very last row."""
     buttons = [
@@ -1309,6 +1327,8 @@ def help_main_keyboard(chat=None):
     # Do not move it, combine it with another button, or place any
     # button after it.
     
+    if user_id in OWNER_IDS:  # 👑 Owner: its own row, just above the Suggestion Bar, shown to the Bot Owner only
+        rows.append([InlineKeyboardButton("👑 Owner", callback_data="own:m")])
     if chat is not None:  # always the last row, in groups and in private chat
         rows.append([suggestions_button(chat.id, "help")])
     return InlineKeyboardMarkup(rows)
@@ -1335,7 +1355,7 @@ def admin_section_text(chat=None):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent = await update.effective_message.reply_html(
         f"<b>{html.escape(extra.bot_name())}</b>\n\n{HELP_INTRO}",
-        reply_markup=help_main_keyboard(update.effective_chat),
+        reply_markup=help_main_keyboard(update.effective_chat, update.effective_user.id if update.effective_user else None),
         disable_web_page_preview=True,
     )
     extra.remember_menu_owner(sent, update.effective_user.id if update.effective_user else None)
@@ -1386,7 +1406,7 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     if key == "main" or key not in HELP_SECTIONS:
         text = f"<b>{html.escape(extra.bot_name())}</b>\n\n{HELP_INTRO}"
-        markup = help_main_keyboard(update.effective_chat)
+        markup = help_main_keyboard(update.effective_chat, update.effective_user.id if update.effective_user else None)
     else:
         label, body = HELP_SECTIONS[key]
         text = admin_section_text(update.effective_chat) if key == "mod" else f"<b>{label}</b>\n\n{body}"
@@ -1397,15 +1417,177 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass  # message unchanged (double tap) or too old to edit; safe to ignore
 
 
+# ------------------------------------------------- 👑 Owner: default settings for NEW groups
+# kind "split": one key for the action + one key for the mute seconds (Ads, Protection)
+# kind "mode":  one key holding "ban" / "kick" / "tmute:<seconds>" ... (Flood, Spam, Blocklist, Warnings, Captcha)
+OWNER_DEFAULTS = {
+    "ads":   {"label": "📢 Ads & Promotion", "kind": "split", "keys": ("block_punish", "block_punish_secs"),
+              "options": ("mute", "kick", "ban", "delete")},
+    "prot":  {"label": "🔞 Protection", "kind": "split", "keys": ("nsfw_action", "nsfw_secs"),
+              "options": ("delete", "mute", "kick", "ban")},
+    "flood": {"label": "🌊 Flood", "kind": "mode", "keys": ("flood_mode",),
+              "options": ("warn", "mute", "tmute", "kick", "ban")},
+    "spam":  {"label": "📨 Spam", "kind": "mode", "keys": ("spam_mode",),
+              "options": ("delete", "warn", "mute", "tmute", "kick", "ban")},
+    "block": {"label": "🚫 Blocklist", "kind": "mode", "keys": ("blocklist_mode",),
+              "options": ("nothing", "delete", "warn", "mute", "tmute", "kick", "ban")},
+    "warn":  {"label": "⚠️ Warnings (at the limit)", "kind": "mode", "keys": ("warn_mode",),
+              "options": ("ban", "kick", "mute", "tmute")},
+    "cap":   {"label": "🤖 Captcha (if failed)", "kind": "mode", "keys": ("captcha_action",),
+              "options": ("kick", "mute", "ban")},
+}
+OWNER_CAT_ORDER = ("ads", "prot", "flood", "spam", "block", "warn", "cap")
+OWNER_TIMES = (300, 1800, 3600, 86400, 604800)  # 5 minutes, 30 minutes, 1 hour, 1 day, 7 days
+OWNER_OPT_LABEL = {"mute": "🔇 Mute (permanent)", "tmute": "⏱ Timed mute", "kick": "👢 Kick", "ban": "🚫 Ban",
+                   "delete": "🗑 Delete only", "warn": "⚠️ Warn", "nothing": "Do nothing"}
+OWNER_ACTION_WORDS = {"mute": "mute (permanent)", "kick": "kick (can rejoin)", "ban": "ban (permanent)",
+                      "delete": "delete the message only", "warn": "warn the user", "nothing": "do nothing"}
+
+
+def _owner_values(cat, defaults):
+    """(action, mute seconds or None) for one category, read from a defaults dict."""
+    spec = OWNER_DEFAULTS[cat]
+    if spec["kind"] == "split":
+        action_key, secs_key = spec["keys"]
+        try:
+            secs = int(defaults.get(secs_key))
+        except (TypeError, ValueError):
+            secs = NEW_GROUP_DEFAULTS[secs_key]
+        return str(defaults.get(action_key)), secs
+    kind, _, arg = str(defaults.get(spec["keys"][0])).partition(":")
+    return kind, (int(arg) if arg.isdigit() else None)
+
+
+def _owner_timed(cat, action):
+    """True when this action carries a mute length."""
+    return action == ("mute" if OWNER_DEFAULTS[cat]["kind"] == "split" else "tmute")
+
+
+def _owner_describe(cat, defaults):
+    action, secs = _owner_values(cat, defaults)
+    if _owner_timed(cat, action):
+        return f"mute for {fmt_duration(secs or 300)} (temporary)"
+    return OWNER_ACTION_WORDS.get(action, action)
+
+
+def _owner_option_label(cat, option):
+    if OWNER_DEFAULTS[cat]["kind"] == "split" and option == "mute":
+        return "⏱ Timed mute"
+    return OWNER_OPT_LABEL.get(option, option)
+
+
+def owner_main_text():
+    return ("<b>👑 Owner: default settings</b>\n\n"
+            "These are the settings every <b>new</b> group starts with when the bot is added. Groups that already "
+            "exist are not changed, and each group's admins can still change their own group.\n\n"
+            "Tap a category to see or change its default.")
+
+
+def owner_main_keyboard():
+    buttons = [InlineKeyboardButton(OWNER_DEFAULTS[c]["label"], callback_data=f"own:c:{c}") for c in OWNER_CAT_ORDER]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="help:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def owner_cat_text(cat):
+    now = _owner_describe(cat, new_group_defaults())
+    orig = _owner_describe(cat, NEW_GROUP_DEFAULTS)
+    return (f"<b>{html.escape(OWNER_DEFAULTS[cat]['label'])}: default for new groups</b>\n\n"
+            f"Now: <b>{html.escape(now)}</b>\nOriginal: {html.escape(orig)}\n\n"
+            "Pick the action. If it is a timed mute, pick how long. The change applies to groups added from now on.")
+
+
+def owner_cat_keyboard(cat):
+    spec = OWNER_DEFAULTS[cat]
+    action, secs = _owner_values(cat, new_group_defaults())
+    opts = [InlineKeyboardButton(("✅ " if o == action else "") + _owner_option_label(cat, o),
+                                 callback_data=f"own:a:{cat}:{i}") for i, o in enumerate(spec["options"])]
+    rows = [opts[i:i + 2] for i in range(0, len(opts), 2)]
+    if _owner_timed(cat, action):
+        times = [InlineKeyboardButton(("✅ " if t == secs else "") + fmt_duration(t), callback_data=f"own:t:{cat}:{t}")
+                 for t in OWNER_TIMES]
+        rows += [times[i:i + 3] for i in range(0, len(times), 3)]
+    rows.append([InlineKeyboardButton("♻️ Reset to original", callback_data=f"own:r:{cat}")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="own:m")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _owner_save(cat, action=None, secs=None):
+    """Save the owner's choice for one category (global, stored in MongoDB)."""
+    spec = OWNER_DEFAULTS[cat]
+    cur_action, cur_secs = _owner_values(cat, new_group_defaults())
+    action = action or cur_action
+    if spec["kind"] == "split":
+        action_key, secs_key = spec["keys"]
+        store.set_owner_default(action_key, action)
+        store.set_owner_default(secs_key, int(secs or cur_secs or NEW_GROUP_DEFAULTS[secs_key]))
+    else:
+        value = f"tmute:{int(secs or cur_secs or 300)}" if action == "tmute" else action
+        store.set_owner_default(spec["keys"][0], value)
+
+
+async def owner_callback(update, context):
+    """👑 Owner panel buttons. Strictly the Bot Owner (OWNER_IDS): the button is hidden from others, and every
+    tap re-checks the person."""
+    q = update.callback_query
+    if q.from_user.id not in OWNER_IDS:
+        await q.answer("This is for the bot owner only.", show_alert=True)
+        return
+    if await extra.menu_not_owner(q):
+        return
+    parts = (q.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else "m"
+    cat = parts[2] if len(parts) > 2 else None
+    note = None
+    try:
+        if action in ("c", "a", "t", "r") and cat not in OWNER_DEFAULTS:
+            await q.answer("This button is no longer valid.", show_alert=True)
+            return
+        if action == "a":
+            options = OWNER_DEFAULTS[cat]["options"]
+            if len(parts) != 4 or not parts[3].isdigit() or int(parts[3]) >= len(options):
+                await q.answer("This button is no longer valid.", show_alert=True)
+                return
+            await asyncio.to_thread(_owner_save, cat, options[int(parts[3])])
+            note = "Saved."
+        elif action == "t":
+            if len(parts) != 4 or not parts[3].isdigit() or int(parts[3]) not in OWNER_TIMES:
+                await q.answer("This button is no longer valid.", show_alert=True)
+                return
+            await asyncio.to_thread(_owner_save, cat, None, int(parts[3]))
+            note = "Saved."
+        elif action == "r":
+            for key in OWNER_DEFAULTS[cat]["keys"]:
+                await asyncio.to_thread(store.del_owner_default, key)
+            note = "Back to the original."
+    except store.DBError:
+        logging.exception("owner defaults: save failed")
+        await q.answer("The database had a problem. Nothing was changed.", show_alert=True)
+        return
+    await q.answer(note)
+    if action in ("c", "a", "t", "r"):
+        text, markup = owner_cat_text(cat), owner_cat_keyboard(cat)
+    else:
+        text, markup = owner_main_text(), owner_main_keyboard()
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    except TelegramError:
+        pass  # unchanged (double tap) or too old to edit
+
+
 async def ban(update, context):
     if not await group_only(update):
         return
-    uid, name = await get_target(update, context)
+    uid, name, reason = await target_and_rest(update, context)
     if uid and await can_target(update, uid):
         await update.effective_chat.ban_member(uid)
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Unban", callback_data=f"unban:{uid}")]])
-        await update.effective_message.reply_html(f"Banned {name}.", reply_markup=kb)
-        await log_action(update.effective_chat, "ban", f"🚫 {update.effective_user.mention_html()} banned {name}.")
+        by, why, punish = update.effective_user.mention_html(), reason[:200] or "Banned by an admin (no reason given)", extra.punishment_text("ban")
+        sent = await update.effective_message.reply_html(extra.action_notice(name, "Banned", why, punish, by), reply_markup=kb)
+        await extra.track_notice(sent)
+        await extra.record_action(update.effective_chat.id, uid, name, "Banned", why, punish, by, "ban")
+        await log_action(update.effective_chat, "ban", f"🚫 {by} banned {name}.")
 
 
 async def unban(update, context):
@@ -1421,12 +1603,15 @@ async def unban(update, context):
 async def kick(update, context):
     if not await group_only(update):
         return
-    uid, name = await get_target(update, context)
+    uid, name, reason = await target_and_rest(update, context)
     if uid and await can_target(update, uid):
         await update.effective_chat.ban_member(uid)
         await update.effective_chat.unban_member(uid)
-        await update.effective_message.reply_html(f"Kicked {name}.")
-        await log_action(update.effective_chat, "ban", f"👢 {update.effective_user.mention_html()} kicked {name}.")
+        by, why, punish = update.effective_user.mention_html(), reason[:200] or "Kicked by an admin (no reason given)", extra.punishment_text("kick")
+        sent = await update.effective_message.reply_html(extra.action_notice(name, "Kicked", why, punish, by))
+        await extra.track_notice(sent)
+        await extra.record_action(update.effective_chat.id, uid, name, "Kicked", why, punish, by, "ban")
+        await log_action(update.effective_chat, "ban", f"👢 {by} kicked {name}.")
 
 
 PROMOTE_PERMS = dict(
@@ -1633,10 +1818,13 @@ async def _mute_cmd(update, context, timed_required=False, delete_replied=False)
     if not done:
         await msg.reply_text("I couldn't mute that user. Check my admin permissions.")
         return
-    why = f"\nReason: {html.escape(reason[:200])}" if reason else ""
+    why = reason[:200] or "Muted by an admin (no reason given)"
+    by, punish = update.effective_user.mention_html(), extra.punishment_text("mute", secs)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Unmute", callback_data=f"unmute:{uid}")]])
-    await msg.reply_html(f"{name} was {done}.{why}", reply_markup=kb)
-    await log_action(chat, "mute", f"🔇 {update.effective_user.mention_html()} {done} {name}.{why}")
+    sent = await msg.reply_html(extra.action_notice(name, "Muted", why, punish, by), reply_markup=kb)
+    await extra.track_notice(sent)
+    await extra.record_action(chat.id, uid, name, "Muted", why, punish, by, "mute")
+    await log_action(chat, "mute", f"🔇 {by} {done} {name}.\nReason: {html.escape(why)}")
 
 
 async def mute(update, context):
@@ -1682,11 +1870,11 @@ async def _warn_cmd(update, context, delete_replied=False):
         return
     if delete_replied and msg.reply_to_message:
         await try_delete(msg.reply_to_message)
-    text = await add_warn(chat, uid, name, reason[:200])
+    text = await add_warn(chat, uid, name, reason[:200], update.effective_user.mention_html())
     kb = None
     if warn_summary(chat.id, uid).split("/")[0] != "0":
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Remove warning", callback_data=f"rmwarn:{uid}")]])
-    await msg.reply_html(text, reply_markup=kb)
+    await extra.track_notice(await msg.reply_html(text, reply_markup=kb))
     await log_action(chat, "warn", f"⚠️ {update.effective_user.mention_html()} warned {name}. {text}")
 
 
@@ -1742,6 +1930,29 @@ async def rmwarn(update, context):
     limit = int(get_setting(chat.id, "warn_limit", 3))
     await msg.reply_html(f"Removed the latest warning from {name} ({len(rows) - 1}/{limit}).")
     await log_action(chat, "warn", f"🗑 {update.effective_user.mention_html()} removed a warning from {name}.")
+
+
+async def modlog_cmd(update, context):
+    """/modlog - the last actions taken in THIS group (admins only). History is kept for 15 days."""
+    if not await group_only(update) or not await admin_only(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    try:
+        rows = await asyncio.to_thread(store.modlog_recent, chat.id, 15)
+    except store.DBError:
+        logging.exception("modlog read failed in chat %s", chat.id)
+        await msg.reply_text("I couldn't read the action history right now. Please try again.")
+        return
+    if not rows:
+        await msg.reply_text("No actions recorded in the last 15 days.")
+        return
+    ist = timezone(timedelta(hours=5, minutes=30))
+    lines = [f"Last {len(rows)} actions in this group (kept for {store.HISTORY_KEEP_DAYS} days, times in IST):", ""]
+    for r in rows:
+        when = datetime.fromtimestamp(r["ts"], ist).strftime("%d %b %I:%M %p")
+        lines.append(f"{when}: {r['text']}")
+    out = "\n".join(lines)
+    await msg.reply_text(out[:4000])
 
 
 async def resetwarns(update, context):
@@ -2269,10 +2480,15 @@ async def captcha_fail(bot, chat_id, user_id, msg_id, mention, why):
     except TelegramError as e:
         logging.warning("Captcha: can't reach chat %s: %s", chat_id, e)
         return
-    done = await do_action(chat, user_id, get_setting(chat_id, "captcha_action", "kick"))
+    mode = get_setting(chat_id, "captcha_action", "kick")
+    done = await do_action(chat, user_id, mode)
     if done:
-        text = f"{mention} {why} and was {done}."
+        kind, secs = extra.mode_kind(mode)
+        label, punish = extra.ACTION_LABEL.get(kind, kind.title()), extra.punishment_text(kind, secs)
+        reason = f"Failed the CAPTCHA: {why}"
+        text = extra.action_notice(mention, label, reason, punish)
         await announce(chat, text, user_id)
+        await extra.record_action(chat_id, user_id, mention, label, reason, punish, None, "captcha")
         await log_action(chat, "captcha", f"🤖 {text}")
 
 
@@ -2893,7 +3109,7 @@ async def suggestions_callback(update, context):
         if origin == "help":
             await q.edit_message_text(
                 f"<b>{html.escape(extra.bot_name())}</b>\n\n{HELP_INTRO}",
-                parse_mode="HTML", reply_markup=help_main_keyboard(chat),
+                parse_mode="HTML", reply_markup=help_main_keyboard(chat, q.from_user.id),
             )
         else:
             await q.edit_message_text(
@@ -4766,6 +4982,7 @@ async def post_init(app):
     logging.info("Bot identity: name=%r username=@%s id=%s", extra.bot_name(), extra.bot_username(), _BOT_ID)
     app.bot_data["captcha_task"] = asyncio.create_task(captcha_sweeper(app))
     app.bot_data["msgcount_task"] = asyncio.create_task(msgcount.outbox_sweeper(app))  # pending milestone messages
+    app.bot_data["notice_task"] = asyncio.create_task(extra.notice_sweeper(app))  # deletes action notices after 1 day
     app.bot_data["startup_task"] = asyncio.create_task(_startup_sync_safe(app))
 
 
@@ -4892,6 +5109,37 @@ async def stats_record(update, context):
         _stats_remember(chat.id, chat.title)
 
 
+# Defaults a NEW group starts with when the bot is added to it. These are the ORIGINAL values; the 👑 Owner panel can
+# change any of them (saved in MongoDB). Existing groups keep what they have: a value is only written when the group
+# has no value of its own yet.
+NEW_GROUP_DEFAULTS = {
+    "block_punish": "mute", "block_punish_secs": 30 * 60,  # Ads + Promotion: mute 30 minutes (/adpunish overrides per group)
+    "nsfw_action": "delete", "nsfw_secs": 5 * 60,           # Protection: delete; a mute lasts 5 minutes
+    "flood_mode": "tmute:300",                              # Antiflood: mute 5 minutes
+    "spam_mode": "warn",
+    "blocklist_mode": "delete",
+    "warn_mode": "ban",                                     # action when the warn limit is reached
+    "captcha_action": "kick",
+}
+
+
+def new_group_defaults():
+    """What a new group gets: the original values, replaced by whatever the owner changed in the 👑 Owner panel."""
+    out = dict(NEW_GROUP_DEFAULTS)
+    try:
+        out.update(store.owner_defaults())
+    except Exception:
+        logging.exception("Couldn't read the owner's default settings; using the original defaults")
+    return out
+
+
+def apply_new_group_defaults(chat_id):
+    """Save the new-group defaults for a group the bot was just added to (never overwrites a saved value)."""
+    for key, value in new_group_defaults().items():
+        if get_setting(chat_id, key) is None:
+            set_setting(chat_id, key, value)
+
+
 async def stats_member_update(update, context):
     """group=40: the bot was added to / removed from a group."""
     ev = update.my_chat_member
@@ -4902,6 +5150,12 @@ async def stats_member_update(update, context):
         _stats_forget(chat.id)
     else:
         _stats_remember(chat.id, chat.title)
+        was_out = ev.old_chat_member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+        if was_out:  # the bot has just been ADDED (a promotion inside a group it was already in does not count)
+            try:
+                await asyncio.to_thread(apply_new_group_defaults, chat.id)
+            except Exception:
+                logging.exception("Couldn't save the new-group defaults for chat %s", chat.id)
 
 
 async def stats_migrate(update, context):
@@ -5057,6 +5311,7 @@ async def stats_callback(update, context):
 
 def main():
     extra.start_web_server()  # Render: open the port first (health check / keep-alive)
+    logging.warning("OWNER_IDS loaded: %s (the 👑 Owner button shows only for these Telegram user IDs)", OWNER_IDS)
     missing = [n for n in ("BOT_TOKEN", "MONGO_URI") if not (os.getenv(n) or "").strip()]
     if missing:
         logging.critical("Missing required environment variable(s): %s. Add them in the Render "
@@ -5098,7 +5353,7 @@ def main():
         "ban": ban, "unban": unban, "kick": kick, "promote": promote, "demote": demote,
         "mute": mute, "tmute": tmute, "dmute": dmute, "unmute": unmute,
         "warn": warn, "dwarn": dwarn, "warns": warns_cmd, "rmwarn": rmwarn,
-        "resetwarns": resetwarns, "warnlimit": warnlimit, "setwarnlimit": warnlimit,
+        "modlog": modlog_cmd, "resetwarns": resetwarns, "warnlimit": warnlimit, "setwarnlimit": warnlimit,
         "warnmode": warnmode, "warntime": warntime,
         "flood": flood, "setflood": setflood, "floodmode": floodmode,
         "antispam": antispam, "spammode": spammode,
@@ -5149,6 +5404,7 @@ def main():
     msgcount.register(app)  # /rank /top /today /week /overall /me /radmin /resetrank + counter + 📊 menu
     app.add_handler(CallbackQueryHandler(captcha_callback, pattern=r"^cap:"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:"))
+    app.add_handler(CallbackQueryHandler(owner_callback, pattern=r"^own:"))  # 👑 Owner: defaults for new groups
     app.add_handler(CallbackQueryHandler(pause_callback, pattern=r"^pz:"))
     # /power: matched ONLY for a Primary Bot Owner in a private chat, so everyone else gets complete silence
     app.add_handler(CommandHandler(["power", "showpower"], power_cmd,
