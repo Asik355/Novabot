@@ -403,6 +403,15 @@ _seen = OrderedDict()          # (chat_id, message_id) of recently counted messa
 _off_until = {}                # chat_id -> monotonic time until which "counting is OFF" is trusted (bounded)
 
 
+def _paused(chat_id):
+    """/pause state of this group (same setting nova.py writes: 0 = running, -1 = until /resume, else end time)."""
+    try:
+        until = int(M.get_setting(chat_id, "paused_until", 0) or 0)
+    except Exception:
+        return False
+    return until == -1 or (until > 0 and until > time.time())
+
+
 async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """group=5: counts each eligible human message once. Never blocks other handlers."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
@@ -414,6 +423,8 @@ async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return                                  # channel posts / anonymous-admin posts: no human to credit
     if not any(getattr(msg, attr, None) for attr in _CONTENT_ATTRS):
         return                                  # service message (tag/setting changes...): not a message
+    if _paused(chat.id):
+        return                                  # /pause is on for this group: nothing is counted
     until = _off_until.get(chat.id)
     if until and until > time.monotonic():
         return
@@ -444,6 +455,12 @@ async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------------------------------------------------------ permissions
 async def _is_group_admin(bot, chat_id, user_id):
     """True/False from Telegram's own member info for THIS chat; None when Telegram can't be asked."""
+    fn = getattr(getattr(extra, "_BD", None), "is_bot_owner", None)
+    try:
+        if fn and fn(user_id):
+            return True                         # bot owner with /power ON counts as an admin everywhere
+    except Exception:
+        log.exception("msgcount: owner power check failed")
     try:
         m = await bot.get_chat_member(chat_id, user_id)
     except TelegramError:

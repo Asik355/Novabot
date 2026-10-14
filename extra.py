@@ -2420,6 +2420,16 @@ _bl_tasks = set()
 _bl_registered = set()  # id(app) of applications that already have the Blocking handlers
 
 
+def _bl_paused(chat_id):
+    """True while /pause is on for this group (is_paused is handed in by nova.py)."""
+    fn = getattr(_BD, "is_paused", None)
+    try:
+        return bool(fn and fn(chat_id))
+    except Exception:
+        log.exception("Blocking: couldn't read the pause state for chat %s", chat_id)
+        return False
+
+
 def _bl_spawn(coro):
     """Background timer that can't be garbage-collected."""
     t = asyncio.get_running_loop().create_task(coro)
@@ -2906,6 +2916,8 @@ async def ads_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if not msg or not user or chat.type == "private":
         return
+    if _bl_paused(chat.id) or _BD.is_bot_owner(user.id):
+        return  # /pause is on for this group, or the sender is the bot owner: never acted on
     prior_msgs = _bl_note_activity(chat.id, user.id)  # how established is this sender (cheap, RAM only)
     if not (msg.text or msg.caption or msg.entities or msg.caption_entities or msg.reply_markup
             or (BL_AI_IMAGES and (getattr(msg, "photo", None) or getattr(msg, "document", None)))):
@@ -3130,7 +3142,7 @@ def _bl_add_screen():
 async def _bl_can_manage(chat, user_id):
     """Same rule as the other admin buttons: a real admin of THIS group, the bot owner or a Super Admin."""
     try:
-        if user_id in _BD.owner_ids or _BD.is_super_admin(user_id):
+        if _BD.is_bot_owner(user_id) or _BD.is_super_admin(user_id):
             return True
         return bool(await _BD.is_admin(chat, user_id))
     except Exception:
@@ -4136,6 +4148,8 @@ async def nsfw_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if not msg or not user or chat.type == "private":
         return
+    if _bl_paused(chat.id) or _BD.is_bot_owner(user.id):
+        return  # /pause is on for this group, or the sender is the bot owner: never acted on
     word_on = _nsfw_on(chat.id, NSFW_WORD_KEY)
     content_on = _nsfw_on(chat.id, NSFW_CONTENT_KEY)
     if not (word_on or content_on):
@@ -4230,7 +4244,7 @@ async def nsfw_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def register_blocking(app, deps):
     """deps needs: is_admin, lock_exempt, load_allow, url_allowed, log_action, MUTED,
-    is_super_admin, owner_ids, get_setting, set_setting."""
+    is_super_admin, owner_ids, is_bot_owner, is_paused, get_setting, set_setting."""
     global _BD
     _BD = deps
     if id(app) in _bl_registered:  # never register the handlers twice on the same application

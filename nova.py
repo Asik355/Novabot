@@ -158,6 +158,8 @@ async def get_role(chat, user_id):
     when Telegram wouldn't tell us. Failures are logged so the cause is visible.
     Successful lookups are cached briefly: every admin check used to cost a Telegram
     round-trip (often 0.2-1s each, several per command)."""
+    if is_bot_owner(user_id):
+        return "creator"  # owner power ON: counts as the group owner everywhere (never cached)
     key = (chat.id, user_id)
     hit = _role_cache.get(key)
     if hit and time.time() - hit[1] < ROLE_TTL:
@@ -181,9 +183,64 @@ async def is_admin(chat, user_id):
     return await get_role(chat, user_id) in ADMIN_STATUSES
 
 
+# ------------------------------------------------------------- owner power (global, owner's private chat only)
+# /power on|off|<time>|show, used by a Primary Bot Owner in a private chat with the bot. While it is ON the owner
+# can use every command and menu in every group without being an admin, and no automatic or manual action
+# touches them. It is OFF by default and is stored globally (chat 0) as "owner_power_until":
+# 0 = off, -1 = on until /power off, otherwise the unix time when it switches itself off.
+POWER_KEY = "owner_power_until"
+POWER_MAX_SECS = 365 * 24 * 3600
+
+
+def power_state():
+    """0 = off, -1 = on until switched off, otherwise the number of seconds left."""
+    try:
+        until = int(get_setting(0, POWER_KEY, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    if until == -1:
+        return -1
+    left = until - int(time.time())
+    return left if until > 0 and left > 0 else 0
+
+
+def owner_power_on() -> bool:
+    return power_state() != 0
+
+
+def is_bot_owner(user_id) -> bool:
+    """True only for a Primary Bot Owner (OWNER_IDS) while /power is ON. Everything that gives the owner
+    extra rights or immunity asks this, so with power OFF the owner is an ordinary member or admin."""
+    return user_id in OWNER_IDS and owner_power_on()
+
+
 def is_approved(chat_id, user_id) -> bool:
-    """Approved users are exempt from locks, blocklists, antiflood and antispam."""
-    return store.is_approved(chat_id, user_id)
+    """Approved users are exempt from locks, blocklists, antiflood and antispam.
+    The bot owner counts as approved everywhere, so every guard that checks approval skips them."""
+    return is_bot_owner(user_id) or store.is_approved(chat_id, user_id)
+
+
+# ------------------------------------------------------------- pause / resume (per group)
+# /pause [time] switches every automatic function off in ONE group until /resume (or until the time ends).
+# Stored as the per-group setting "paused_until": 0 = running, -1 = paused until /resume, otherwise the
+# unix time when it resumes by itself. Commands and menus keep working so an admin can always /resume.
+PAUSE_KEY = "paused_until"
+
+
+def pause_state(chat_id):
+    """0 = running, -1 = paused until /resume, otherwise the number of seconds left."""
+    try:
+        until = int(get_setting(chat_id, PAUSE_KEY, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    if until == -1:
+        return -1
+    left = until - int(time.time())
+    return left if until > 0 and left > 0 else 0
+
+
+def is_paused(chat_id) -> bool:
+    return chat_id < 0 and pause_state(chat_id) != 0
 
 
 async def admin_only(update: Update) -> bool:
@@ -303,6 +360,9 @@ async def get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def can_target(update, user_id) -> bool:
+    if is_bot_owner(user_id):
+        await update.effective_message.reply_text("I won't act on the bot owner.")
+        return False
     if await is_admin(update.effective_chat, user_id):
         await update.effective_message.reply_text("I won't act on an admin.")
         return False
@@ -378,6 +438,8 @@ _recent_mutes = {}  # (chat_id, user_id) -> time the bot last muted them (lets a
 
 async def do_action(chat, user_id, mode):
     """Run ban/kick/mute/tmute. Returns a past-tense word, or None if Telegram refused."""
+    if is_bot_owner(user_id):
+        return None  # never act on the bot owner, whatever triggered it
     kind, _, arg = mode.partition(":")
     try:
         if kind == "ban":
@@ -656,8 +718,8 @@ async def approved_list(update, context):
 
 
 async def _can_unapprove_all(chat, user_id) -> bool:
-    """Only the chat creator (or a bot owner) may wipe every approval."""
-    if user_id in OWNER_IDS:
+    """Only the chat creator (or a bot owner with power ON) may wipe every approval."""
+    if is_bot_owner(user_id):
         return True
     try:
         member = await chat.get_member(user_id)
@@ -995,6 +1057,8 @@ HELP_SECTIONS = {
     "other": (
         "Misc",
         "<b>Misc</b>\n\n" + _numbered([
+            "/pause [time]: Switch every automatic function off in this group until /resume, or for a set time (admins).",
+            "/resume: Switch everything back on (admins).",
             "/pin (reply): Pin the replied-to message.",
             "/suggestions on|off: Show or hide the / command-suggestion menu here.",
         ]),
@@ -1250,8 +1314,22 @@ def help_main_keyboard(chat=None):
     return InlineKeyboardMarkup(rows)
 
 
-def help_section_keyboard():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="help:main")]])
+def help_section_keyboard(key=None, chat=None):
+    rows = []
+    if key == "mod" and chat is not None and chat.type != "private":
+        # Admin section: pause / resume every automatic function of this group (same state as /pause, /resume)
+        rows.append([InlineKeyboardButton("⏸ Pause", callback_data="pz:p"),
+                     InlineKeyboardButton("▶️ Resume", callback_data="pz:r")])
+    rows.append([InlineKeyboardButton("« Back", callback_data="help:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_section_text(chat=None):
+    label, body = HELP_SECTIONS["mod"]
+    text = f"<b>{label}</b>\n\n{body}"
+    if chat is not None and chat.type != "private":
+        text += "\n\n" + html.escape(pause_text(chat.id))
+    return text
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1268,7 +1346,7 @@ async def action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     chat = update.effective_chat
     if not (await is_admin(chat, q.from_user.id)
-            or q.from_user.id in OWNER_IDS or store.is_super_admin(q.from_user.id)):
+            or is_bot_owner(q.from_user.id) or store.is_super_admin(q.from_user.id)):
         await q.answer("Admins only.", show_alert=True)
         return
     action, _, uid = q.data.partition(":")
@@ -1311,8 +1389,8 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         markup = help_main_keyboard(update.effective_chat)
     else:
         label, body = HELP_SECTIONS[key]
-        text = f"<b>{label}</b>\n\n{body}"
-        markup = help_section_keyboard()
+        text = admin_section_text(update.effective_chat) if key == "mod" else f"<b>{label}</b>\n\n{body}"
+        markup = help_section_keyboard(key, update.effective_chat)
     try:
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     except TelegramError:
@@ -1375,6 +1453,8 @@ _PROMOTED_KEY = "bot_promoted_admins"  # per-group setting: comma-separated user
 async def has_add_admin_right(chat, user_id):
     """Does this user hold the 'Add New Admin' right in THIS chat? True/False, or None when
     Telegram wouldn't tell us. Always a fresh lookup (not the cached role)."""
+    if is_bot_owner(user_id):
+        return True  # owner power ON
     try:
         member = await chat.get_member(user_id)
     except TelegramError as e:
@@ -1897,7 +1977,7 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user.is_bot:
             continue
         added_by_admin = adder_is_admin and adder.id != user.id
-        if verify and not added_by_admin and not await is_admin(chat, user.id):
+        if verify and not added_by_admin and not is_bot_owner(user.id) and not await is_admin(chat, user.id):
             await start_captcha(context, chat, user)
         else:
             await send_welcome(context, chat, user, reply_to=msg)
@@ -2609,7 +2689,7 @@ async def _gather_limited(coros, limit=6):
 
 async def can_toggle_suggestions(chat, user_id, msg=None) -> bool:
     """Bot Owner, Bot Moderators (Super Admins) and group admins/owner only."""
-    if user_id in OWNER_IDS or is_super_admin(user_id):
+    if is_bot_owner(user_id) or is_super_admin(user_id):
         return True
     if msg is not None and msg.sender_chat is not None and msg.sender_chat.id == chat.id:
         return True  # anonymous group admin
@@ -2822,6 +2902,179 @@ async def suggestions_callback(update, context):
             )
     except TelegramError:
         pass
+
+
+PAUSE_MAX_SECS = 30 * 24 * 3600  # a timed pause can last at most 30 days
+PAUSE_USAGE = ("Usage:\n"
+               "1. /pause: Switch every automatic function off here until /resume.\n"
+               "2. /pause 30m: Pause for a set time, then resume by itself (m, h, d, w; up to 30 days).\n"
+               "3. /pause status: Show whether this group is paused.\n"
+               "4. /resume: Switch everything back on.")
+
+
+def pause_text(chat_id):
+    state = pause_state(chat_id)
+    if state == 0:
+        return "▶️ Everything is running normally in this group."
+    if state == -1:
+        return "⏸ This group is paused until an admin sends /resume."
+    return f"⏸ This group is paused. It resumes by itself in {fmt_duration(state)}, or send /resume now."
+
+
+async def _pause_allowed(update) -> bool:
+    chat, msg, user = update.effective_chat, update.effective_message, update.effective_user
+    if chat is None or msg is None or user is None:
+        return False
+    if chat.type == "private":
+        await msg.reply_text("Use this command in a group.")
+        return False
+    if not await can_toggle_suggestions(chat, user.id, msg):  # Bot Owner, Super Admins, group admins
+        await msg.reply_text("Only group admins, the Bot Owner or Moderators can use this command.")
+        return False
+    return True
+
+
+async def pause_cmd(update, context):
+    """/pause [time|status]: every automatic function off in this group (locks, flood, spam, blocklist,
+    ads/promotion, NSFW protection, captcha, welcome/goodbye, filters, notes, message counting...).
+    Commands and menu buttons keep working."""
+    if not await _pause_allowed(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    arg = context.args[0].lower() if context.args else ""
+    if arg == "status":
+        await msg.reply_text(pause_text(chat.id))
+        return
+    secs = None
+    if arg:
+        secs = parse_duration(arg)
+        if not secs or secs > PAUSE_MAX_SECS:
+            await msg.reply_text("❌ That time isn't valid.\n\n" + PAUSE_USAGE)
+            return
+    try:
+        set_setting(chat.id, PAUSE_KEY, int(time.time()) + secs if secs else -1)
+    except Exception:
+        logging.exception("Couldn't save the pause state for chat %s", chat.id)
+        await msg.reply_text("⚠️ I couldn't save that right now, so nothing was changed. Please try again.")
+        return
+    await msg.reply_text(
+        "⏸ Paused. Locks, flood and spam control, blocklist, ads/promotion and NSFW protection, captcha, "
+        "welcome messages, filters and message counting are all off in this group.\n"
+        + (f"I'll resume by myself in {fmt_duration(secs)}. " if secs else "")
+        + "Commands still work. Send /resume to switch everything back on."
+    )
+    await log_action(chat, "admin", f"⏸ {update.effective_user.mention_html()} paused the bot"
+                     + (f" for {fmt_duration(secs)}." if secs else "."))
+
+
+async def resume_cmd(update, context):
+    """/resume: switch every function back on."""
+    if not await _pause_allowed(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    if not is_paused(chat.id):
+        set_setting(chat.id, PAUSE_KEY, 0)  # also clears an expired timer
+        await msg.reply_text("▶️ Everything is already running in this group.")
+        return
+    try:
+        set_setting(chat.id, PAUSE_KEY, 0)
+    except Exception:
+        logging.exception("Couldn't clear the pause state for chat %s", chat.id)
+        await msg.reply_text("⚠️ I couldn't save that right now, so nothing was changed. Please try again.")
+        return
+    await msg.reply_text("▶️ Resumed. Every function is back on in this group.")
+    await log_action(chat, "admin", f"▶️ {update.effective_user.mention_html()} resumed the bot.")
+
+
+async def pause_callback(update, context):
+    """Pause / Resume buttons of the Admin menu. Permissions are re-checked on every click."""
+    q = update.callback_query
+    chat = getattr(q.message, "chat", None)
+    if chat is None or chat.type == "private":
+        await q.answer("Use this in a group.", show_alert=True)
+        return
+    if await extra.menu_not_owner(q):
+        return
+    if q.data not in ("pz:p", "pz:r"):
+        await q.answer("This button is no longer valid.", show_alert=True)
+        return
+    if not await can_toggle_suggestions(chat, q.from_user.id):
+        await q.answer("Only group admins, the Bot Owner or Moderators can do this.", show_alert=True)
+        return
+    pausing = q.data == "pz:p"
+    if pausing == is_paused(chat.id):
+        await q.answer("Already paused." if pausing else "Already running.")
+        return
+    try:
+        set_setting(chat.id, PAUSE_KEY, -1 if pausing else 0)
+    except Exception:
+        logging.exception("Couldn't save the pause state for chat %s", chat.id)
+        await q.answer("I couldn't save that right now, so nothing was changed.", show_alert=True)
+        return
+    await q.answer("Paused. Press Resume to switch everything back on." if pausing else "Resumed.", show_alert=pausing)
+    try:
+        await q.edit_message_text(admin_section_text(chat), parse_mode="HTML",
+                                  reply_markup=help_section_keyboard("mod", chat))
+    except TelegramError:
+        pass
+    await log_action(chat, "admin", f"{'⏸' if pausing else '▶️'} {q.from_user.mention_html()} "
+                     f"{'paused' if pausing else 'resumed'} the bot.")
+
+
+def power_text():
+    state = power_state()
+    if state == 0:
+        return "🔒 Owner Power: OFF"
+    if state == -1:
+        return "🔓 Owner Power: ON (until you send /power off)"
+    return f"🔓 Owner Power: ON ({fmt_duration(state)} left, then it switches itself off)"
+
+
+POWER_USAGE = ("Usage:\n"
+               "/power on: Switch Owner Power on until you switch it off.\n"
+               "/power 30m: Switch it on for a set time (m, h, d, w; up to 1 year), then it turns off by itself.\n"
+               "/power off: Switch it off.\n"
+               "/power show: Show the current status.")
+
+
+async def power_cmd(update, context):
+    """/power on | off | <time> | show. Primary Bot Owner only, in a private chat only. Anyone else gets no
+    reply at all (the handler isn't even matched for them; the checks below are a second lock)."""
+    chat, msg, user = update.effective_chat, update.effective_message, update.effective_user
+    if not chat or not msg or not user or chat.type != "private" or user.id not in OWNER_IDS:
+        return
+    arg = (context.args[0].lower() if context.args else "")
+    if update.effective_message.text and update.effective_message.text.lstrip("/").lower().startswith("showpower"):
+        arg = "show"
+    if arg in ("", "show", "status"):
+        await msg.reply_text(power_text() + ("" if arg else "\n\n" + POWER_USAGE))
+        return
+    if arg == "on":
+        value = -1
+    elif arg == "off":
+        value = 0
+    else:
+        secs = parse_duration(arg)
+        if not secs or secs > POWER_MAX_SECS:
+            await msg.reply_text("❌ That time isn't valid.\n\n" + POWER_USAGE)
+            return
+        value = int(time.time()) + secs
+    try:
+        set_setting(0, POWER_KEY, value)
+    except Exception:
+        logging.exception("Couldn't save the owner power state")
+        await msg.reply_text("⚠️ I couldn't save that right now, so nothing was changed. Please try again.")
+        return
+    await msg.reply_text(power_text())
+
+
+async def pause_gate(update, context):
+    """group=-100, before every other handler: while a group is paused, ordinary messages and join/leave
+    events are not processed at all. Commands still go through (so /resume works); the guards that also
+    look at commands (locks, ads, NSFW) check is_paused themselves."""
+    chat = update.effective_chat
+    if chat is not None and is_paused(chat.id):
+        raise ApplicationHandlerStop
 
 
 def flood_text(chat_id):
@@ -3132,7 +3385,7 @@ def find_violation(msg, locked, allow):
 async def lock_exempt(chat, msg, user, bot_id):
     """Admins, the owner, genuine anonymous admins, approved users and Telegram's own
     forwards are never touched by locks."""
-    if msg.is_automatic_forward or user.id in (777000, bot_id):
+    if msg.is_automatic_forward or user.id in (777000, bot_id) or is_bot_owner(user.id):
         return True
     if msg.sender_chat is not None:
         # sender_chat == this chat is a real anonymous admin; any other channel is not exempt
@@ -3162,6 +3415,8 @@ async def lock_guard(update, context):
         return
     if is_service_message(msg):
         return  # group-setting / member-tag changes are not messages to police
+    if is_paused(chat.id):
+        return  # /pause: every function is off in this group
     locked = locked_set(chat.id)
     if not locked:
         return  # fast path: no locks, no Telegram calls
@@ -3521,7 +3776,7 @@ async def _purge_checks(update, context, need_reply=True):
         return False
     anonymous_admin = msg.sender_chat is not None and msg.sender_chat.id == chat.id
     # Bot Owner and Bot Moderators (Super Admins) may purge in any group.
-    privileged = user.id in OWNER_IDS or is_super_admin(user.id)
+    privileged = is_bot_owner(user.id) or is_super_admin(user.id)
     if not anonymous_admin and not privileged:
         try:
             member = await chat.get_member(user.id)
@@ -3966,6 +4221,8 @@ async def edit_perm_error(kind, chat, user_id):
         return ERR_BOT_DENIED if OWNER_IDS else owner_setup_hint(user_id)
     if chat.type == "private":
         return "⚠️ Group editing only works inside a group. Use /groupedit or /help there."
+    if is_bot_owner(user_id):
+        return None  # owner power ON
     try:
         member = await chat.get_member(user_id)
     except TelegramError:
@@ -4866,6 +5123,7 @@ def main():
         "allowlist": allowlist_cmd, "rmallowlist": rmallowlist, "rmallowlistall": rmallowlistall,
         "save": save_note, "get": get_note, "notes": list_notes, "clear": clear_note,
         "filter": add_filter, "stop": stop_filter, "filters": list_filters,
+        "pause": pause_cmd, "resume": resume_cmd,
         "lock": lock, "unlock": unlock, "pin": pin, "purge": purge, "spurge": spurge, "del": del_cmd,
         "purgefrom": purgefrom, "purgeto": purgeto,
         "addblocklist": addblocklist, "unblocklist": unblocklist, "blocklist": blocklist_cmd,
@@ -4886,11 +5144,15 @@ def main():
     extra.register_blocking(app, SimpleNamespace(
         is_admin=is_admin, lock_exempt=lock_exempt, load_allow=load_allow, url_allowed=url_allowed,
         log_action=log_action, MUTED=MUTED, is_super_admin=is_super_admin, owner_ids=OWNER_IDS,
-        get_setting=store.get_setting, set_setting=store.set_setting,
+        is_paused=is_paused, is_bot_owner=is_bot_owner, get_setting=store.get_setting, set_setting=store.set_setting,
         block_words=store.block_words))  # the Blocklist is the shared word source for NSFW Word
     msgcount.register(app)  # /rank /top /today /week /overall /me /radmin /resetrank + counter + 📊 menu
     app.add_handler(CallbackQueryHandler(captcha_callback, pattern=r"^cap:"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:"))
+    app.add_handler(CallbackQueryHandler(pause_callback, pattern=r"^pz:"))
+    # /power: matched ONLY for a Primary Bot Owner in a private chat, so everyone else gets complete silence
+    app.add_handler(CommandHandler(["power", "showpower"], power_cmd,
+                                   filters=filters.ChatType.PRIVATE & filters.User(user_id=OWNER_IDS)))
     app.add_handler(CallbackQueryHandler(edit_callback, pattern=r"^(gedit|bedit):"))
     app.add_handler(CallbackQueryHandler(suggestions_callback, pattern=r"^sug:"))
     app.add_handler(CallbackQueryHandler(unapprove_all_callback, pattern=r"^unall:"))
@@ -4898,6 +5160,10 @@ def main():
     # default list is published once at startup; each group's own list (ON/OFF) is synced from the
     # database on the first message seen there (group=-3 runs before everything else, never blocks)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, sync_suggestions), group=-3)
+    # group=-100: /pause gate. Runs before everything else; a paused group's ordinary messages and join/leave
+    # events stop here. Commands and the group->supergroup migration notice are never stopped.
+    app.add_handler(MessageHandler(
+        filters.ChatType.GROUPS & ~filters.COMMAND & ~filters.StatusUpdate.MIGRATE, pause_gate), group=-100)
     # group=-4: automatic name-change detection (no command; a group of its own so it never
     # competes with, or blocks, the other handlers)
     app.add_handler(MessageHandler(
