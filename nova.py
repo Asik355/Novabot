@@ -2358,9 +2358,115 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.effective_message.reply_text("That rules link isn't valid.")
         return
+    if chat.type != "private":
+        await update.effective_message.reply_text(
+            f"Hi! I'm {extra.bot_name()}. Add me to your group as an admin and use /help."
+        )
+        return
     await update.effective_message.reply_text(
-        f"Hi! I'm {extra.bot_name()}. Add me to your group as an admin and use /help."
+        start_text(update.effective_user),
+        parse_mode="HTML",
+        reply_markup=await start_keyboard(context),
+        disable_web_page_preview=True,
     )
+
+
+# Channel button on the /start card: set the CHANNEL_URL environment variable (e.g. https://t.me/yourchannel).
+# While it is empty the button is simply not shown.
+CHANNEL_URL = os.environ.get("CHANNEL_URL", "").strip()
+START_ADMIN_RIGHTS = "delete_messages+restrict_members+pin_messages+invite_users+change_info"
+
+
+START_BOT_NAME = "ALBEDO"
+
+
+_SMALL_CAPS = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ")
+
+
+def small_caps(text):
+    """Latin letters to small-capital letters; everything else (digits, emoji, other scripts) unchanged."""
+    return text.translate(_SMALL_CAPS)
+
+
+_SC_SKIP = re.compile(r"(<[^>]*>|&[a-z]+;|/[A-Za-z_]+)")
+
+
+def sc_html(text):
+    """Small-caps every word of an HTML message, but leave tags, entities and /commands untouched
+    (commands must stay tappable)."""
+    return "".join(part if i % 2 else small_caps(part.lower()) for i, part in enumerate(_SC_SKIP.split(text)))
+
+
+def start_text(user, bot_name=None):
+    who = html.escape(small_caps(((user.first_name if user else "") or "there").lower()))
+    name = small_caps(START_BOT_NAME.lower())
+    return (
+        f"🌸 {small_caps('hey')}, {who}! {small_caps('welcome to')} {name} ✨\n"
+        f"{small_caps('my name is')} {name} 💗\n"
+        f"{small_caps('your smart ai')} &amp; {small_caps('group management bot')} 🤖\n\n"
+        f"╭━━━「 💫 {small_caps('my features')} 」━━━╮\n"
+        f"┃ ✦ 🛡️ {small_caps('group moderation')}\n"
+        f"┃ ✦ 🤖 {small_caps('ai chat')} &amp; {small_caps('smart tools')}\n"
+        f"┃ ✦ ⚡ {small_caps('useful commands')}\n"
+        f"┃ ✦ 🌷 {small_caps('easy group management')}\n"
+        "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
+        f"💫 {small_caps('your group, your rules')}\n"
+        f"🌸 {small_caps('let')} {name} {small_caps('help!')} 💗\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"💚 {small_caps('add me to your group')}\n"
+        f"💙 {small_caps('explore my commands')}\n"
+        f"💜 {small_caps('discover more about me')}"
+    )
+
+
+def start_about_text():
+    return sc_html(
+        f"💜 <b>ABOUT {START_BOT_NAME}</b>\n\n"
+        f"Hi, I'm <b>{START_BOT_NAME.title()}</b>, your group's smart helper. I keep your chat clean and safe, "
+        "and I also bring AI tools and fun games, so your members have a good time.\n\n"
+        "🚀 <b>HOW TO GET STARTED</b>\n"
+        "<blockquote>1️⃣ Tap <b>➕ Add Me to Group</b> and pick your group\n"
+        "2️⃣ Please make me an admin, so I can look after your group properly\n"
+        "3️⃣ Send /help in the group and tap a category to set things up\n"
+        "4️⃣ That's it. I'll take care of the rest</blockquote>\n"
+        "🛡 <b>WHAT I DO</b>\n"
+        "<blockquote>• I stop floods, spam and bad links, and I check new members with a CAPTCHA\n"
+        "• I welcome new members, show the rules, and keep filters and notes\n"
+        "• I handle reports, and I keep a mod log of recent actions\n"
+        "• I add AI chat and image tools, plus fun games like roast, court and birthdays</blockquote>\n"
+        "🔎 <b>I ALWAYS EXPLAIN</b>\n"
+        "When I warn, mute or ban someone, I post the reason and the punishment. "
+        "The notice clears itself after 1 day.\n\n"
+        "📚 Tap <b>Commands</b> on the main card to see everything I can do."
+    )
+
+
+async def start_keyboard(context):
+    username = await bot_username(context)
+    add_url = f"https://t.me/{username}?startgroup=true&admin={START_ADMIN_RIGHTS}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ " + small_caps("add me to group"), url=add_url, api_kwargs={"style": "success"})],
+        [InlineKeyboardButton("📚 " + small_caps("commands"), callback_data="help:main", api_kwargs={"style": "primary"}),
+         InlineKeyboardButton("💜 " + small_caps("details"), callback_data="start:about", api_kwargs={"style": "primary"})],
+    ])
+
+
+async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Details page of the private /start card, with a Back button (and the Channel link if CHANNEL_URL is set)."""
+    q = update.callback_query
+    await q.answer()
+    if q.data == "start:home":
+        text, markup = start_text(update.effective_user), await start_keyboard(context)
+    else:
+        rows = []
+        if CHANNEL_URL:
+            rows.append([InlineKeyboardButton("📢 " + small_caps("channel"), url=CHANNEL_URL, api_kwargs={"style": "primary"})])
+        rows.append([InlineKeyboardButton("« " + small_caps("back"), callback_data="start:home")])
+        text, markup = start_about_text(), InlineKeyboardMarkup(rows)
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+    except TelegramError:
+        pass  # unchanged (double tap) or too old to edit
 
 
 async def setrules(update, context):
@@ -5509,6 +5615,7 @@ def main():
     msgcount.register(app)  # /rank /top /today /week /overall /me /radmin /resetrank + counter + 📊 menu
     app.add_handler(CallbackQueryHandler(captcha_callback, pattern=r"^cap:"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:"))
+    app.add_handler(CallbackQueryHandler(start_callback, pattern=r"^start:"))
     app.add_handler(CallbackQueryHandler(owner_callback, pattern=r"^own:"))  # 👑 Owner: defaults for new groups
     app.add_handler(CallbackQueryHandler(pause_callback, pattern=r"^pz:"))
     # /power: matched ONLY for a Primary Bot Owner in a private chat, so everyone else gets complete silence
