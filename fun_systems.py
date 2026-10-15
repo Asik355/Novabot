@@ -34,6 +34,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as KB
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -3922,6 +3923,742 @@ def _bd_register(app):
     app.post_init = _post_init
 
 
+# ============================================================ 🎉 FUN COMMANDS + GIF MANAGER
+# /help -> 🎉 Fun -> 🎭 Commands (everyone) and ⚙️ Customise Commands (Bot Owner only).
+# Commands and their GIFs are GLOBAL (MongoDB: fun_commands, fun_gifs), the same in every group. They are looked up
+# in the database at the moment they are used, so a command created, renamed or deleted in the menu works (or stops
+# working) immediately, with no code change and no restart. A user replies to a message with /<name>; the bot replies
+# to that message with one randomly chosen saved GIF (a Telegram file_id, nothing is downloaded) and no caption.
+#   callbacks  fun:m | fun:c:<page> | fun:d:<id>:<page>                      (everyone)
+#              fun:x fun:s fun:my fun:new fun:p fun:ef fun:cy fun:g fun:rm fun:rmy fun:rmn fun:cx fun:gd fun:ag   (owner)
+#   commands   /setgif <name>   /gifedit <name>                               (owner only: everyone else gets silence)
+FUN_PAGE = 10                      # commands per page in the lists
+FUN_GIF_PAGE = 5                   # GIFs shown per page in View / Remove
+FUN_SESSION_SECS = 600             # a guided owner workflow expires after 10 idle minutes
+FUN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
+FUN_DESC_MAX, FUN_USAGE_MAX = 300, 200
+FUN_STATIC_RESERVED = frozenset({"start", "help", "cancel", "done", "setgif", "gifedit"})
+FUN_NA_TEXT = "⚙️ Feature Not Available Yet"
+FUN_BLANK = "⠀"               # an invisible button label (Telegram does not accept an empty one)
+FUN_SEEDS = (                      # created once on the very first start; afterwards they are ordinary commands
+    ("hug", "Send a random hug GIF in response to another user's message.", "/hug (reply to a user's message)"),
+    ("kiss", "Send a random kiss GIF in response to another user's message.", "/kiss (reply to a user's message)"),
+    ("pat", "Send a random pat GIF in response to another user's message.", "/pat (reply to a user's message)"),
+    ("slap", "Send a random slap GIF in response to another user's message.", "/slap (reply to a user's message)"),
+)
+FUN_OPS = {"addg": "🎞 Add GIF", "view": "👀 View GIFs", "edit": "✏️ Edit Command",
+           "rmg": "🗑 Remove GIF", "clr": "🧹 Clear GIFs", "del": "❌ Delete Command"}
+FUN_FIELDS = {"n": "name", "d": "description", "u": "usage"}
+_fun_S = {}                        # (chat_id, owner id) -> the owner's guided workflow (transient UI state only)
+_fun_names_cache = {"ts": 0.0, "names": frozenset()}
+_fun_app = None
+
+
+def fun_help_row():
+    """The row under Count / AI Commands / Blocking in /help: 🎉 Fun and two placeholders."""
+    return [B("🎉 Fun", callback_data="fun:m"), B(FUN_BLANK, callback_data="fun:na"), B(FUN_BLANK, callback_data="fun:na")]
+
+
+def _fun_is_owner(uid):
+    return uid in set(getattr(D, "owner_ids", None) or ())
+
+
+def _fun_invalidate():
+    _fun_names_cache["ts"] = 0.0
+
+
+async def _fun_names():
+    """Names of all Fun commands (cached for 30 s and dropped on every change; the data itself is in MongoDB)."""
+    now = time.monotonic()
+    if now - _fun_names_cache["ts"] > 30:
+        try:
+            _fun_names_cache["names"] = frozenset(await asyncio.to_thread(M.fun_names))
+            _fun_names_cache["ts"] = now
+        except Exception:
+            log.exception("fun: couldn't read the command names")
+    return _fun_names_cache["names"]
+
+
+def _fun_reserved():
+    """Every command name the bot already answers to (read from the live handler list) plus a few fixed ones."""
+    names = set(FUN_STATIC_RESERVED)
+    try:
+        for handlers in _fun_app.handlers.values():
+            for h in handlers:
+                if isinstance(h, CommandHandler):
+                    cmds = getattr(h, "commands", None)
+                    if cmds is None:
+                        cmds = getattr(h, "command", ())
+                    names.update(str(c).lower() for c in ((cmds,) if isinstance(cmds, str) else cmds))
+    except Exception:
+        log.exception("fun: couldn't read the registered commands")
+    return names
+
+
+def _fun_check_name(raw, exclude_id=None):
+    """(name, None) or (None, error text). Trims, drops one leading '/', lower-cases, then validates."""
+    t = (raw or "").strip()
+    if t.startswith("/"):
+        t = t[1:]
+    name = t.lower()
+    if not name or any(ch.isspace() for ch in name):
+        return None, "Use a single word, for example dance."
+    if not FUN_NAME_RE.fullmatch(name):
+        return None, "A command name needs 2-32 characters: lowercase letters, digits or _, starting with a letter."
+    if name in _fun_reserved():
+        return None, f"/{name} is a built-in command and can't be used."
+    other = M.fun_get_by_name(name)
+    if other and other["id"] != exclude_id:
+        return None, f"/{name} already exists."
+    return name, None
+
+
+def _fun_int(parts, i, default=-1):
+    return int(parts[i]) if len(parts) > i and parts[i].isdigit() and len(parts[i]) < 12 else default
+
+
+def _fun_esc(text, limit=400):
+    return html.escape((text or "").strip()[:limit], quote=False)   # Telegram HTML only needs & < > escaped
+
+
+# ---- guided owner workflows (per chat AND per owner: nobody else can read or hijack them)
+def _fun_session_put(chat_id, uid, **data):
+    now = time.time()
+    for k in [k for k, v in _fun_S.items() if now - v["ts"] > FUN_SESSION_SECS]:
+        _fun_S.pop(k, None)
+    if len(_fun_S) > 200:
+        _fun_S.clear()
+    _fun_S[(chat_id, uid)] = dict(data, ts=now)
+
+
+def _fun_session_get(chat_id, uid):
+    s = _fun_S.get((chat_id, uid))
+    if s and time.time() - s["ts"] > FUN_SESSION_SECS:
+        _fun_S.pop((chat_id, uid), None)
+        return None
+    return s
+
+
+def _fun_session_end(chat_id, uid):
+    _fun_S.pop((chat_id, uid), None)
+
+
+# ---- screens (synchronous: they read MongoDB, so callers run them in a thread)
+def _fun_menu_view():
+    return ("🎉 <b>Fun</b>\n\nChoose an option.",
+            KB([[B("🎭 Commands", callback_data="fun:c:0")],
+                [B("⚙️ Customise Commands", callback_data="fun:x")],
+                [B("⬅️ Back", callback_data="help:main")]]))
+
+
+def _fun_nav(prefix, page, pages):
+    nav = []
+    if page > 0:
+        nav.append(B("⬅️ Prev", callback_data=f"{prefix}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(B("Next ➡️", callback_data=f"{prefix}:{page + 1}"))
+    return nav
+
+
+def _fun_page_of(cmds, page):
+    pages = max(1, -(-len(cmds) // FUN_PAGE))
+    page = min(max(page, 0), pages - 1)
+    return cmds[page * FUN_PAGE:(page + 1) * FUN_PAGE], page, pages
+
+
+def _fun_list_view(page):
+    chunk, page, pages = _fun_page_of(M.fun_list(), page)
+    base = page * FUN_PAGE
+    lines = ["🎉 <b>Fun Commands</b>", ""]
+    lines += [f"{i}. /{c['name']}" for i, c in enumerate(chunk, start=base + 1)] or ["No Fun commands yet."]
+    if pages > 1:
+        lines += ["", f"Page {page + 1}/{pages}"]
+    nums = [B(str(i), callback_data=f"fun:d:{c['id']}:{page}") for i, c in enumerate(chunk, start=base + 1)]
+    rows = [nums[i:i + 5] for i in range(0, len(nums), 5)]
+    nav = _fun_nav("fun:c", page, pages)
+    if nav:
+        rows.append(nav)
+    rows.append([B("⬅️ Back", callback_data="fun:m")])
+    return "\n".join(lines), KB(rows)
+
+
+def _fun_detail_view(cid, page):
+    c = M.fun_get(cid)
+    back = KB([[B("⬅️ Back", callback_data=f"fun:c:{max(page, 0)}")]])
+    if not c:
+        return "⚠️ This command no longer exists.", back
+    return (f"🎉 <b>Command:</b> /{c['name']}\n\n<b>Description:</b>\n{_fun_esc(c['description']) or '-'}\n\n"
+            f"<b>Usage:</b>\n{_fun_esc(c['usage']) or '-'}\n\n<b>Saved GIFs:</b> {c['gifs']}"), back
+
+
+FUN_CUSTOMISE_TEXT = (
+    "⚙️ <b>Customise Commands</b>\n\n"
+    "1. ➕ Create Command\nCreate a new Fun command with its own description and usage.\n\n"
+    "2. 🎞 Add GIF\nAdd a GIF to an existing Fun command.\n\n"
+    "3. 👀 View GIFs\nView the GIFs saved for a selected command.\n\n"
+    "4. ✏️ Edit Command\nChange a command's name, description, or usage.\n\n"
+    "5. 🗑 Remove GIF\nRemove a selected GIF from a command.\n\n"
+    "6. 🧹 Clear GIFs\nRemove all saved GIFs from a selected command.\n\n"
+    "7. 📋 My Commands\nView all commands created and managed by the owner.\n\n"
+    "8. ❌ Delete Command\nDelete a command and its associated GIF collection.")
+
+
+def _fun_customise_view():
+    kb = KB([[B("➕ Create Command", callback_data="fun:new"), B("🎞 Add GIF", callback_data="fun:s:addg:0")],
+             [B("👀 View GIFs", callback_data="fun:s:view:0"), B("✏️ Edit Command", callback_data="fun:s:edit:0")],
+             [B("🗑 Remove GIF", callback_data="fun:s:rmg:0"), B("🧹 Clear GIFs", callback_data="fun:s:clr:0")],
+             [B("📋 My Commands", callback_data="fun:my:0"), B("❌ Delete Command", callback_data="fun:s:del:0")],
+             [B("⬅️ Back", callback_data="fun:m")]])
+    return FUN_CUSTOMISE_TEXT, kb
+
+
+def _fun_select_view(op, page):
+    chunk, page, pages = _fun_page_of(M.fun_list(), page)
+    title = FUN_OPS[op]
+    if not chunk:
+        return f"<b>{title}</b>\n\nThere are no Fun commands yet. Create one first.", KB([[B("⬅️ Back", callback_data="fun:x")]])
+    rows = [[B(f"/{c['name']} ({c['gifs']})", callback_data=f"fun:p:{op}:{c['id']}")] for c in chunk]
+    nav = _fun_nav(f"fun:s:{op}", page, pages)
+    if nav:
+        rows.append(nav)
+    rows.append([B("⬅️ Back", callback_data="fun:x")])
+    return f"<b>{title}</b>\n\nChoose a command:" + (f"\n\nPage {page + 1}/{pages}" if pages > 1 else ""), KB(rows)
+
+
+def _fun_my_view(page):
+    chunk, page, pages = _fun_page_of(M.fun_list(), page)
+    base = page * FUN_PAGE
+    lines = ["📋 <b>My Commands</b>", ""]
+    lines += [f"{i}. /{c['name']}: {c['gifs']} GIF{'s' if c['gifs'] != 1 else ''}" for i, c in enumerate(chunk, start=base + 1)] \
+        or ["No Fun commands yet."]
+    if pages > 1:
+        lines += ["", f"Page {page + 1}/{pages}"]
+    rows = [_fun_nav("fun:my", page, pages)] if pages > 1 else []
+    rows.append([B("⬅️ Back", callback_data="fun:x")])
+    return "\n".join(lines), KB(rows)
+
+
+def _fun_edit_view(cid, note=""):
+    c = M.fun_get(cid)
+    if not c:
+        return "⚠️ This command no longer exists.", KB([[B("⬅️ Back", callback_data="fun:x")]])
+    text = (f"{note}✏️ <b>Edit /{c['name']}</b>\n\n<b>Name:</b> /{c['name']}\n<b>Description:</b> {_fun_esc(c['description']) or '-'}\n"
+            f"<b>Usage:</b> {_fun_esc(c['usage']) or '-'}\n\nWhat do you want to change?")
+    return text, KB([[B("✏️ Name", callback_data=f"fun:ef:{cid}:n"), B("✏️ Description", callback_data=f"fun:ef:{cid}:d"),
+                      B("✏️ Usage", callback_data=f"fun:ef:{cid}:u")],
+                     [B("⬅️ Back", callback_data="fun:x")]])
+
+
+def _fun_cancel_kb():
+    return KB([[B("❌ Cancel", callback_data="fun:cx")]])
+
+
+def _fun_confirm_view(kind, cid):
+    c = M.fun_get(cid)
+    back = KB([[B("⬅️ Back", callback_data="fun:x")]])
+    if not c:
+        return "⚠️ This command no longer exists.", back
+    if kind == "clr":
+        text = f"🧹 Remove all <b>{c['gifs']}</b> saved GIFs from <b>/{c['name']}</b>?\nThe command itself stays."
+    else:
+        text = (f"❌ Delete <b>/{c['name']}</b> and its <b>{c['gifs']}</b> saved GIFs?\n"
+                "It can't be used afterwards, and this can't be undone.")
+    return text, KB([[B("✅ Yes", callback_data=f"fun:cy:{kind}:{cid}"), B("❌ No", callback_data="fun:x")]])
+
+
+async def _fun_edit(q, text, kb):
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            log.warning("fun: couldn't edit a menu message: %s", e)
+    except TelegramError as e:
+        log.warning("fun: couldn't edit a menu message: %s: %s", type(e).__name__, e)
+
+
+# ---- buttons
+async def fun_callback(update, context):
+    q = update.callback_query
+    parts = (q.data or "").split(":")
+    act = parts[1] if len(parts) > 1 else "m"
+    try:
+        if act == "na":                                     # the two empty placeholder buttons
+            await q.answer(FUN_NA_TEXT, show_alert=True)
+            return
+        if q.message is None:
+            await q.answer("This menu has expired. Open /help again.", show_alert=True)
+            return
+        if act in ("m", "c", "d"):                          # everyone may browse
+            if await extra.menu_not_owner(q):
+                return
+            if act == "m":
+                text, kb = _fun_menu_view()
+            elif act == "c":
+                text, kb = await asyncio.to_thread(_fun_list_view, _fun_int(parts, 2, 0))
+            else:
+                text, kb = await asyncio.to_thread(_fun_detail_view, _fun_int(parts, 2), _fun_int(parts, 3, 0))
+            await q.answer()
+            await _fun_edit(q, text, kb)
+            return
+        # everything else changes data or opens management: Bot Owner only, checked on EVERY tap
+        if not _fun_is_owner(q.from_user.id):
+            await q.answer("Only the bot owner can do this.", show_alert=True)
+            return
+        await _fun_manage(q, context, act, parts)
+    except M.DBError:
+        log.exception("fun: database error in callback %r", q.data)
+        await _fun_safe_answer(q, "The database had a problem. Nothing was changed.", True)
+    except TelegramError as e:
+        log.warning("fun: Telegram error in callback %r: %s", q.data, e)
+    except Exception:
+        log.exception("fun: callback %r failed", q.data)
+        await _fun_safe_answer(q, "Something went wrong. Please try again.", True)
+
+
+async def _fun_safe_answer(q, text=None, alert=False):
+    try:
+        await q.answer(text, show_alert=alert)
+    except TelegramError:
+        pass
+
+
+async def _fun_manage(q, context, act, parts):
+    chat_id, uid = q.message.chat.id, q.from_user.id
+    gone = "This command no longer exists."
+    if act == "x":
+        _fun_session_end(chat_id, uid)
+        await q.answer()
+        await _fun_edit(q, *_fun_customise_view())
+    elif act == "s" and len(parts) > 2 and parts[2] in FUN_OPS:
+        await q.answer()
+        await _fun_edit(q, *await asyncio.to_thread(_fun_select_view, parts[2], _fun_int(parts, 3, 0)))
+    elif act == "my":
+        await q.answer()
+        await _fun_edit(q, *await asyncio.to_thread(_fun_my_view, _fun_int(parts, 2, 0)))
+    elif act == "new":
+        _fun_session_put(chat_id, uid, step="name")
+        await q.answer()
+        await _fun_edit(q, "➕ <b>Create Command</b>\n\nSend the command name, for example <code>dance</code>.\n"
+                           "Use letters, digits or _ (2-32 characters).\n\nThe next message you send here is used.",
+                        _fun_cancel_kb())
+    elif act == "p" and len(parts) > 3 and parts[2] in FUN_OPS:
+        await _fun_pick(q, context, parts[2], _fun_int(parts, 3))
+    elif act == "ef" and len(parts) > 3 and parts[3] in FUN_FIELDS:
+        cid = _fun_int(parts, 2)
+        cmd = await asyncio.to_thread(M.fun_get, cid)
+        if not cmd:
+            await q.answer(gone, show_alert=True)
+            return
+        field = FUN_FIELDS[parts[3]]
+        _fun_session_put(chat_id, uid, step="edit_" + field, cid=cid)
+        hint = {"name": "Send the new name (letters, digits or _; 2-32 characters).",
+                "description": f"Send the new description (up to {FUN_DESC_MAX} characters).",
+                "usage": f"Send the new usage text (up to {FUN_USAGE_MAX} characters)."}[field]
+        await q.answer()
+        await _fun_edit(q, f"✏️ <b>Edit /{cmd['name']}: {field}</b>\n\n{hint}\n\nThe next message you send here is used.",
+                        _fun_cancel_kb())
+    elif act == "cy" and len(parts) > 3 and parts[2] in ("clr", "del"):
+        await _fun_confirmed(q, parts[2], _fun_int(parts, 3))
+    elif act == "g" and len(parts) > 4 and parts[2] in ("v", "r"):
+        await _fun_send_gifs(q, context, _fun_int(parts, 3), parts[2], _fun_int(parts, 4, 0))
+    elif act in ("rm", "rmy", "rmn"):
+        await _fun_gif_buttons(q, act, _fun_int(parts, 2))
+    elif act == "cx":
+        _fun_session_end(chat_id, uid)
+        await q.answer("Cancelled.")
+        await _fun_edit(q, "Cancelled. Nothing was changed.", KB([[B("⬅️ Back", callback_data="fun:x")]]))
+    elif act == "gd":
+        s = _fun_session_get(chat_id, uid)
+        _fun_session_end(chat_id, uid)
+        await q.answer("Done.")
+        cmd = await asyncio.to_thread(M.fun_get, s["cid"]) if s and s.get("cid") else None
+        await _fun_edit(q, "✅ Finished adding GIFs." + (f"\n/{cmd['name']} now has <b>{cmd['gifs']}</b> saved GIFs." if cmd else ""),
+                        KB([[B("⬅️ Back", callback_data="fun:x")]]))
+    elif act == "ag":
+        await _fun_start_gif_session(q, _fun_int(parts, 2))
+    else:
+        await q.answer("This button is no longer valid.", show_alert=True)
+
+
+async def _fun_pick(q, context, op, cid):
+    chat_id, uid = q.message.chat.id, q.from_user.id
+    cmd = await asyncio.to_thread(M.fun_get, cid)
+    if not cmd:
+        await q.answer("This command no longer exists.", show_alert=True)
+        return
+    if op == "addg":
+        await _fun_start_gif_session(q, cid)
+    elif op in ("view", "rmg"):
+        await _fun_send_gifs(q, context, cid, "v" if op == "view" else "r", 0)
+    elif op == "edit":
+        await q.answer()
+        await _fun_edit(q, *await asyncio.to_thread(_fun_edit_view, cid))
+    elif op in ("clr", "del"):
+        await q.answer()
+        await _fun_edit(q, *await asyncio.to_thread(_fun_confirm_view, op, cid))
+
+
+async def _fun_start_gif_session(q, cid):
+    cmd = await asyncio.to_thread(M.fun_get, cid)
+    if not cmd:
+        await q.answer("This command no longer exists.", show_alert=True)
+        return
+    _fun_session_put(q.message.chat.id, q.from_user.id, step="gif", cid=cid)
+    await q.answer()
+    await _fun_edit(q, f"🎞 <b>Add GIF to /{cmd['name']}</b>\n\nSend the GIF(s) now. Each one is saved as you send it "
+                       f"(saved so far: {cmd['gifs']}).\nTap Done when you have finished.",
+                    KB([[B("✅ Done", callback_data="fun:gd"), B("❌ Cancel", callback_data="fun:cx")]]))
+
+
+async def _fun_confirmed(q, kind, cid):
+    if kind == "clr":
+        cmd = await asyncio.to_thread(M.fun_get, cid)
+        if not cmd:
+            await q.answer("This command no longer exists.", show_alert=True)
+            return
+        n = await asyncio.to_thread(M.fun_gif_clear, cid)
+        await q.answer("Cleared.")
+        await _fun_edit(q, f"🧹 Removed {n} GIF{'s' if n != 1 else ''} from <b>/{cmd['name']}</b>. The command is still there.",
+                        KB([[B("⬅️ Back", callback_data="fun:x")]]))
+    else:
+        cmd = await asyncio.to_thread(M.fun_get, cid)
+        if not cmd:
+            await q.answer("This command no longer exists.", show_alert=True)
+            return
+        if await asyncio.to_thread(M.fun_delete, cid):
+            _fun_invalidate()
+            await q.answer("Deleted.")
+            await _fun_edit(q, f"❌ <b>/{cmd['name']}</b> and its GIFs were deleted.", KB([[B("⬅️ Back", callback_data="fun:x")]]))
+        else:
+            await q.answer("This command no longer exists.", show_alert=True)
+
+
+async def _fun_send_gifs(q, context, cid, mode, offset):
+    """View / Remove: each saved GIF is sent as its own message with its id; in Remove mode with a 🗑 button."""
+    cmd = await asyncio.to_thread(M.fun_get, cid)
+    if not cmd:
+        await q.answer("This command no longer exists.", show_alert=True)
+        return
+    if cmd["gifs"] == 0:
+        await q.answer(f"/{cmd['name']} has no saved GIFs.", show_alert=True)
+        return
+    offset = min(max(offset, 0), cmd["gifs"] - 1)
+    rows = await asyncio.to_thread(M.fun_gifs, cid, offset, FUN_GIF_PAGE)
+    await q.answer(f"GIFs {offset + 1}-{offset + len(rows)} of {cmd['gifs']}")
+    chat_id = q.message.chat.id
+    extra_kw = {"message_thread_id": q.message.message_thread_id} if getattr(q.message, "is_topic_message", False) else {}
+    more = offset + len(rows) < cmd["gifs"]
+    for i, g in enumerate(rows):
+        kb_rows = [[B("🗑 Remove", callback_data=f"fun:rm:{g['id']}")]] if mode == "r" else []
+        if more and i == len(rows) - 1:
+            kb_rows.append([B(f"➡️ Next {FUN_GIF_PAGE}", callback_data=f"fun:g:{mode}:{cid}:{offset + len(rows)}")])
+        markup = KB(kb_rows) if kb_rows else None
+        try:
+            await context.bot.send_animation(chat_id, g["file_id"], caption=f"GIF #{g['id']} of /{cmd['name']}",
+                                             reply_markup=markup, **extra_kw)
+        except TelegramError as e:
+            log.warning("fun: couldn't show GIF %s of command %s: %s", g["id"], cid, e)
+            try:
+                await context.bot.send_message(chat_id, f"⚠️ GIF #{g['id']} of /{cmd['name']} can't be shown (the file is "
+                                               "no longer available).", reply_markup=markup, **extra_kw)
+            except TelegramError:
+                pass
+        await asyncio.sleep(0.3)
+
+
+async def _fun_gif_buttons(q, act, gid):
+    """The 🗑 Remove button of one GIF message: asks to confirm, then removes only that GIF."""
+    remove_kb = KB([[B("🗑 Remove", callback_data=f"fun:rm:{gid}")]])
+    try:
+        if act == "rm":
+            await q.answer()
+            await q.edit_message_reply_markup(reply_markup=KB([[B("✅ Yes, remove", callback_data=f"fun:rmy:{gid}"),
+                                                                B("❌ Keep", callback_data=f"fun:rmn:{gid}")]]))
+        elif act == "rmn":
+            await q.answer("Kept.")
+            await q.edit_message_reply_markup(reply_markup=remove_kb)
+        else:
+            cid = await asyncio.to_thread(M.fun_gif_remove, gid)
+            if cid is None:
+                await q.answer("That GIF was already removed.", show_alert=True)
+            else:
+                left = await asyncio.to_thread(M.fun_get, cid)
+                await q.answer(f"Removed. {left['gifs'] if left else 0} GIFs left.")
+            try:
+                await q.edit_message_caption(caption=f"🗑 GIF #{gid} removed", reply_markup=None)
+            except TelegramError:
+                try:
+                    await q.edit_message_text(f"🗑 GIF #{gid} removed", reply_markup=None)
+                except TelegramError:
+                    pass
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            log.warning("fun: GIF button failed: %s", e)
+
+
+# ---- the owner's typed answers (create / edit) and the GIFs the owner sends
+async def fun_text_input(update, context):
+    """group=-27, Bot Owner only. Takes the owner's next message as the answer to the open question, and keeps it from
+    being handled as an ordinary command (a usage text like '/hug (reply to a user)' must not run /hug)."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user or chat is None or not msg.text:
+        return
+    s = _fun_session_get(chat.id, user.id)
+    if not s or s["step"] == "gif":
+        return
+    if not _fun_is_owner(user.id):
+        _fun_session_end(chat.id, user.id)
+        return
+    try:
+        await _fun_step(msg, chat, user, s, msg.text.strip())
+    except M.DBError:
+        log.exception("fun: database error while saving")
+        await msg.reply_text("⚠️ The database had a problem. Nothing was saved. Please try again.")
+    except Exception:
+        log.exception("fun: workflow step failed")
+        await msg.reply_text("⚠️ Something went wrong. Nothing was saved.")
+    raise ApplicationHandlerStop
+
+
+async def _fun_step(msg, chat, user, s, text):
+    step, cancel = s["step"], _fun_cancel_kb()
+    if step == "name":
+        name, err = await asyncio.to_thread(_fun_check_name, text)
+        if err:
+            await msg.reply_text(f"⚠️ {err}\nSend another name, or tap Cancel.", reply_markup=cancel)
+            return
+        _fun_session_put(chat.id, user.id, step="description", name=name)
+        await msg.reply_html(f"Name: <b>/{name}</b>\n\nNow send the <b>description</b> (what the command does).", reply_markup=cancel)
+    elif step == "description":
+        if not text or len(text) > FUN_DESC_MAX:
+            await msg.reply_text(f"⚠️ Send a description of 1-{FUN_DESC_MAX} characters, or tap Cancel.", reply_markup=cancel)
+            return
+        _fun_session_put(chat.id, user.id, step="usage", name=s["name"], description=text)
+        await msg.reply_html("Now send the <b>usage</b> instructions, for example:\n"
+                             f"<code>Reply to a user's message with /{s['name']}</code>", reply_markup=cancel)
+    elif step == "usage":
+        if not text or len(text) > FUN_USAGE_MAX:
+            await msg.reply_text(f"⚠️ Send usage text of 1-{FUN_USAGE_MAX} characters, or tap Cancel.", reply_markup=cancel)
+            return
+        cmd = await asyncio.to_thread(M.fun_create, s["name"], s["description"], text)
+        _fun_session_end(chat.id, user.id)
+        if not cmd:
+            await msg.reply_text(f"⚠️ /{s['name']} was just taken by another command. Nothing was saved.")
+            return
+        _fun_invalidate()
+        await msg.reply_html(f"✅ <b>/{cmd['name']}</b> was created.\n\nDo you want to add GIFs to it now?",
+                             reply_markup=KB([[B("🎞 Add GIFs now", callback_data=f"fun:ag:{cmd['id']}"),
+                                               B("Not now", callback_data="fun:x")]]))
+    elif step.startswith("edit_"):
+        field, cid = step[5:], s["cid"]
+        if field == "name":
+            value, err = await asyncio.to_thread(_fun_check_name, text, cid)
+        else:
+            limit = FUN_DESC_MAX if field == "description" else FUN_USAGE_MAX
+            value, err = (text, None) if text and len(text) <= limit else (None, f"Send 1-{limit} characters.")
+        if err:
+            await msg.reply_text(f"⚠️ {err}\nTry again, or tap Cancel.", reply_markup=cancel)
+            return
+        res = await asyncio.to_thread(M.fun_update, cid, **{field: value})
+        _fun_session_end(chat.id, user.id)
+        if res == "duplicate":
+            await msg.reply_text(f"⚠️ /{value} already exists. Nothing was changed.")
+        elif res == "missing":
+            await msg.reply_text("⚠️ This command no longer exists.")
+        else:
+            _fun_invalidate()
+            view, kb = await asyncio.to_thread(_fun_edit_view, cid, "✅ Saved.\n\n")
+            await msg.reply_html(view, reply_markup=kb)
+
+
+async def fun_media_input(update, context):
+    """group=-27, Bot Owner only: a GIF sent during an Add GIF session, or a GIF whose caption is '/setgif <name>'."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user or chat is None or not _fun_is_owner(user.id):
+        return
+    s = _fun_session_get(chat.id, user.id)
+    in_session = bool(s and s["step"] == "gif")
+    m = re.match(r"^/setgif(?:@\w+)?\s+(\S+)", msg.caption or "", re.I)
+    if not in_session and not m:
+        return
+    anim = msg.animation
+    if anim is None:                                           # a photo, video, sticker, file...
+        await msg.reply_text("⚠️ That is not a GIF. Send a GIF (an animation), or tap Done or Cancel.")
+        return
+    try:
+        if in_session:
+            cid = s["cid"]
+        else:
+            cmd = await asyncio.to_thread(M.fun_get_by_name, m.group(1).lstrip("/").lower())
+            if not cmd:
+                await msg.reply_text(f"⚠️ There is no Fun command named /{m.group(1).lstrip('/').lower()}. Create it first.")
+                return
+            cid = cmd["id"]
+        await _fun_save_gif(msg, chat, user, cid, anim, in_session)
+    except M.DBError:
+        log.exception("fun: database error while saving a GIF")
+        await msg.reply_text("⚠️ The database had a problem. The GIF was not saved.")
+
+
+async def _fun_save_gif(msg, chat, user, cid, anim, in_session):
+    res = await asyncio.to_thread(M.fun_gif_add, cid, anim.file_id, anim.file_unique_id)
+    cmd = await asyncio.to_thread(M.fun_get, cid)
+    if res == "missing" or not cmd:
+        _fun_session_end(chat.id, user.id)
+        await msg.reply_text("⚠️ This command no longer exists. The GIF was not saved.")
+    elif res == "duplicate":
+        await msg.reply_text(f"ℹ️ That GIF is already saved for /{cmd['name']}. Saved GIFs: {cmd['gifs']}")
+    else:
+        if in_session:
+            _fun_session_put(chat.id, user.id, step="gif", cid=cid)        # keeps the session alive
+        await msg.reply_text(f"✅ GIF saved to /{cmd['name']}. Saved GIFs: {cmd['gifs']}")
+
+
+# ---- /setgif and /gifedit (Bot Owner only)
+async def setgif_cmd(update, context):
+    """/setgif <name>: reply to a GIF with it, or send it and then the GIF(s). A GIF captioned '/setgif <name>' works too."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user or not _fun_is_owner(user.id):
+        return
+    if not context.args:
+        await msg.reply_text("Usage: /setgif <command>\nReply to a GIF with it, or send it and then send the GIF(s).\n"
+                             "A GIF whose caption is /setgif <command> also works.")
+        return
+    name = context.args[0].lstrip("/").lower()
+    try:
+        cmd = await asyncio.to_thread(M.fun_get_by_name, name)
+        if not cmd:
+            await msg.reply_text(f"⚠️ There is no Fun command named /{name}. Create it first in /help > Fun > Customise Commands.")
+            return
+        rep = msg.reply_to_message
+        if rep is not None:
+            if rep.animation is None:
+                await msg.reply_text("⚠️ The message you replied to is not a GIF (animation).")
+                return
+            await _fun_save_gif(msg, chat, user, cmd["id"], rep.animation, False)
+            return
+        _fun_session_put(chat.id, user.id, step="gif", cid=cmd["id"])
+        sent = await msg.reply_html(f"🎞 <b>Add GIF to /{cmd['name']}</b>\n\nSend the GIF(s) now. Each one is saved as you send it.\n"
+                                    "Tap Done when you have finished.",
+                                    reply_markup=KB([[B("✅ Done", callback_data="fun:gd"), B("❌ Cancel", callback_data="fun:cx")]]))
+        extra.remember_menu_owner(sent, user.id)
+    except M.DBError:
+        log.exception("fun: /setgif failed")
+        await msg.reply_text("⚠️ The database had a problem. Nothing was saved.")
+
+
+async def gifedit_cmd(update, context):
+    """/gifedit <name>: opens the Edit Command screen of that command."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or not _fun_is_owner(user.id):
+        return
+    if not context.args:
+        await msg.reply_text("Usage: /gifedit <command_name>")
+        return
+    name = context.args[0].lstrip("/").lower()
+    try:
+        cmd = await asyncio.to_thread(M.fun_get_by_name, name)
+        if not cmd:
+            await msg.reply_text(f"⚠️ There is no Fun command named /{name}.")
+            return
+        text, kb = await asyncio.to_thread(_fun_edit_view, cmd["id"])
+        sent = await msg.reply_html(text, reply_markup=kb)
+        extra.remember_menu_owner(sent, user.id)
+    except M.DBError:
+        log.exception("fun: /gifedit failed")
+        await msg.reply_text("⚠️ The database had a problem. Please try again.")
+
+
+# ---- running a Fun command (any name that exists in the database)
+def _fun_unusable_target(target):
+    return target is None or any(getattr(target, a, None) for a in (
+        "forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
+        "general_forum_topic_hidden", "general_forum_topic_unhidden"))
+
+
+async def fun_dispatch(update, context):
+    """group=8: '/<name>' where <name> is a Fun command. The name is only ever compared with the stored names; user
+    input is never executed. Unknown commands are ignored here, so this never interferes with the other commands."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not msg.text or not user or chat is None or user.is_bot or not msg.text.startswith("/"):
+        return
+    cmd, _, tag = msg.text.split(None, 1)[0][1:].partition("@")
+    cmd = cmd.lower()
+    if not cmd or (tag and tag.lower() != (context.bot.username or "").lower()):
+        return                                              # addressed to a different bot
+    if cmd not in await _fun_names():
+        return
+    if chat.type == "private":
+        await msg.reply_text("Use this command in a group, as a reply to someone's message.")
+        return
+    if not await _cool(update, 3):
+        return
+    target = msg.reply_to_message
+    if _fun_unusable_target(target):
+        await msg.reply_text(f"↩️ Reply to a message with /{cmd}.")
+        return
+    try:
+        row = await asyncio.to_thread(M.fun_get_by_name, cmd)
+        if row is None:                                     # deleted a moment ago
+            _fun_invalidate()
+            return
+        tried = []
+        for _ in range(3):
+            gif = await asyncio.to_thread(M.fun_gif_random, row["id"], tried)
+            if gif is None:
+                break
+            try:
+                await target.reply_animation(animation=gif["file_id"])           # no caption, no extra text
+                return
+            except BadRequest as e:
+                low = str(e).lower()
+                if "repl" in low and "not found" in low:                          # the target message was deleted
+                    try:
+                        await msg.reply_animation(animation=gif["file_id"])
+                        return
+                    except TelegramError as e2:
+                        log.warning("fun: /%s fallback failed: %s", cmd, e2)
+                else:
+                    log.warning("fun: /%s couldn't send GIF %s: %s", cmd, gif["id"], e)
+                tried.append(gif["id"])
+            except TelegramError as e:
+                log.warning("fun: /%s couldn't send GIF %s: %s", cmd, gif["id"], e)
+                tried.append(gif["id"])
+        if not tried:
+            await msg.reply_text(f"⚠️ /{cmd} has no GIFs yet.")
+        else:
+            await msg.reply_text("⚠️ I couldn't send a GIF right now. Please try again later.")
+    except M.DBError:
+        log.exception("fun: database error running /%s", cmd)
+        await msg.reply_text("⚠️ Something went wrong. Please try again later.")
+    except TelegramError as e:
+        log.warning("fun: /%s failed: %s", cmd, e)
+
+
+def _fun_register(app, deps):
+    """Called from register(): the Fun menu callbacks, /setgif, /gifedit and the dynamic command dispatcher."""
+    global _fun_app
+    _fun_app = app
+    try:
+        M.fun_cleanup()
+        made = M.fun_seed(FUN_SEEDS)
+        if made:
+            log.info("fun: created the %d starter commands", made)
+    except Exception:
+        log.exception("fun: couldn't prepare the Fun commands collection")
+    owners = sorted(set(getattr(deps, "owner_ids", None) or ()))
+    app.add_handler(CallbackQueryHandler(fun_callback, pattern=r"^fun:"))
+    if owners:                                              # everyone else gets complete silence
+        only_owner = filters.User(user_id=owners)
+        app.add_handler(CommandHandler("setgif", setgif_cmd, filters=only_owner))
+        app.add_handler(CommandHandler("gifedit", gifedit_cmd, filters=only_owner))
+        app.add_handler(MessageHandler(filters.TEXT & only_owner, fun_text_input), group=-27)
+        app.add_handler(MessageHandler((filters.ANIMATION | filters.VIDEO | filters.PHOTO | filters.Document.ALL
+                                        | filters.Sticker.ALL | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE) & only_owner,
+                                       fun_media_input), group=-27)
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.COMMAND, fun_dispatch), group=8)
+
+
 # ------------------------------------------------------------ registration
 def register(app, deps):
     """deps needs: is_admin, admin_only."""
@@ -3952,3 +4689,4 @@ def register(app, deps):
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, battle_input),
                     group=2)
     _bd_register(app)    # /wish, the 🎂 Birthday menu and the daily announcements
+    _fun_register(app, deps)   # 🎉 Fun menu, /setgif, /gifedit and the global Fun commands + GIFs

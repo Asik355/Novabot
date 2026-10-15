@@ -1306,6 +1306,42 @@ HELP_INTRO = (
 # - Never place any button after the Suggestion Bar.
 # - Never combine the Suggestion Bar with another button.
 # - Preserve these rules whenever the Help Menu is modified in the future.
+# Colored /help buttons (Telegram button styles: danger = red, success = green, primary = blue).
+# Pattern: red, green, blue on the first row, then every next row starts one color later
+# (blue, red, green / green, blue, red / ...), so no two neighbouring buttons ever share a color.
+# Sent through api_kwargs, so it works on any python-telegram-bot version; clients that don't
+# know the field simply show normal buttons. Placeholder buttons (fun:na) stay plain.
+HELP_COLORS = ("danger", "success", "primary")  # red, green, blue
+
+
+def style_help_buttons(rows):
+    """Return rows with a color style on each button, following the diagonal pattern above.
+    Single-button rows (Owner, suggestions bar) just avoid the color of the row above them."""
+    out, above = [], None
+    for r, row in enumerate(rows):
+        new_row, first = [], None
+        for c, b in enumerate(row):
+            data = getattr(b, "callback_data", None)
+            if data == "fun:na":
+                new_row.append(b)
+                continue
+            if len(row) == 1:
+                prefer = "success" if data and data.startswith("sug:") else "primary"
+                st = prefer if prefer != above else next(x for x in HELP_COLORS if x not in (above, prefer))
+            else:
+                st = HELP_COLORS[(c - r) % 3]
+            if first is None:
+                first = st
+            try:
+                b = InlineKeyboardButton(b.text, callback_data=data, api_kwargs={"style": st})
+            except Exception:
+                pass  # never break /help over a color
+            new_row.append(b)
+        above = first
+        out.append(new_row)
+    return out
+
+
 def help_main_keyboard(chat=None, user_id=None):
     """Category buttons in a strict 3-column grid, then the command-suggestions
     toggle as a single full-width button on the very last row."""
@@ -1327,11 +1363,12 @@ def help_main_keyboard(chat=None, user_id=None):
     # Do not move it, combine it with another button, or place any
     # button after it.
     
+    rows.append(fun_systems.fun_help_row())  # 🎉 Fun + two placeholders: its own row under Count / AI Commands / Blocking
     if user_id in OWNER_IDS:  # 👑 Owner: its own row, just above the Suggestion Bar, shown to the Bot Owner only
         rows.append([InlineKeyboardButton("👑 Owner", callback_data="own:m")])
     if chat is not None:  # always the last row, in groups and in private chat
         rows.append([suggestions_button(chat.id, "help")])
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(style_help_buttons(rows))
 
 
 def help_section_keyboard(key=None, chat=None):
@@ -3903,7 +3940,9 @@ PURGE_BATCH = 100         # Telegram's deleteMessages limit per call
 PURGE_BATCH_DELAY = 0.4   # seconds between batches (gentle throttling)
 PURGE_NOTICE_TTL = 5      # seconds temporary notices stay visible
 PURGE_START_TTL = 600     # /purgefrom start point lives 10 minutes
-PURGE_RETRY_LIMIT = 5     # flood-wait retries per batch
+PURGE_RETRY_LIMIT = 5     # retries per batch (flood waits and network/API errors)
+PURGE_FALLBACK_CONCURRENCY = 10  # one-by-one fallback: at most this many deletes at the same time
+PURGE_OLD_SECS = 48 * 3600       # Telegram can't delete messages older than this
 
 PURGE_ERR = {
     "no_reply": "❌ Please reply to a message to use this command.",
@@ -3969,13 +4008,38 @@ def _real_reply(msg):
     return r
 
 
+def _msg_ts(m):
+    """When a message was sent (unix seconds), or None if unknown."""
+    d = getattr(m, "date", None)
+    try:
+        return d.timestamp() if d is not None else None
+    except Exception:
+        return None
+
+
+def _purge_bg(coro):
+    """Run a coroutine in the background (keeps a reference until it finishes)."""
+    task = asyncio.create_task(coro)
+    _purge_tasks.add(task)
+    task.add_done_callback(_purge_tasks.discard)
+
+
+async def _purge_old_warning(chat, sent_at):
+    """Warn (in the background, so the purge isn't delayed) when the start message is over 48 hours old."""
+    if sent_at is not None and time.time() - sent_at > PURGE_OLD_SECS:
+        await _purge_temp_notice(
+            chat,
+            "⚠️ The start message is older than 48 hours. Telegram can't delete messages that old, "
+            "so those will stay.")
+
+
 def _purge_failure_text(deleted, failed, reasons):
-    """Professional notice for messages Telegram refused to delete. The reasons are the real
-    API error descriptions Telegram returned - nothing is assumed about time limits."""
+    """Notice for messages Telegram refused to delete. The reasons are the real API error
+    descriptions Telegram returned - nothing is assumed about time limits."""
     detail = "; ".join(sorted(reasons)[:3])[:300] if reasons else "no details were returned"
     head = (f"⚠️ {failed} message{'s' if failed != 1 else ''} could not be deleted."
             if deleted == 0 else
-            f"⚠️ Purge completed with exceptions: {deleted} processed, {failed} could not be deleted.")
+            f"⚠️ Purge finished: processed {deleted} IDs, {failed} failed.")
     return (
         f"{head}\n"
         "Some messages could not be deleted because of Telegram's deletion restrictions or a "
@@ -4050,11 +4114,28 @@ async def _delete_one(bot, chat_id, mid, stats):
     return True
 
 
+async def _delete_many(bot, chat_id, ids, stats):
+    """One-by-one fallback, about PURGE_FALLBACK_CONCURRENCY at a time (flood waits honoured
+    inside _delete_one). Returns False if a real permission error stopped it."""
+    sem = asyncio.Semaphore(PURGE_FALLBACK_CONCURRENCY)
+
+    async def one(mid):
+        async with sem:
+            if stats["no_perm"]:
+                return
+            await _delete_one(bot, chat_id, mid, stats)
+
+    await asyncio.gather(*(one(m) for m in ids))
+    return not stats["no_perm"]
+
+
 async def _purge_delete(chat, bot, first_id, last_id, extra_ids=()):
-    """Delete message IDs first_id..last_id (plus extra_ids) in batches of 100, generated
-    on the fly so a huge range never builds one giant list. A failing batch is retried
-    message by message; flood waits are honoured; processing continues after any failure.
-    Returns stats: deleted / failed / reasons (Telegram's error texts) / no_perm."""
+    """Delete message IDs first_id..last_id (plus extra_ids) in batches of 100 (the fast path),
+    generated on the fly so a huge range never builds one giant list. A batch is retried (flood
+    waits honoured); if it still fails, its messages are deleted one by one. The next batch only
+    starts once this one is deleted, fully attempted, or stopped by a real permission error.
+    Telegram's deleteMessages returns no per-message result, so "deleted" for a batch means the
+    IDs Telegram accepted. Returns stats: deleted / failed / reasons / no_perm."""
     stats = {"deleted": 0, "failed": 0, "reasons": set(), "no_perm": False}
     lock = _purge_locks.setdefault(chat.id, asyncio.Lock())
 
@@ -4066,9 +4147,13 @@ async def _purge_delete(chat, bot, first_id, last_id, extra_ids=()):
             yield extra
 
     async with lock:
+        first_batch = True
         for batch in batches():
+            if not first_batch:
+                await asyncio.sleep(PURGE_BATCH_DELAY)  # throttle between batches only, never after the last
+            first_batch = False
             done = False
-            for _ in range(PURGE_RETRY_LIMIT):
+            for attempt in range(1, PURGE_RETRY_LIMIT + 1):
                 try:
                     await bot.delete_messages(chat.id, batch)
                     stats["deleted"] += len(batch)
@@ -4086,32 +4171,39 @@ async def _purge_delete(chat, bot, first_id, last_id, extra_ids=()):
                         return stats
                     # The batch call was rejected as a whole; go one by one so we
                     # can count exactly what worked and what didn't.
-                    for mid in batch:
-                        if not await _delete_one(bot, chat.id, mid, stats):
-                            return stats
+                    if not await _delete_many(bot, chat.id, batch, stats):
+                        return stats
                     done = True
                     break
-                except TelegramError as e:  # network / API trouble: skip this batch, keep going
-                    logging.warning("Purge batch failed in chat %s: %s", chat.id, e)
+                except TelegramError as e:  # network / API trouble: retry the same batch
+                    logging.warning("Purge batch %s-%s failed in chat %s (try %s/%s): %s",
+                                    batch[0], batch[-1], chat.id, attempt, PURGE_RETRY_LIMIT, e)
                     stats["reasons"].add(f"{type(e).__name__}: {str(e)[:100]}")
-                    break
+                    if attempt < PURGE_RETRY_LIMIT:
+                        await asyncio.sleep(min(0.5 * attempt, 2))
             if not done:
-                stats["failed"] += len(batch)
-                logging.warning("Purge gave up on a batch in chat %s", chat.id)
-            await asyncio.sleep(PURGE_BATCH_DELAY)
+                # Retries used up: delete this batch's messages one by one. Never skip them.
+                logging.warning("Purge: batch %s-%s in chat %s fell back to one-by-one deletes",
+                                batch[0], batch[-1], chat.id)
+                if not await _delete_many(bot, chat.id, batch, stats):
+                    return stats
     return stats
 
 
-async def _purge_range(update, context, first_id, last_id, cmd, silent=False):
+async def _purge_range(update, context, first_id, last_id, cmd, silent=False, start_sent_at=None):
     """Delete first_id..last_id plus the command message, then report."""
     chat, msg, user = update.effective_chat, update.effective_message, update.effective_user
     first_id, last_id = min(first_id, last_id), max(first_id, last_id)
+    if start_sent_at is not None:
+        _purge_bg(_purge_old_warning(chat, start_sent_at))  # in the background: the purge starts at once
     # The command message always goes too (it is the newest message the bot can know about).
     stats = await _purge_delete(chat, context.bot, first_id, last_id, (msg.message_id,))
     d, f = stats["deleted"], stats["failed"]
-    logging.info("purge chat=%s actor=%s cmd=%s range=%s-%s deleted=%s failed=%s reasons=%s ts=%s",
-                 chat.id, user.id, cmd, first_id, last_id, d, f, sorted(stats["reasons"]), int(time.time()))
-    await log_action(chat, "purge", f"🧹 {user.mention_html()} used /{cmd}: deleted {d} messages; {f} failed.")
+    logging.info("purge chat=%s type=%s actor=%s cmd=%s range=%s-%s processed=%s failed=%s reasons=%s ts=%s",
+                 chat.id, chat.type, user.id, cmd, first_id, last_id, d, f, sorted(stats["reasons"]), int(time.time()))
+    # Result first; the log-channel message is sent in the background.
+    _purge_bg(log_action(chat, "purge",
+                         f"🧹 {user.mention_html()} used /{cmd}: processed {d} IDs; {f} failed."))
     if stats["no_perm"]:
         await chat.send_message(PURGE_ERR["bot_perm"])
         return
@@ -4123,8 +4215,7 @@ async def _purge_range(update, context, first_id, last_id, cmd, silent=False):
         return
     if silent:
         return
-    else:
-        await _purge_temp_notice(chat, f"✅ Purged {d} messages.")
+    await _purge_temp_notice(chat, f"✅ Purge finished: processed {d} message IDs, 0 failed.")
 
 
 async def purge(update, context, silent=False):
@@ -4140,7 +4231,8 @@ async def purge(update, context, silent=False):
             await msg.reply_text(PURGE_ERR["bad_number"])
             return
         end_id = min(start_id + int(context.args[0]), msg.message_id)
-    await _purge_range(update, context, start_id, end_id, cmd, silent)
+    await _purge_range(update, context, start_id, end_id, cmd, silent,
+                       start_sent_at=_msg_ts(_real_reply(msg)))
 
 
 async def spurge(update, context):
@@ -4171,6 +4263,7 @@ async def purgefrom(update, context):
     purge_state[(chat.id, user.id)] = {
         "message_id": _real_reply(msg).message_id,
         "created_at": time.time(),
+        "sent_at": _msg_ts(_real_reply(msg)),
     }
     await _purge_temp_notice(chat, "✅ Purge start point saved.")
 
@@ -4190,7 +4283,8 @@ async def purgeto(update, context):
         await msg.reply_text(PURGE_ERR["expired"])
         return
     purge_state.pop(key, None)  # clear right away so nothing stale is left behind
-    await _purge_range(update, context, state["message_id"], _real_reply(msg).message_id, "purgeto")
+    await _purge_range(update, context, state["message_id"], _real_reply(msg).message_id, "purgeto",
+                       start_sent_at=state.get("sent_at"))
 
 
 # ------------------------------------------------- super admin management
@@ -5394,7 +5488,8 @@ def main():
     # roast and court systems: the bot's own helpers are handed in (no re-import of this file)
     fun_systems.register(app, SimpleNamespace(
         is_admin=is_admin, admin_only=admin_only, lock_exempt=lock_exempt,
-        load_allow=load_allow, url_allowed=url_allowed, log_action=log_action, MUTED=MUTED))
+        load_allow=load_allow, url_allowed=url_allowed, log_action=log_action, MUTED=MUTED,
+        owner_ids=OWNER_IDS))  # owner_ids: the 🎉 Fun menu's management is strictly for these Telegram IDs
     # auto-ads / promotion blocker + the 🔒 Blocking menu (lives in extra.py; per-group settings in the settings store)
     extra.register_blocking(app, SimpleNamespace(
         is_admin=is_admin, lock_exempt=lock_exempt, load_allow=load_allow, url_allowed=url_allowed,

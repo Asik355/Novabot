@@ -118,12 +118,16 @@ UNIQUE_INDEXES = {
     "roast_votes": ["battle_id", "voter_id"], "court_cases": ["id"],
     "court_votes": ["case_id", "voter_id"], "court_verdicts": ["id"],
     "modlog": ["id"], "notice_pending": ["chat_id", "message_id"],
+    "fun_commands": ["id"], "fun_gifs": ["id"],
 }
+# Extra unique indexes (one list of keys each): a Fun command name is unique, and the same GIF is saved once per command.
+EXTRA_UNIQUE_INDEXES = {"fun_commands": [["name"]], "fun_gifs": [["command_id", "file_unique_id"]]}
 PLAIN_INDEXES = {
     "warn_log": [["chat_id", "user_id"]], "captcha_pending": [["expires"]],
     "roast_battles": [["chat_id"]], "roast_profiles": [["chat_id", "points"]],
     "court_cases": [["chat_id", "case_no"], ["chat_id", "defendant_id"]], "court_verdicts": [["case_id"]],
     "modlog": [["chat_id", "id"]], "notice_pending": [["delete_at"]],
+    "fun_gifs": [["command_id"]],
 }
 # MongoDB deletes a document by itself once its "expire_at" date has passed (no bot code involved).
 # Documents without an expire_at (the old modlog rows) are never touched by this.
@@ -136,6 +140,12 @@ def _ensure_indexes():
             col(name).create_index([(k, ASCENDING) for k in keys], unique=True)
         except PyMongoError as e:
             log.warning("Couldn't create the unique index on %s%s: %s", name, keys, e)
+    for name, groups in EXTRA_UNIQUE_INDEXES.items():
+        for keys in groups:
+            try:
+                col(name).create_index([(k, ASCENDING) for k in keys], unique=True)
+            except PyMongoError as e:
+                log.warning("Couldn't create the unique index on %s%s: %s", name, keys, e)
     for name, groups in PLAIN_INDEXES.items():
         for keys in groups:
             try:
@@ -618,6 +628,126 @@ def notice_take_due(now, limit=50):
         if col("notice_pending").delete_one({"_id": r["_id"]}).deleted_count:
             out.append((r["chat_id"], r["message_id"]))
     return out
+
+
+# ------------------------------------------------------------------ Fun commands + GIF collections (GLOBAL)
+# fun_commands: {id, name, description, usage, created_at}      id = stable number, never reused, never the list position
+# fun_gifs:     {id, command_id, file_id, file_unique_id, added_at}
+# Not tied to any chat: every group the bot is in shares the same commands and GIFs. Deleting a command removes the
+# command first (so it can no longer run) and then its GIFs; fun_cleanup() sweeps up anything an interruption left.
+def _fun_cmd(r, gifs=0):
+    return {"id": r["id"], "name": r["name"], "description": r.get("description") or "",
+            "usage": r.get("usage") or "", "created_at": r.get("created_at") or 0, "gifs": gifs}
+
+
+def fun_list():
+    """Every Fun command, oldest first: [{id, name, description, usage, created_at, gifs}]."""
+    counts = {r["_id"]: r["n"] for r in col("fun_gifs").aggregate([{"$group": {"_id": "$command_id", "n": {"$sum": 1}}}])}
+    return [_fun_cmd(r, counts.get(r["id"], 0)) for r in col("fun_commands").find({}, sort=[("id", ASCENDING)])]
+
+
+def fun_names():
+    return {r["name"] for r in col("fun_commands").find({}, {"name": 1})}
+
+
+def fun_get(command_id):
+    r = col("fun_commands").find_one({"id": int(command_id)})
+    return _fun_cmd(r, col("fun_gifs").count_documents({"command_id": int(command_id)})) if r else None
+
+
+def fun_get_by_name(name):
+    r = col("fun_commands").find_one({"name": str(name)})
+    return _fun_cmd(r, col("fun_gifs").count_documents({"command_id": r["id"]})) if r else None
+
+
+def fun_create(name, description, usage):
+    """The new command, or None when the name is already taken."""
+    doc = {"id": next_id("fun_commands"), "name": str(name), "description": str(description), "usage": str(usage),
+           "created_at": int(time.time())}
+    try:
+        col("fun_commands").insert_one(dict(doc))
+    except DuplicateKeyError:
+        return None
+    return _fun_cmd(doc, 0)
+
+
+def fun_update(command_id, **fields):
+    """'ok' | 'missing' | 'duplicate'. Only name, description and usage can change; the GIFs stay attached."""
+    changes = {k: str(v) for k, v in fields.items() if k in ("name", "description", "usage")}
+    try:
+        res = col("fun_commands").update_one({"id": int(command_id)}, {"$set": changes})
+    except DuplicateKeyError:
+        return "duplicate"
+    return "ok" if res.matched_count else "missing"
+
+
+def fun_delete(command_id):
+    """True when the command existed. The command goes first, then its GIFs."""
+    command_id = int(command_id)
+    gone = col("fun_commands").delete_one({"id": command_id}).deleted_count
+    col("fun_gifs").delete_many({"command_id": command_id})
+    return bool(gone)
+
+
+def fun_cleanup():
+    """Delete GIF rows whose command no longer exists (left over by an interrupted delete)."""
+    live = [r["id"] for r in col("fun_commands").find({}, {"id": 1})]
+    return col("fun_gifs").delete_many({"command_id": {"$nin": live}}).deleted_count
+
+
+def fun_gif_add(command_id, file_id, file_unique_id=None):
+    """'added' | 'duplicate' | 'missing' (the command is gone)."""
+    command_id = int(command_id)
+    if not col("fun_commands").find_one({"id": command_id}, {"id": 1}):
+        return "missing"
+    try:
+        col("fun_gifs").insert_one({"id": next_id("fun_gifs"), "command_id": command_id, "file_id": str(file_id),
+                                    "file_unique_id": str(file_unique_id or file_id), "added_at": int(time.time())})
+    except DuplicateKeyError:
+        return "duplicate"
+    return "added"
+
+
+def fun_gifs(command_id, skip=0, limit=5):
+    return [{"id": r["id"], "command_id": r["command_id"], "file_id": r["file_id"]} for r in
+            col("fun_gifs").find({"command_id": int(command_id)}, sort=[("id", ASCENDING)], skip=int(skip), limit=int(limit))]
+
+
+def fun_gif_get(gif_id):
+    r = col("fun_gifs").find_one({"id": int(gif_id)})
+    return {"id": r["id"], "command_id": r["command_id"], "file_id": r["file_id"]} if r else None
+
+
+def fun_gif_remove(gif_id):
+    """The removed GIF's command id, or None when it was already gone."""
+    r = col("fun_gifs").find_one_and_delete({"id": int(gif_id)})
+    return r["command_id"] if r else None
+
+
+def fun_gif_clear(command_id):
+    return col("fun_gifs").delete_many({"command_id": int(command_id)}).deleted_count
+
+
+def fun_gif_random(command_id, exclude=()):
+    """One randomly chosen GIF of this command (skipping the ids in `exclude`), or None."""
+    flt = {"command_id": int(command_id)}
+    if exclude:
+        flt["id"] = {"$nin": [int(x) for x in exclude]}
+    rows = list(col("fun_gifs").aggregate([{"$match": flt}, {"$sample": {"size": 1}}]))
+    return {"id": rows[0]["id"], "file_id": rows[0]["file_id"]} if rows else None
+
+
+def fun_seed(seeds):
+    """First start only: create the starter commands [(name, description, usage)]. Afterwards they are ordinary
+    commands: deleting one keeps it deleted. Returns how many were created."""
+    if col("meta").find_one({"_id": "fun_seeded"}):
+        return 0
+    made = 0
+    for name, description, usage in seeds:
+        if not col("fun_commands").find_one({"name": name}, {"id": 1}) and fun_create(name, description, usage):
+            made += 1
+    col("meta").replace_one({"_id": "fun_seeded"}, {"_id": "fun_seeded", "ts": time.time()}, upsert=True)
+    return made
 
 
 # ------------------------------------------------------------------ owner-chosen defaults for NEW groups
