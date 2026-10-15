@@ -1342,11 +1342,21 @@ def style_help_buttons(rows):
     return out
 
 
+# Symbol shown on the /help button only (section titles are unchanged). Sections whose label
+# already starts with a symbol (Group Edit, Bot Edit, Roast, Court, Birthday) are not listed.
+HELP_BUTTON_ICONS = {
+    "mod": "🛡", "warn": "⚠️", "flood": "🌊", "captcha": "🧩", "greet": "👋", "rules": "📜",
+    "notes": "🔍", "locks": "🔐", "purge": "🧹", "log": "📝", "reports": "🚨", "approval": "❤️",
+    "disabling": "🚫", "other": "⚙️", "info": "ℹ️", "extras": "✨",
+}
+
+
 def help_main_keyboard(chat=None, user_id=None):
     """Category buttons in a strict 3-column grid, then the command-suggestions
     toggle as a single full-width button on the very last row."""
     buttons = [
-        InlineKeyboardButton(HELP_SECTIONS[key][0], callback_data=f"help:{key}")
+        InlineKeyboardButton(f"{HELP_BUTTON_ICONS.get(key, '')} {HELP_SECTIONS[key][0]}".strip(),
+                             callback_data=f"help:{key}")
         for key in HELP_ORDER
     ]
     buttons.append(msgcount.menu_button())  # "📊 Message Count" (handled by msgcount.mc_callback)
