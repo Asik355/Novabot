@@ -5612,7 +5612,7 @@ def main():
         log_action=log_action, MUTED=MUTED, is_super_admin=is_super_admin, owner_ids=OWNER_IDS,
         is_paused=is_paused, is_bot_owner=is_bot_owner, get_setting=store.get_setting, set_setting=store.set_setting,
         block_words=store.block_words))  # the Blocklist is the shared word source for NSFW Word
-    msgcount.register(app, owner_ids=OWNER_IDS)  # /rank /top /today /week /overall /me /radmin /resetrank + counter + 📊 menu
+    msgcount.register(app, owner_ids=OWNER_IDS, groups_source=_stats_refresh)  # /rank /top /today /week /overall /me /radmin /resetrank + counter + 📊 menu
     app.add_handler(CallbackQueryHandler(captcha_callback, pattern=r"^cap:"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:"))
     app.add_handler(CallbackQueryHandler(start_callback, pattern=r"^start:"))

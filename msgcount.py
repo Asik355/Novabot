@@ -695,7 +695,7 @@ async def count_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat is None or msg is None:
         return
     if chat.type == "private" and _cc_is_owner(update.effective_user.id if update.effective_user else None):
-        text, kb = await asyncio.to_thread(_cc_list_view, 0)
+        text, kb = await _cc_list(msg.get_bot(), 0)
         await msg.reply_html(text, reply_markup=kb)
         return
     if chat.type not in GROUP_TYPES:
@@ -894,7 +894,7 @@ async def mc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if chat.type == "private" and _cc_is_owner(q.from_user.id):
             await q.answer()
-            await _edit(q, *await asyncio.to_thread(_cc_list_view, 0))
+            await _edit(q, *await _cc_list(context.bot, 0))
             return
         if chat.type not in GROUP_TYPES:
             await q.answer()
@@ -1725,16 +1725,16 @@ async def inactive_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------------------------------------------------------ Bot Owner: custom count (private chat only)
 # Nothing here is ever reachable from a group: every handler requires a PRIVATE chat and the sender's ID in OWNER_IDS,
 # checked again on every tap and on every typed number. The group dashboard has no such buttons.
-_cc_pending = {}   # owner id -> (group chat_id, expiry on the monotonic clock). Transient UI state only.
+_cc_pending = {}   # owner id -> (group chat_id, expiry on the monotonic clock, "count" | "interval"). Transient UI state only.
 
 
 def _cc_is_owner(user_id):
     return user_id is not None and user_id in _OWNERS
 
 
-def _cc_groups_sync(page):
+def _cc_groups_sync(page, ids=None):
     c = M.col(GROUPS)
-    flt = {"chat_id": {"$lt": 0}}
+    flt = {"chat_id": {"$lt": 0}} if ids is None else {"chat_id": {"$in": list(ids)}}
     total = c.count_documents(flt)
     pages = max(1, -(-total // CC_PAGE))
     page = min(max(page, 0), pages - 1)
@@ -1742,10 +1742,38 @@ def _cc_groups_sync(page):
     return rows, page, pages
 
 
-def _cc_list_view(page):
-    rows, page, pages = _cc_groups_sync(page)
+_GROUPS_SOURCE = None          # async callable(bot) -> [(chat_id, title, link)]: the groups the bot is in RIGHT NOW (set by register)
+_cc_ids_cache = (0.0, None)    # (monotonic time, set of chat ids) kept for 60 seconds
+
+
+async def _cc_current_ids(bot):
+    """The chat ids of the groups the bot is currently in (checked with Telegram by the bot's own group list), or None when
+    that can't be known right now (then the list simply isn't filtered: never hide a group on a guess)."""
+    global _cc_ids_cache
+    if _GROUPS_SOURCE is None:
+        return None
+    t, ids = _cc_ids_cache
+    if ids is not None and time.monotonic() - t < 60:
+        return ids
+    try:
+        rows = await asyncio.wait_for(_GROUPS_SOURCE(bot), timeout=25)
+        ids = {int(r[0]) for r in rows}
+    except Exception:
+        log.warning("msgcount: couldn't get the bot's current groups; using the last known list", exc_info=True)
+        return ids                                         # the last good answer, or None
+    _cc_ids_cache = (time.monotonic(), ids)
+    return ids
+
+
+async def _cc_list(bot, page):
+    ids = await _cc_current_ids(bot)
+    return await asyncio.to_thread(_cc_list_view, page, ids)
+
+
+def _cc_list_view(page, ids=None):
+    rows, page, pages = _cc_groups_sync(page, ids)
     if not rows:
-        return "📊 <b>SELECT A GROUP</b>\n\nNo group has been counted yet.", KB([[B("🔙 Back", callback_data="help:main")]])
+        return "📊 <b>SELECT A GROUP</b>\n\nNo group the bot is in has been counted yet.", KB([[B("🔙 Back", callback_data="help:main")]])
     kb = [[B("👥 " + (r.get("name") or str(r["chat_id"]))[:40], callback_data=f"mcc:g:{r['chat_id']}")] for r in rows]
     nav = []
     if page > 0:
@@ -1768,9 +1796,11 @@ def _cc_dash_view(chat_id, note=""):
             f"💬 <b>Active Count:</b> {active_count(g):,}\n"
             f"📊 <b>Normal Count:</b> {normal_count(g):,}\n"
             f"🔧 <b>Custom Mode:</b> {'ON' if on else 'OFF'}\n"
-            f"💾 <b>Saved Custom Count:</b> {int(g.get('custom_total', 0)):,}")
+            f"💾 <b>Saved Custom Count:</b> {int(g.get('custom_total', 0)):,}\n"
+            f"🎯 <b>Milestone:</b> every {int(g.get('interval', DEFAULT_INTERVAL)):,} messages")
     return text, KB([
         [B("⚙️ Set Custom Count", callback_data=f"mcc:s:{chat_id}")],
+        [B("🎯 Milestone", callback_data=f"mcc:m:{chat_id}")],
         [B("♻️ Reset to Default", callback_data=f"mcc:r:{chat_id}")],
         [B("📖 Help Me", callback_data=f"mcc:h:{chat_id}")],
         [B("🔙 Select Group", callback_data="mcc:l:0")],
@@ -1824,7 +1854,7 @@ async def cc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         gid = int(parts[2]) if len(parts) > 2 and re.fullmatch(r"-?[0-9]{1,20}", parts[2]) else None
         if act == "l":
             await q.answer()
-            await _edit(q, *await asyncio.to_thread(_cc_list_view, gid or 0))
+            await _edit(q, *await _cc_list(context.bot, gid or 0))
             return
         if gid is None or gid >= 0:
             await q.answer("This button is no longer valid.", show_alert=True)
@@ -1840,11 +1870,38 @@ async def cc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             if len(_cc_pending) > 200:
                 _cc_pending.clear()
-            _cc_pending[uid] = (gid, time.monotonic() + INPUT_SECS)
+            _cc_pending[uid] = (gid, time.monotonic() + INPUT_SECS, "count")
             await q.answer()
             await _edit(q, "⚙️ <b>SET CUSTOM COUNT</b>\n\nEnter the new total message count for the selected group.\n\n"
                            f"Example: <code>50000</code>\n\nSend a whole number from 0 to {MAX_CUSTOM:,} within {INPUT_SECS // 60} minutes.",
                         KB([[B("❌ Cancel", callback_data=f"mcc:g:{gid}")]]))
+        elif act in ("m", "mp"):
+            g = await asyncio.to_thread(M.col(GROUPS).find_one, {"chat_id": gid})
+            if g is None:
+                await q.answer("This group is no longer in the list.", show_alert=True)
+                return
+            if act == "mp":                                # one of the quick values
+                v = parts[3] if len(parts) > 3 else ""
+                if not re.fullmatch(r"[0-9]{1,7}", v) or not (MIN_INTERVAL <= int(v) <= MAX_INTERVAL):
+                    await q.answer("This button is no longer valid.", show_alert=True)
+                    return
+                _cc_pending.pop(uid, None)
+                g2 = await asyncio.to_thread(_save_interval_sync, gid, int(v), _utcnow())
+                await q.answer("Milestone saved.")
+                nxt = next_milestone(int(g2.get("last_milestone", 0)), int(g2.get("initial", DEFAULT_INITIAL)), int(v))
+                await _edit(q, *await asyncio.to_thread(
+                    _cc_dash_view, gid, f"✅ <b>Milestone saved:</b> every {int(v):,} messages. Next milestone: {nxt:,}.\n\n"))
+                return
+            if len(_cc_pending) > 200:
+                _cc_pending.clear()
+            _cc_pending[uid] = (gid, time.monotonic() + INPUT_SECS, "interval")
+            await q.answer()
+            await _edit(q, "🎯 <b>MILESTONE</b>\n\n"
+                           f"Now: every {int(g.get('interval', DEFAULT_INTERVAL)):,} messages.\n\n"
+                           f"Tap a quick value or send your own whole number from {MIN_INTERVAL:,} to {MAX_INTERVAL:,} within {INPUT_SECS // 60} minutes.",
+                        KB([[B("250", callback_data=f"mcc:mp:{gid}:250"), B("500", callback_data=f"mcc:mp:{gid}:500"),
+                              B("1,000", callback_data=f"mcc:mp:{gid}:1000")],
+                            [B("❌ Cancel", callback_data=f"mcc:g:{gid}")]]))
         elif act == "r":
             g = await asyncio.to_thread(M.col(GROUPS).find_one, {"chat_id": gid})
             if g is None:
@@ -1894,7 +1951,7 @@ async def cc_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pend = _cc_pending.get(user.id)
     if pend is None:
         return
-    gid, exp = pend
+    gid, exp, mode = pend
     if exp <= time.monotonic():
         _cc_pending.pop(user.id, None)
         return
@@ -1902,6 +1959,26 @@ async def cc_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _cc_pending.pop(user.id, None)
         return
     text = (msg.text or "").strip()
+    if mode == "interval":
+        if not re.fullmatch(r"[0-9]{1,7}", text) or not (MIN_INTERVAL <= int(text) <= MAX_INTERVAL):
+            await msg.reply_text(f"❌ Please send a whole number from {MIN_INTERVAL:,} to {MAX_INTERVAL:,}, or tap Cancel. Nothing was changed.")
+            raise ApplicationHandlerStop
+        value = int(text)
+        try:
+            exists = await asyncio.to_thread(M.col(GROUPS).find_one, {"chat_id": gid})
+            g2 = await asyncio.to_thread(_save_interval_sync, gid, value, _utcnow()) if exists is not None else None
+        except PyMongoError:
+            log.exception("msgcount: saving the milestone failed for %s", gid)
+            await msg.reply_text(NO_DB + " Nothing was changed.")
+            raise ApplicationHandlerStop
+        _cc_pending.pop(user.id, None)
+        if g2 is None:
+            await msg.reply_text("⚠️ That group is no longer in the list. Nothing was changed.")
+            raise ApplicationHandlerStop
+        nxt = next_milestone(int(g2.get("last_milestone", 0)), int(g2.get("initial", DEFAULT_INITIAL)), value)
+        _, kb = await asyncio.to_thread(_cc_dash_view, gid)
+        await msg.reply_html(f"✅ <b>MILESTONE SAVED</b>\n\nEvery {value:,} messages.\nNext milestone: {nxt:,}.", reply_markup=kb)
+        raise ApplicationHandlerStop
     if not re.fullmatch(r"[0-9]{1,10}", text) or int(text) > MAX_CUSTOM:
         await msg.reply_text(f"❌ Please send a whole number from 0 to {MAX_CUSTOM:,}, or tap Cancel. Nothing was changed.")
         raise ApplicationHandlerStop
@@ -1961,11 +2038,13 @@ async def on_migrate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _registered = set()
 
 
-def register(app, owner_ids=None):
+def register(app, owner_ids=None, groups_source=None):
     """Commands, button handler and the counter. Call once, after the database is connected.
-    owner_ids: the bot's OWNER_IDS (the only people who may use the private custom-count dashboard)."""
-    global _OWNERS
+    owner_ids: the bot's OWNER_IDS (the only people who may use the private custom-count dashboard).
+    groups_source: async callable(bot) returning [(chat_id, title, link)] of the groups the bot is in now."""
+    global _OWNERS, _GROUPS_SOURCE
     _OWNERS = frozenset(int(i) for i in (owner_ids or ()))
+    _GROUPS_SOURCE = groups_source
     if id(app) in _registered:
         log.warning("msgcount.register called twice; ignoring the second call.")
         return
