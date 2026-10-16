@@ -4222,6 +4222,19 @@ def _fun_cancel_kb():
     return KB([[B("❌ Cancel", callback_data="fun:cx")]])
 
 
+def _fun_skip_kb():
+    """Optional steps (description, usage): ⏭️ Skip above ❌ Cancel."""
+    return KB([[B("⏭️ Skip", callback_data="fun:sk")], [B("❌ Cancel", callback_data="fun:cx")]])
+
+
+def _fun_gif_kb():
+    return KB([[B("✅ Done", callback_data="fun:gd"), B("❌ Cancel", callback_data="fun:cx")]])
+
+
+_fun_locks = defaultdict(asyncio.Lock)   # (chat_id, owner id) -> serialises GIF staging / Done / Cancel (updates run concurrently)
+_USAGE_PROMPT = "Now send the <b>usage</b> instructions, for example:\n<code>Reply to a user's message with /{name}</code>"
+
+
 def _fun_confirm_view(kind, cid):
     c = M.fun_get(cid)
     back = KB([[B("⬅️ Back", callback_data="fun:x")]])
@@ -4362,21 +4375,88 @@ async def _fun_manage(q, context, act, parts):
         await _fun_send_gifs(q, context, _fun_int(parts, 3), parts[2], _fun_int(parts, 4, 0))
     elif act in ("rm", "rmy", "rmn"):
         await _fun_gif_buttons(q, act, _fun_int(parts, 2))
+    elif act == "sk":
+        await _fun_skip(q, chat_id, uid)
     elif act == "cx":
-        _fun_session_end(chat_id, uid)
+        async with _fun_locks[(chat_id, uid)]:
+            s = _fun_session_get(chat_id, uid)
+            dropped = len(s.get("staged") or ()) if s and s.get("step") == "gif" else 0
+            _fun_session_end(chat_id, uid)
         await q.answer("Cancelled.")
-        await _fun_edit(q, "Cancelled. Nothing was changed.", KB([[B("⬅️ Back", callback_data="fun:x")]]))
-    elif act == "gd":
-        s = _fun_session_get(chat_id, uid)
-        _fun_session_end(chat_id, uid)
-        await q.answer("Done.")
-        cmd = await asyncio.to_thread(M.fun_get, s["cid"]) if s and s.get("cid") else None
-        await _fun_edit(q, "✅ Finished adding GIFs." + (f"\n/{cmd['name']} now has <b>{cmd['gifs']}</b> saved GIFs." if cmd else ""),
+        await _fun_edit(q, "Cancelled. Nothing was changed."
+                        + (f"\n{dropped} GIF{'s' if dropped != 1 else ''} from this session {'were' if dropped != 1 else 'was'} not saved." if dropped else ""),
                         KB([[B("⬅️ Back", callback_data="fun:x")]]))
+    elif act == "gd":
+        await _fun_gif_done(q, chat_id, uid)
     elif act == "ag":
         await _fun_start_gif_session(q, _fun_int(parts, 2))
     else:
         await q.answer("This button is no longer valid.", show_alert=True)
+
+
+async def _fun_skip(q, chat_id, uid):
+    """⏭️ Skip on an optional step: the field stays empty and the workflow moves on."""
+    s = _fun_session_get(chat_id, uid)
+    step = s["step"] if s else None
+    if step == "description":
+        _fun_session_put(chat_id, uid, step="usage", name=s["name"], description="")
+        await q.answer("Skipped.")
+        await _fun_edit(q, _USAGE_PROMPT.format(name=s["name"]), _fun_skip_kb())
+    elif step == "usage":
+        cmd = await asyncio.to_thread(M.fun_create, s["name"], s.get("description", ""), "")
+        _fun_session_end(chat_id, uid)                      # a second tap finds no session: no double create
+        if not cmd:
+            await q.answer("Not saved.", show_alert=True)
+            await _fun_edit(q, f"⚠️ /{s['name']} was just taken by another command. Nothing was saved.",
+                            KB([[B("⬅️ Back", callback_data="fun:x")]]))
+            return
+        _fun_invalidate()
+        await q.answer("Skipped.")
+        await _fun_edit(q, f"✅ <b>/{cmd['name']}</b> was created.\n\nDo you want to add GIFs to it now?",
+                        KB([[B("🎞 Add GIFs now", callback_data=f"fun:ag:{cmd['id']}"), B("Not now", callback_data="fun:x")]]))
+    else:
+        await q.answer("This step is no longer open.", show_alert=True)
+
+
+async def _fun_gif_done(q, chat_id, uid):
+    """✅ Done: saves every GIF staged in this session, once. A repeated tap finds no session and saves nothing."""
+    async with _fun_locks[(chat_id, uid)]:
+        s = _fun_session_get(chat_id, uid)
+        if not s or s.get("step") != "gif":
+            await q.answer("This session is already finished.", show_alert=True)
+            try:
+                await q.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+            return
+        cid, staged = s["cid"], s.setdefault("staged", [])
+        added = dup = 0
+        try:
+            while staged:
+                fid, uid_unique = staged[0]
+                res = await asyncio.to_thread(M.fun_gif_add, cid, fid, uid_unique)
+                staged.pop(0)
+                if res == "missing":
+                    staged.clear()
+                    break
+                if res == "duplicate":
+                    dup += 1
+                else:
+                    added += 1
+        except M.DBError:
+            log.exception("fun: database error while saving staged GIFs")
+            await q.answer("The database had a problem. Tap Done again.", show_alert=True)
+            return                                          # the session (and the rest of the GIFs) stays open
+        _fun_session_end(chat_id, uid)
+    await q.answer("Done.")
+    cmd = await asyncio.to_thread(M.fun_get, cid)
+    if not cmd:
+        text = "⚠️ This command no longer exists. The GIFs were not saved."
+    else:
+        text = (f"✅ Finished adding GIFs.\nSaved <b>{added}</b> new GIF{'s' if added != 1 else ''} to /{cmd['name']}"
+                + (f" ({dup} already saved, skipped)" if dup else "")
+                + f".\n/{cmd['name']} now has <b>{cmd['gifs']}</b> saved GIFs.")
+    await _fun_edit(q, text, KB([[B("⬅️ Back", callback_data="fun:x")]]))
 
 
 async def _fun_pick(q, context, op, cid):
@@ -4402,11 +4482,11 @@ async def _fun_start_gif_session(q, cid):
     if not cmd:
         await q.answer("This command no longer exists.", show_alert=True)
         return
-    _fun_session_put(q.message.chat.id, q.from_user.id, step="gif", cid=cid)
+    _fun_session_put(q.message.chat.id, q.from_user.id, step="gif", cid=cid, staged=[], ctl=q.message.message_id, ctl_status=False)
     await q.answer()
-    await _fun_edit(q, f"🎞 <b>Add GIF to /{cmd['name']}</b>\n\nSend the GIF(s) now. Each one is saved as you send it "
-                       f"(saved so far: {cmd['gifs']}).\nTap Done when you have finished.",
-                    KB([[B("✅ Done", callback_data="fun:gd"), B("❌ Cancel", callback_data="fun:cx")]]))
+    await _fun_edit(q, f"🎞 <b>Add GIF to /{cmd['name']}</b>\n\nSend the GIF(s) now (added this session: 0, "
+                       f"saved in the command: {cmd['gifs']}).\nThey are saved when you tap Done. The buttons move down "
+                       "with every GIF.", _fun_gif_kb())
 
 
 async def _fun_confirmed(q, kind, cid):
@@ -4527,19 +4607,18 @@ async def _fun_step(msg, chat, user, s, text):
             await msg.reply_text(f"⚠️ {err}\nSend another name, or tap Cancel.", reply_markup=cancel)
             return
         _fun_session_put(chat.id, user.id, step="description", name=name)
-        await msg.reply_html(f"Name: <b>/{name}</b>\n\nNow send the <b>description</b> (what the command does).", reply_markup=cancel)
+        await msg.reply_html(f"Name: <b>/{name}</b>\n\nNow send the <b>description</b> (what the command does).", reply_markup=_fun_skip_kb())
     elif step == "description":
         if not text or len(text) > FUN_DESC_MAX:
-            await msg.reply_text(f"⚠️ Send a description of 1-{FUN_DESC_MAX} characters, or tap Cancel.", reply_markup=cancel)
+            await msg.reply_text(f"⚠️ Send a description of 1-{FUN_DESC_MAX} characters, or tap Skip or Cancel.", reply_markup=_fun_skip_kb())
             return
         _fun_session_put(chat.id, user.id, step="usage", name=s["name"], description=text)
-        await msg.reply_html("Now send the <b>usage</b> instructions, for example:\n"
-                             f"<code>Reply to a user's message with /{s['name']}</code>", reply_markup=cancel)
+        await msg.reply_html(_USAGE_PROMPT.format(name=s["name"]), reply_markup=_fun_skip_kb())
     elif step == "usage":
         if not text or len(text) > FUN_USAGE_MAX:
-            await msg.reply_text(f"⚠️ Send usage text of 1-{FUN_USAGE_MAX} characters, or tap Cancel.", reply_markup=cancel)
+            await msg.reply_text(f"⚠️ Send usage text of 1-{FUN_USAGE_MAX} characters, or tap Skip or Cancel.", reply_markup=_fun_skip_kb())
             return
-        cmd = await asyncio.to_thread(M.fun_create, s["name"], s["description"], text)
+        cmd = await asyncio.to_thread(M.fun_create, s["name"], s.get("description", ""), text)
         _fun_session_end(chat.id, user.id)
         if not cmd:
             await msg.reply_text(f"⚠️ /{s['name']} was just taken by another command. Nothing was saved.")
@@ -4617,10 +4696,55 @@ async def fun_media_input(update, context):
                 await msg.reply_text(f"⚠️ There is no Fun command named /{m.group(1).lstrip('/').lower()}. Create it first.")
                 return
             cid = cmd["id"]
-        await _fun_save_gif(msg, chat, user, cid, anim, in_session)
+        if in_session:
+            await _fun_stage_gif(msg, chat, user, anim)
+        else:
+            await _fun_save_gif(msg, chat, user, cid, anim, in_session)
     except M.DBError:
         log.exception("fun: database error while saving a GIF")
         await msg.reply_text("⚠️ The database had a problem. The GIF was not saved.")
+
+
+async def _fun_stage_gif(msg, chat, user, anim):
+    """A GIF sent during an Add GIF session: kept in the session (saved by ✅ Done, dropped by ❌ Cancel), and the
+    ✅ Done / ❌ Cancel buttons are moved to a fresh message right under this GIF; the previous controls are removed."""
+    async with _fun_locks[(chat.id, user.id)]:
+        s = _fun_session_get(chat.id, user.id)
+        if not s or s.get("step") != "gif":
+            return                                          # Done/Cancel won the race: nothing to add to
+        cid = s["cid"]
+        cmd = await asyncio.to_thread(M.fun_get, cid)
+        if not cmd:
+            _fun_session_end(chat.id, user.id)
+            await msg.reply_text("⚠️ This command no longer exists. The GIF was not saved.")
+            return
+        staged = s.setdefault("staged", [])
+        note = ""
+        if any(u == anim.file_unique_id for _, u in staged):
+            note = "ℹ️ That GIF was already added in this session.\n"
+        else:
+            staged.append((anim.file_id, anim.file_unique_id))
+        s["ts"] = time.time()                                # keeps the session alive
+        text = (f"{note}🎞 <b>/{cmd['name']}</b>: <b>{len(staged)}</b> GIF{'s' if len(staged) != 1 else ''} added this session "
+                f"(saved in the command: {cmd['gifs']}).\nSend more, then tap Done to save them.")
+        try:
+            sent = await msg.reply_html(text, reply_markup=_fun_gif_kb())
+        except TelegramError as e:
+            log.warning("fun: couldn't send the GIF controls: %s", e)
+            return
+        old, old_status = s.get("ctl"), s.get("ctl_status")
+        s["ctl"], s["ctl_status"] = sent.message_id, True
+    if old:                                                  # the old controls are obsolete: delete our status line, or just drop its buttons
+        try:
+            if old_status:
+                await msg.get_bot().delete_message(chat.id, old)
+            else:
+                await msg.get_bot().edit_message_reply_markup(chat.id, old, reply_markup=None)
+        except TelegramError:
+            try:
+                await msg.get_bot().edit_message_reply_markup(chat.id, old, reply_markup=None)
+            except TelegramError:
+                pass
 
 
 async def _fun_save_gif(msg, chat, user, cid, anim, in_session):
@@ -4660,10 +4784,10 @@ async def setgif_cmd(update, context):
                 return
             await _fun_save_gif(msg, chat, user, cmd["id"], rep.animation, False)
             return
-        _fun_session_put(chat.id, user.id, step="gif", cid=cmd["id"])
-        sent = await msg.reply_html(f"🎞 <b>Add GIF to /{cmd['name']}</b>\n\nSend the GIF(s) now. Each one is saved as you send it.\n"
-                                    "Tap Done when you have finished.",
-                                    reply_markup=KB([[B("✅ Done", callback_data="fun:gd"), B("❌ Cancel", callback_data="fun:cx")]]))
+        sent = await msg.reply_html(f"🎞 <b>Add GIF to /{cmd['name']}</b>\n\nSend the GIF(s) now (added this session: 0).\n"
+                                    "They are saved when you tap Done. The buttons move down with every GIF.",
+                                    reply_markup=_fun_gif_kb())
+        _fun_session_put(chat.id, user.id, step="gif", cid=cmd["id"], staged=[], ctl=sent.message_id, ctl_status=False)
         extra.remember_menu_owner(sent, user.id)
     except M.DBError:
         log.exception("fun: /setgif failed")
@@ -4720,12 +4844,38 @@ async def fun_dispatch(update, context):
         return                                              # addressed to a different bot
     if cmd not in await _fun_names():
         return
-    if chat.type == "private":
-        await msg.reply_text("Use this command in a group, as a reply to someone's message.")
+    await _fun_run(update, context, cmd, plain=False)
+
+
+async def fun_plain_dispatch(update, context):
+    """group=9: a reply whose whole text is a Fun command name without the slash ('hug', 'Slap', 'sorry') runs that
+    command exactly like '/hug'. Anything else (not a reply, other words, private chats, unknown names) is ignored
+    silently and never stops the other handlers. Needs the bot to receive the message (privacy mode off, or admin)."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not msg.text or not user or chat is None or user.is_bot or msg.reply_to_message is None:
         return
-    if not await _cool(update, 3):
+    if chat.type not in ("group", "supergroup"):
+        return
+    word = msg.text.strip().lower()
+    if not word or len(word) > 32 or not FUN_NAME_RE.fullmatch(word):
+        return
+    if word not in await _fun_names():
+        return
+    await _fun_run(update, context, word, plain=True)
+
+
+async def _fun_run(update, context, cmd, plain):
+    """Runs the Fun command <cmd> (a name or an alias) for the message: shared by '/hug' and a plain 'hug' reply."""
+    msg, chat = update.effective_message, update.effective_chat
+    if chat.type == "private":
+        if not plain:
+            await msg.reply_text("Use this command in a group, as a reply to someone's message.")
         return
     target = msg.reply_to_message
+    if plain and _fun_unusable_target(target):
+        return                                              # e.g. the implicit topic-start reply: it is just a normal message
+    if not await _cool(update, 3):
+        return
     if _fun_unusable_target(target):
         await msg.reply_text(f"↩️ Reply to a message with /{cmd}.")
         return
@@ -4789,6 +4939,9 @@ def _fun_register(app, deps):
                                     | filters.Sticker.ALL | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE),
                                    fun_media_input), group=-27)
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.COMMAND, fun_dispatch), group=8)
+    # "hug" / "slap" / ... typed as a reply, without the slash (group 9: its own group, so no other handler is displaced)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND & filters.REPLY,
+                                   fun_plain_dispatch), group=9)
 
 
 # ------------------------------------------------------------ registration
