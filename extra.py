@@ -2163,12 +2163,55 @@ async def flip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(f"🪙 {random.choice(['Heads', 'Tails'])}!")
 
 
+SAY_MAX = 300                 # characters spoken in one voice message
+SAY_COOLDOWN = 10             # seconds between two /say per person
+_say_last = {}
+
+
+def _say_lang(text: str) -> str:
+    """Hindi when the text has Devanagari letters, otherwise English."""
+    return "hi" if re.search(r"[\u0900-\u097F]", text) else "en"
+
+
+def _say_mp3(text: str, lang: str) -> bytes:
+    """Text-to-speech through gTTS (Google's free endpoint). Runs in a worker thread; raises on any failure."""
+    import io
+    from gtts import gTTS
+    buf = io.BytesIO()
+    gTTS(text=text, lang=lang).write_to_fp(buf)
+    return buf.getvalue()
+
+
 async def say_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/say <text>: the bot answers with a voice message that speaks the text (the text is its caption).
+    If the voice can't be made or sent, the bot says the text in writing instead."""
+    msg, user = update.effective_message, update.effective_user
     text = _query_from(update, context) if context.args else ""
     if not text:
-        await update.effective_message.reply_text("Usage: /say <text>")
+        await msg.reply_text("Usage: /say <text>")
         return
-    await update.effective_message.reply_text(text[:1000], disable_web_page_preview=True)
+    now = time.monotonic()
+    if user is not None:
+        left = SAY_COOLDOWN - (now - _say_last.get(user.id, -1e9))
+        if left > 0:
+            await msg.reply_text(f"Please wait {int(left) + 1} seconds before using /say again.")
+            return
+        if len(_say_last) > 2000:
+            _say_last.clear()
+        _say_last[user.id] = now
+    spoken = text[:SAY_MAX]
+    caption = spoken + ("\n\n(Only the first %d characters were spoken.)" % SAY_MAX if len(text) > SAY_MAX else "")
+    try:
+        try:
+            await context.bot.send_chat_action(msg.chat_id, ChatAction.RECORD_VOICE)
+        except TelegramError:
+            pass
+        audio = await asyncio.wait_for(asyncio.to_thread(_say_mp3, spoken, _say_lang(spoken)), timeout=25)
+        await msg.reply_voice(voice=audio, caption=caption)
+        return
+    except Exception as e:                                  # TTS down, timeout, Telegram refused the voice, ...
+        log.warning("say: voice failed (%s: %s); sending the text instead", type(e).__name__, str(e)[:120])
+    await msg.reply_text(text[:1000], disable_web_page_preview=True)
 
 
 # ------------------------------------------------------ inline button menu
@@ -2183,7 +2226,7 @@ AI_HELP_LINES = [
     "/fact: An interesting fact.",
     "/roll: Roll a dice (1-6).",
     "/flip: Flip a coin.",
-    "/say: Make the bot repeat your text.",
+    "/say: Make the bot speak your text as a voice message.",
 ]
 
 # key -> (button label, detail text, runs instantly when tapped?)
@@ -2209,7 +2252,7 @@ AI_PAGES = {
     "fact": ("🧠 Fact", "<b>🧠 Fact</b>\n\n/fact: an interesting fact.", True),
     "roll": ("🎲 Roll", "<b>🎲 Roll</b>\n\n/roll: roll a dice (1-6).", True),
     "flip": ("🪙 Flip", "<b>🪙 Flip</b>\n\n/flip: flip a coin (Heads or Tails).", True),
-    "say": ("📢 Say", "<b>📢 Say</b>\n\n/say &lt;text&gt;\nI repeat your text.", False),
+    "say": ("📢 Say", "<b>📢 Say</b>\n\n/say &lt;text&gt;\nI speak your text as a voice message (the first 300 characters). If the voice is unavailable I write it instead.", False),
 }
 _AI_RUNNERS = {
     "joke": "joke_command", "quote": "quote_command", "fact": "fact_command",

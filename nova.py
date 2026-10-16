@@ -1197,7 +1197,7 @@ ESSENTIAL_COMMANDS = [
     ("fact", "Get an interesting fact"),
     ("roll", "Roll a dice"),
     ("flip", "Flip a coin"),
-    ("say", "Make the bot say something"),
+    ("say", "Make the bot speak your text"),
     # roast game
     ("roast", "Roast someone"),
     ("roastme", "Roast yourself"),
