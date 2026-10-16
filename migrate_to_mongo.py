@@ -118,16 +118,17 @@ UNIQUE_INDEXES = {
     "roast_votes": ["battle_id", "voter_id"], "court_cases": ["id"],
     "court_votes": ["case_id", "voter_id"], "court_verdicts": ["id"],
     "modlog": ["id"], "notice_pending": ["chat_id", "message_id"],
-    "fun_commands": ["id"], "fun_gifs": ["id"],
+    "fun_commands": ["id"], "fun_gifs": ["id"], "fun_aliases": ["id"],
 }
 # Extra unique indexes (one list of keys each): a Fun command name is unique, and the same GIF is saved once per command.
-EXTRA_UNIQUE_INDEXES = {"fun_commands": [["name"]], "fun_gifs": [["command_id", "file_unique_id"]]}
+EXTRA_UNIQUE_INDEXES = {"fun_commands": [["name"]], "fun_gifs": [["command_id", "file_unique_id"]],
+                        "fun_aliases": [["name"]]}
 PLAIN_INDEXES = {
     "warn_log": [["chat_id", "user_id"]], "captcha_pending": [["expires"]],
     "roast_battles": [["chat_id"]], "roast_profiles": [["chat_id", "points"]],
     "court_cases": [["chat_id", "case_no"], ["chat_id", "defendant_id"]], "court_verdicts": [["case_id"]],
     "modlog": [["chat_id", "id"]], "notice_pending": [["delete_at"]],
-    "fun_gifs": [["command_id"]],
+    "fun_gifs": [["command_id"]], "fun_aliases": [["command_id"]],
 }
 # MongoDB deletes a document by itself once its "expire_at" date has passed (no bot code involved).
 # Documents without an expire_at (the old modlog rows) are never touched by this.
@@ -664,6 +665,8 @@ def fun_create(name, description, usage):
     """The new command, or None when the name is already taken."""
     doc = {"id": next_id("fun_commands"), "name": str(name), "description": str(description), "usage": str(usage),
            "created_at": int(time.time())}
+    if col("fun_aliases").find_one({"name": str(name)}, {"id": 1}):
+        return None
     try:
         col("fun_commands").insert_one(dict(doc))
     except DuplicateKeyError:
@@ -674,6 +677,8 @@ def fun_create(name, description, usage):
 def fun_update(command_id, **fields):
     """'ok' | 'missing' | 'duplicate'. Only name, description and usage can change; the GIFs stay attached."""
     changes = {k: str(v) for k, v in fields.items() if k in ("name", "description", "usage")}
+    if "name" in changes and col("fun_aliases").find_one({"name": changes["name"]}, {"id": 1}):
+        return "duplicate"
     try:
         res = col("fun_commands").update_one({"id": int(command_id)}, {"$set": changes})
     except DuplicateKeyError:
@@ -686,13 +691,56 @@ def fun_delete(command_id):
     command_id = int(command_id)
     gone = col("fun_commands").delete_one({"id": command_id}).deleted_count
     col("fun_gifs").delete_many({"command_id": command_id})
+    col("fun_aliases").delete_many({"command_id": command_id})
     return bool(gone)
 
 
 def fun_cleanup():
     """Delete GIF rows whose command no longer exists (left over by an interrupted delete)."""
     live = [r["id"] for r in col("fun_commands").find({}, {"id": 1})]
+    col("fun_aliases").delete_many({"command_id": {"$nin": live}})
     return col("fun_gifs").delete_many({"command_id": {"$nin": live}}).deleted_count
+
+
+# fun_aliases: {id, command_id, name, created_at}   a second name for a Fun command (same GIFs, same behaviour)
+def fun_alias_map():
+    """{alias name: command_id} for every alias."""
+    return {r["name"]: r["command_id"] for r in col("fun_aliases").find({}, {"name": 1, "command_id": 1})}
+
+
+def fun_alias_list(command_id):
+    """[{id, name}] of one command's aliases, oldest first."""
+    return [{"id": r["id"], "name": r["name"]} for r in
+            col("fun_aliases").find({"command_id": int(command_id)}, sort=[("id", ASCENDING)])]
+
+
+def fun_alias_get_by_name(name):
+    r = col("fun_aliases").find_one({"name": str(name)})
+    return {"id": r["id"], "command_id": r["command_id"], "name": r["name"]} if r else None
+
+
+def fun_alias_add(command_id, name):
+    """'ok' | 'missing' (the command is gone) | 'duplicate' (the alias or a command already uses that name)."""
+    command_id = int(command_id)
+    if not col("fun_commands").find_one({"id": command_id}, {"id": 1}):
+        return "missing"
+    if col("fun_commands").find_one({"name": str(name)}, {"id": 1}):
+        return "duplicate"
+    try:
+        col("fun_aliases").insert_one({"id": next_id("fun_aliases"), "command_id": command_id, "name": str(name),
+                                       "created_at": int(time.time())})
+    except DuplicateKeyError:
+        return "duplicate"
+    if not col("fun_commands").find_one({"id": command_id}, {"id": 1}):   # command deleted meanwhile: don't leave a stray alias
+        col("fun_aliases").delete_many({"command_id": command_id})
+        return "missing"
+    return "ok"
+
+
+def fun_alias_remove(alias_id):
+    """The command id the alias belonged to, or None when it was already gone."""
+    r = col("fun_aliases").find_one_and_delete({"id": int(alias_id)})
+    return r["command_id"] if r else None
 
 
 def fun_gif_add(command_id, file_id, file_unique_id=None):

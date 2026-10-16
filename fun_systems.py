@@ -3381,6 +3381,16 @@ async def wish_cmd(update, context):
     extra.remember_menu_owner(sent, user.id)      # so ◀️ Back (to /help) works for this message too
 
 
+async def fun_cmd(update, context):
+    """/fun opens the same 🎉 Fun menu as the /help button (private chats and groups)."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or user.is_bot or not await _cool(update, 3):
+        return
+    text, kb = _fun_menu_view(await _fun_can_manage(user.id))
+    sent = await msg.reply_html(text, reply_markup=kb, disable_web_page_preview=True)
+    extra.remember_menu_owner(sent, user.id)      # so ⬅️ Back (to /help) works for this message too
+
+
 async def birthday_menu_from_help(update, context):
     """The 🎂 Birthday button in /help (nova.help_callback): turns the help message into the menu."""
     q = update.callback_query
@@ -3910,7 +3920,7 @@ def _bd_ensure_task(bot):
 
 
 def _bd_register(app):
-    app.add_handler(CommandHandler("wish", wish_cmd))
+    app.add_handler(CommandHandler(["wish", "birthday"], wish_cmd))      # /birthday opens the same menu as /wish
     app.add_handler(CallbackQueryHandler(_bd_on_callback, pattern=r"^bd:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND
                                    & (filters.ChatType.PRIVATE | filters.ChatType.GROUPS), _bd_on_text), group=5)
@@ -3955,12 +3965,27 @@ _fun_app = None
 
 
 def fun_help_row():
-    """The row under Count / AI Commands / Blocking in /help: 🎉 Fun and two placeholders."""
-    return [B("🎉 Fun", callback_data="fun:m"), B(FUN_BLANK, callback_data="fun:na"), B(FUN_BLANK, callback_data="fun:na")]
+    """The row under Count / AI Commands / Blocking in /help: 🎉 Fun, 🗑 Delete (handled by msgcount.del_callback) and one placeholder."""
+    return [B("🎉 Fun", callback_data="fun:m"), B("🗑 Delete", callback_data="mcd:m"), B(FUN_BLANK, callback_data="fun:na")]
 
 
 def _fun_is_owner(uid):
     return uid in set(getattr(D, "owner_ids", None) or ())
+
+
+async def _fun_can_manage(uid):
+    """True for the Bot Owner and the bot's own admins (Super Admins). Group admins and members are never included.
+    Checked on every tap/command, so removing a bot admin takes effect on their very next action."""
+    if _fun_is_owner(uid):
+        return True
+    fn = getattr(D, "is_super_admin", None)
+    if fn is None:
+        return False
+    try:
+        return bool(await asyncio.to_thread(fn, uid))
+    except Exception:
+        log.exception("fun: couldn't check the bot-admin list")
+        return False
 
 
 def _fun_invalidate():
@@ -3972,7 +3997,9 @@ async def _fun_names():
     now = time.monotonic()
     if now - _fun_names_cache["ts"] > 30:
         try:
-            _fun_names_cache["names"] = frozenset(await asyncio.to_thread(M.fun_names))
+            names = set(await asyncio.to_thread(M.fun_names))
+            names.update(await asyncio.to_thread(M.fun_alias_map))      # an alias runs the command it belongs to
+            _fun_names_cache["names"] = frozenset(names)
             _fun_names_cache["ts"] = now
         except Exception:
             log.exception("fun: couldn't read the command names")
@@ -4010,6 +4037,8 @@ def _fun_check_name(raw, exclude_id=None):
     other = M.fun_get_by_name(name)
     if other and other["id"] != exclude_id:
         return None, f"/{name} already exists."
+    if M.fun_alias_get_by_name(name):
+        return None, f"/{name} is already used as an alias."
     return name, None
 
 
@@ -4044,11 +4073,14 @@ def _fun_session_end(chat_id, uid):
 
 
 # ---- screens (synchronous: they read MongoDB, so callers run them in a thread)
-def _fun_menu_view():
-    return ("🎉 <b>Fun</b>\n\nChoose an option.",
-            KB([[B("🎭 Commands", callback_data="fun:c:0")],
-                [B("⚙️ Customise Commands", callback_data="fun:x")],
-                [B("⬅️ Back", callback_data="help:main")]]))
+def _fun_menu_view(manage=False):
+    """Everyone sees Commands and Back; the Bot Owner and bot admins also see Alias and Customise Commands."""
+    rows = [[B("🎭 Commands", callback_data="fun:c:0")]]
+    if manage:
+        rows[0].append(B("🏷 Alias", callback_data="fun:al:0"))
+        rows.append([B("⚙️ Customise Commands", callback_data="fun:x")])
+    rows.append([B("⬅️ Back", callback_data="help:main")])
+    return "🎉 <b>Fun</b>\n\nChoose an option.", KB(rows)
 
 
 def _fun_nav(prefix, page, pages):
@@ -4087,8 +4119,10 @@ def _fun_detail_view(cid, page):
     back = KB([[B("⬅️ Back", callback_data=f"fun:c:{max(page, 0)}")]])
     if not c:
         return "⚠️ This command no longer exists.", back
+    aliases = ", ".join(f"/{a['name']}" for a in M.fun_alias_list(cid))
     return (f"🎉 <b>Command:</b> /{c['name']}\n\n<b>Description:</b>\n{_fun_esc(c['description']) or '-'}\n\n"
-            f"<b>Usage:</b>\n{_fun_esc(c['usage']) or '-'}\n\n<b>Saved GIFs:</b> {c['gifs']}"), back
+            f"<b>Usage:</b>\n{_fun_esc(c['usage']) or '-'}\n\n<b>Saved GIFs:</b> {c['gifs']}"
+            + (f"\n<b>Also works as:</b> {aliases}" if aliases else "")), back
 
 
 FUN_CUSTOMISE_TEXT = (
@@ -4123,6 +4157,41 @@ def _fun_select_view(op, page):
         rows.append(nav)
     rows.append([B("⬅️ Back", callback_data="fun:x")])
     return f"<b>{title}</b>\n\nChoose a command:" + (f"\n\nPage {page + 1}/{pages}" if pages > 1 else ""), KB(rows)
+
+
+def _fun_alias_list_view(page):
+    """🏷 Alias: pick a command to add or remove a second name for."""
+    chunk, page, pages = _fun_page_of(M.fun_list(), page)
+    back = [B("⬅️ Back", callback_data="fun:m")]
+    if not chunk:
+        return "🏷 <b>Alias</b>\n\nThere are no Fun commands yet. Create one first.", KB([back])
+    counts = {}
+    for a in M.fun_alias_map().values():
+        counts[a] = counts.get(a, 0) + 1
+    btns = [B(f"/{c['name']}" + (f" ({counts[c['id']]})" if counts.get(c['id']) else ""),
+              callback_data=f"fun:ad:{c['id']}:{page}") for c in chunk]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    nav = _fun_nav("fun:al", page, pages)
+    if nav:
+        rows.append(nav)
+    rows.append(back)
+    return ("🏷 <b>Alias</b>\n\nPick a command to add or remove a second name."
+            + (f"\n\nPage {page + 1}/{pages}" if pages > 1 else "")), KB(rows)
+
+
+def _fun_alias_view(cid, page=0, note=""):
+    """One command's aliases, with ➕ Add alias and a 🗑 button for each alias."""
+    c = M.fun_get(cid)
+    back = [B("⬅️ Back", callback_data=f"fun:al:{max(page, 0)}")]
+    if not c:
+        return "⚠️ This command no longer exists.", KB([back])
+    aliases = M.fun_alias_list(cid)
+    names = ", ".join(f"/{a['name']}" for a in aliases) or "No aliases yet"
+    rows = [[B("➕ Add alias", callback_data=f"fun:aa:{cid}:{max(page, 0)}")]]
+    dels = [B(f"🗑 /{a['name']}", callback_data=f"fun:ar:{a['id']}:{max(page, 0)}") for a in aliases]
+    rows += [dels[i:i + 2] for i in range(0, len(dels), 2)]
+    rows.append(back)
+    return f"{note}🏷 <b>/{c['name']}</b>\n\nAliases: {names}", KB(rows)
 
 
 def _fun_my_view(page):
@@ -4192,7 +4261,7 @@ async def fun_callback(update, context):
             if await extra.menu_not_owner(q):
                 return
             if act == "m":
-                text, kb = _fun_menu_view()
+                text, kb = _fun_menu_view(await _fun_can_manage(q.from_user.id))
             elif act == "c":
                 text, kb = await asyncio.to_thread(_fun_list_view, _fun_int(parts, 2, 0))
             else:
@@ -4200,9 +4269,9 @@ async def fun_callback(update, context):
             await q.answer()
             await _fun_edit(q, text, kb)
             return
-        # everything else changes data or opens management: Bot Owner only, checked on EVERY tap
-        if not _fun_is_owner(q.from_user.id):
-            await q.answer("Only the bot owner can do this.", show_alert=True)
+        # everything else changes data or opens management: Bot Owner and bot admins only, checked on EVERY tap
+        if not await _fun_can_manage(q.from_user.id):
+            await q.answer("Only the bot owner and bot admins can do this.", show_alert=True)
             return
         await _fun_manage(q, context, act, parts)
     except M.DBError:
@@ -4235,6 +4304,36 @@ async def _fun_manage(q, context, act, parts):
     elif act == "my":
         await q.answer()
         await _fun_edit(q, *await asyncio.to_thread(_fun_my_view, _fun_int(parts, 2, 0)))
+    elif act == "al":                                       # 🏷 Alias: the command list
+        _fun_session_end(chat_id, uid)
+        await q.answer()
+        await _fun_edit(q, *await asyncio.to_thread(_fun_alias_list_view, _fun_int(parts, 2, 0)))
+    elif act == "ad":                                       # one command's aliases
+        _fun_session_end(chat_id, uid)
+        await q.answer()
+        await _fun_edit(q, *await asyncio.to_thread(_fun_alias_view, _fun_int(parts, 2), _fun_int(parts, 3, 0)))
+    elif act == "aa":                                       # ➕ Add alias: the next message is the name
+        cid, page = _fun_int(parts, 2), _fun_int(parts, 3, 0)
+        cmd = await asyncio.to_thread(M.fun_get, cid)
+        if not cmd:
+            await q.answer(gone, show_alert=True)
+            return
+        _fun_session_put(chat_id, uid, step="alias", cid=cid, page=page)
+        await q.answer()
+        await _fun_edit(q, f"Send the new name for <b>/{cmd['name']}</b>.\n"
+                           "Use 2 to 32 letters, numbers or underscores, starting with a letter.\n"
+                           "Example: <code>cuddle</code>\n\nThe next message you send here is used.",
+                        KB([[B("❌ Cancel", callback_data=f"fun:ad:{cid}:{page}")]]))
+    elif act == "ar":                                       # 🗑 remove one alias
+        aid, page = _fun_int(parts, 2), _fun_int(parts, 3, 0)
+        cid = await asyncio.to_thread(M.fun_alias_remove, aid)
+        _fun_invalidate()
+        if cid is None:
+            await q.answer("That alias was already removed.", show_alert=True)
+            await _fun_edit(q, *await asyncio.to_thread(_fun_alias_list_view, page))
+            return
+        await q.answer("Removed.")
+        await _fun_edit(q, *await asyncio.to_thread(_fun_alias_view, cid, page, "🗑 Alias removed.\n\n"))
     elif act == "new":
         _fun_session_put(chat_id, uid, step="name")
         await q.answer()
@@ -4406,7 +4505,7 @@ async def fun_text_input(update, context):
     s = _fun_session_get(chat.id, user.id)
     if not s or s["step"] == "gif":
         return
-    if not _fun_is_owner(user.id):
+    if not await _fun_can_manage(user.id):
         _fun_session_end(chat.id, user.id)
         return
     try:
@@ -4449,6 +4548,28 @@ async def _fun_step(msg, chat, user, s, text):
         await msg.reply_html(f"✅ <b>/{cmd['name']}</b> was created.\n\nDo you want to add GIFs to it now?",
                              reply_markup=KB([[B("🎞 Add GIFs now", callback_data=f"fun:ag:{cmd['id']}"),
                                                B("Not now", callback_data="fun:x")]]))
+    elif step == "alias":
+        cid, page = s["cid"], s.get("page", 0)
+        name, err = await asyncio.to_thread(_fun_check_name, text)
+        if err:
+            await msg.reply_text(f"❌ {err}\nPlease send another name, or tap Cancel.",
+                                 reply_markup=KB([[B("❌ Cancel", callback_data=f"fun:ad:{cid}:{page}")]]))
+            return
+        res = await asyncio.to_thread(M.fun_alias_add, cid, name)
+        if res == "missing":
+            _fun_session_end(chat.id, user.id)
+            await msg.reply_text("⚠️ This command no longer exists.")
+            return
+        if res == "duplicate":
+            await msg.reply_text(f"❌ /{name} is already used. Please send another name, or tap Cancel.",
+                                 reply_markup=KB([[B("❌ Cancel", callback_data=f"fun:ad:{cid}:{page}")]]))
+            return
+        _fun_session_end(chat.id, user.id)
+        _fun_invalidate()
+        cmd = await asyncio.to_thread(M.fun_get, cid)
+        view, kb = await asyncio.to_thread(_fun_alias_view, cid, page,
+                                           f"✅ /{name} now works like /{cmd['name'] if cmd else '?'}.\n\n")
+        await msg.reply_html(view, reply_markup=kb)
     elif step.startswith("edit_"):
         field, cid = step[5:], s["cid"]
         if field == "name":
@@ -4474,12 +4595,14 @@ async def _fun_step(msg, chat, user, s, text):
 async def fun_media_input(update, context):
     """group=-27, Bot Owner only: a GIF sent during an Add GIF session, or a GIF whose caption is '/setgif <name>'."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not msg or not user or chat is None or not _fun_is_owner(user.id):
+    if not msg or not user or chat is None:
         return
     s = _fun_session_get(chat.id, user.id)
     in_session = bool(s and s["step"] == "gif")
     m = re.match(r"^/setgif(?:@\w+)?\s+(\S+)", msg.caption or "", re.I)
     if not in_session and not m:
+        return                                              # the usual case: nothing to do, no lookup at all
+    if not await _fun_can_manage(user.id):
         return
     anim = msg.animation
     if anim is None:                                           # a photo, video, sticker, file...
@@ -4518,7 +4641,7 @@ async def _fun_save_gif(msg, chat, user, cid, anim, in_session):
 async def setgif_cmd(update, context):
     """/setgif <name>: reply to a GIF with it, or send it and then the GIF(s). A GIF captioned '/setgif <name>' works too."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not msg or not user or not _fun_is_owner(user.id):
+    if not msg or not user or not await _fun_can_manage(user.id):
         return
     if not context.args:
         await msg.reply_text("Usage: /setgif <command>\nReply to a GIF with it, or send it and then send the GIF(s).\n"
@@ -4550,7 +4673,7 @@ async def setgif_cmd(update, context):
 async def gifedit_cmd(update, context):
     """/gifedit <name>: opens the Edit Command screen of that command."""
     msg, user = update.effective_message, update.effective_user
-    if not msg or not user or not _fun_is_owner(user.id):
+    if not msg or not user or not await _fun_can_manage(user.id):
         return
     if not context.args:
         await msg.reply_text("Usage: /gifedit <command_name>")
@@ -4576,6 +4699,15 @@ def _fun_unusable_target(target):
         "general_forum_topic_hidden", "general_forum_topic_unhidden"))
 
 
+def _fun_row_for(name):
+    """The command a typed name runs: the command itself, or the command an alias belongs to."""
+    row = M.fun_get_by_name(name)
+    if row is None:
+        alias = M.fun_alias_get_by_name(name)
+        row = M.fun_get(alias["command_id"]) if alias else None
+    return row
+
+
 async def fun_dispatch(update, context):
     """group=8: '/<name>' where <name> is a Fun command. The name is only ever compared with the stored names; user
     input is never executed. Unknown commands are ignored here, so this never interferes with the other commands."""
@@ -4598,7 +4730,7 @@ async def fun_dispatch(update, context):
         await msg.reply_text(f"↩️ Reply to a message with /{cmd}.")
         return
     try:
-        row = await asyncio.to_thread(M.fun_get_by_name, cmd)
+        row = await asyncio.to_thread(_fun_row_for, cmd)
         if row is None:                                     # deleted a moment ago
             _fun_invalidate()
             return
@@ -4646,16 +4778,16 @@ def _fun_register(app, deps):
             log.info("fun: created the %d starter commands", made)
     except Exception:
         log.exception("fun: couldn't prepare the Fun commands collection")
-    owners = sorted(set(getattr(deps, "owner_ids", None) or ()))
     app.add_handler(CallbackQueryHandler(fun_callback, pattern=r"^fun:"))
-    if owners:                                              # everyone else gets complete silence
-        only_owner = filters.User(user_id=owners)
-        app.add_handler(CommandHandler("setgif", setgif_cmd, filters=only_owner))
-        app.add_handler(CommandHandler("gifedit", gifedit_cmd, filters=only_owner))
-        app.add_handler(MessageHandler(filters.TEXT & only_owner, fun_text_input), group=-27)
-        app.add_handler(MessageHandler((filters.ANIMATION | filters.VIDEO | filters.PHOTO | filters.Document.ALL
-                                        | filters.Sticker.ALL | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE) & only_owner,
-                                       fun_media_input), group=-27)
+    app.add_handler(CommandHandler("fun", fun_cmd))
+    # The Bot Owner and the bot's admins can manage (bot admins change at runtime, so each handler checks the person
+    # itself, only after it knows there is something to do). Everyone else gets complete silence.
+    app.add_handler(CommandHandler("setgif", setgif_cmd))
+    app.add_handler(CommandHandler("gifedit", gifedit_cmd))
+    app.add_handler(MessageHandler(filters.TEXT, fun_text_input), group=-27)
+    app.add_handler(MessageHandler((filters.ANIMATION | filters.VIDEO | filters.PHOTO | filters.Document.ALL
+                                    | filters.Sticker.ALL | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE),
+                                   fun_media_input), group=-27)
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.COMMAND, fun_dispatch), group=8)
 
 

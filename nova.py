@@ -1183,6 +1183,11 @@ ESSENTIAL_COMMANDS = [
     ("limits", "Show this chat's limits"),
     # AI and fun utilities
     ("ai", "Open the AI commands menu"),
+    ("fun", "Open the Fun menu"),
+    ("birthday", "Open the Birthday menu"),
+    ("count", "Open the Message Count menu"),
+    ("deleted", "List and kick deleted accounts"),
+    ("inactive", "List members inactive for N days"),
     ("ask", "Ask the AI a question"),
     ("search", "AI web search summary"),
     ("translate", "Translate to Hindi and English"),
@@ -5605,14 +5610,14 @@ def main():
     fun_systems.register(app, SimpleNamespace(
         is_admin=is_admin, admin_only=admin_only, lock_exempt=lock_exempt,
         load_allow=load_allow, url_allowed=url_allowed, log_action=log_action, MUTED=MUTED,
-        owner_ids=OWNER_IDS))  # owner_ids: the 🎉 Fun menu's management is strictly for these Telegram IDs
+        owner_ids=OWNER_IDS, is_super_admin=is_super_admin))  # 🎉 Fun management: the Bot Owner and the bot's admins
     # auto-ads / promotion blocker + the 🔒 Blocking menu (lives in extra.py; per-group settings in the settings store)
     extra.register_blocking(app, SimpleNamespace(
         is_admin=is_admin, lock_exempt=lock_exempt, load_allow=load_allow, url_allowed=url_allowed,
         log_action=log_action, MUTED=MUTED, is_super_admin=is_super_admin, owner_ids=OWNER_IDS,
         is_paused=is_paused, is_bot_owner=is_bot_owner, get_setting=store.get_setting, set_setting=store.set_setting,
         block_words=store.block_words))  # the Blocklist is the shared word source for NSFW Word
-    msgcount.register(app)  # /rank /top /today /week /overall /me /radmin /resetrank + counter + 📊 menu
+    msgcount.register(app, owner_ids=OWNER_IDS)  # /rank /top /today /week /overall /me /radmin /resetrank + counter + 📊 menu
     app.add_handler(CallbackQueryHandler(captcha_callback, pattern=r"^cap:"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:"))
     app.add_handler(CallbackQueryHandler(start_callback, pattern=r"^start:"))
