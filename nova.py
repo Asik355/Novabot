@@ -1146,6 +1146,18 @@ HELP_SECTIONS = {
         "🎂 Birthday",
         "<b>Birthday</b>\n\nSend /wish to open the Birthday System menu.",
     ),
+    # the ➕ More button (row under Count / AI Commands / Blocking); not in HELP_ORDER, opened by help:more
+    "more": (
+        "➕ More",
+        "<b>➕ More</b>\n\nTap a button below.",
+    ),
+    "dl": (  # opened from the ➕ More page (help:dl)
+        "📥 Download",
+        "<b>📥 Download</b>\n\n"
+        "• /download &lt;link&gt; (or /dl): download a Reel, YouTube Short or other public video.\n"
+        "• /da &lt;link&gt;: download only the audio.\n\n"
+        "You can also reply to a message that has a link with /dl or /da.",
+    ),
 }
 HELP_ORDER = ["mod", "warn", "flood", "captcha", "greet", "rules", "notes", "locks", "purge", "log", "reports", "approval", "disabling", "groupedit", "botedit", "other", "info", "extras", "roast", "court", "birthday"]
 
@@ -1196,6 +1208,7 @@ ESSENTIAL_COMMANDS = [
     ("roll", "Roll a dice"),
     ("flip", "Flip a coin"),
     ("say", "Make the bot speak your text"),
+    ("download", "Download a reel or shorts video"),
     # roast game
     ("roast", "Roast someone"),
     ("roastme", "Roast yourself"),
@@ -1373,7 +1386,10 @@ def help_main_keyboard(chat=None, user_id=None):
     # Do not move it, combine it with another button, or place any
     # button after it.
     
-    rows.append(fun_systems.fun_help_row())  # 🎉 Fun + two placeholders: its own row under Count / AI Commands / Blocking
+    fun_row = list(fun_systems.fun_help_row())  # 🎉 Fun, 🗑 Delete, placeholder -> the placeholder becomes ➕ More
+    if len(fun_row) >= 3:
+        fun_row[2] = InlineKeyboardButton("➕ More", callback_data="help:more")
+    rows.append(fun_row)  # 🎉 Fun + two placeholders: its own row under Count / AI Commands / Blocking
     if user_id in OWNER_IDS:  # 👑 Owner: its own row, just above the Suggestion Bar, shown to the Bot Owner only
         rows.append([InlineKeyboardButton("👑 Owner", callback_data="own:m")])
     if chat is not None:  # always the last row, in groups and in private chat
@@ -1387,7 +1403,10 @@ def help_section_keyboard(key=None, chat=None):
         # Admin section: pause / resume every automatic function of this group (same state as /pause, /resume)
         rows.append([InlineKeyboardButton("⏸ Pause", callback_data="pz:p"),
                      InlineKeyboardButton("▶️ Resume", callback_data="pz:r")])
-    rows.append([InlineKeyboardButton("« Back", callback_data="help:main")])
+    if key == "more":
+        rows.append([InlineKeyboardButton("📥 Download", callback_data="help:dl")])
+    back = "help:more" if key == "dl" else "help:main"
+    rows.append([InlineKeyboardButton("« Back", callback_data=back)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -5495,6 +5514,25 @@ async def stats_callback(update, context):
         if action == "p" and len(parts) == 3:
             page = int(parts[2])
         elif action == "rm" and len(parts) == 4:
+            cid, page = int(parts[2]), int(parts[3])
+            info = _stats_load().get(str(cid))
+            if info is None:
+                toast = "That group is no longer in the list."
+            else:
+                title = info.get("title") if isinstance(info, dict) else info
+                title = html.escape(str(title or cid))
+                await q.answer()
+                try:
+                    await q.edit_message_text(
+                        f"⚠️ Remove the bot from <b>{title}</b>?\n\nThe bot will leave this group.",
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("✅ Yes, remove", callback_data=f"stats:rmy:{cid}:{page}"),
+                            InlineKeyboardButton("❌ Cancel", callback_data=f"stats:p:{page}")]]))
+                except TelegramError:
+                    pass
+                return
+        elif action == "rmy" and len(parts) == 4:
             cid, page = int(parts[2]), int(parts[3])
             if str(cid) in _stats_load():
                 try:

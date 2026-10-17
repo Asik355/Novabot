@@ -1601,10 +1601,35 @@ def plan_ask(query: str, today: date = None) -> AskPlan:
 
 
 _ASK_NORMAL_RULES = (
+    "Talk like the user's warm, close best friend: casual, natural and caring, never robotic or formal. "
+    "Match their language and vibe exactly (Hinglish, Hindi or English). React to their mood first (celebrate good "
+    "news, comfort when they are down, tease lightly when they joke), then help. Keep it short, usually 1-4 lines, "
+    "use a few fitting emojis, and sometimes ask a friendly question back. No lectures, no bullet-point essays, no "
+    "'As an AI'. Give real, honest advice like a friend would. "
     "Answer from your own knowledge. You have NO live web access for this answer. If the question depends on "
-    "current events, recent changes or exact figures you cannot be sure of, say plainly that you cannot verify it "
-    "here and suggest /search. Never guess or invent names, dates, scores, statistics, URLs or sources. Be concise "
-    "and reply in the user's language.")
+    "current events, recent changes or exact figures you cannot be sure of, say so in a friendly way and suggest "
+    "/search. Never guess or invent names, dates, scores, statistics, URLs or sources.")
+
+# Short per-chat, per-user memory of the last few exchanges so the chat feels continuous.
+_FRIEND_MEMORY_TURNS = 6
+_FRIEND_MEMORY_MAX = 500
+_friend_memory = OrderedDict()
+
+
+def _friend_history(chat_id, user_id) -> str:
+    turns = _friend_memory.get((chat_id, user_id))
+    if not turns:
+        return ""
+    return "\n\nRecent conversation (oldest first):\n" + "\n".join(f"User: {u}\nYou: {b}" for u, b in turns)
+
+
+def _friend_remember(chat_id, user_id, query, answer):
+    key = (chat_id, user_id)
+    turns = _friend_memory.pop(key, [])
+    turns.append((query[:300], answer[:300]))
+    _friend_memory[key] = turns[-_FRIEND_MEMORY_TURNS:]
+    while len(_friend_memory) > _FRIEND_MEMORY_MAX:
+        _friend_memory.popitem(last=False)
 
 
 async def ask_engine(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str, prev: str = ""):
@@ -1633,11 +1658,16 @@ async def ask_engine(update: Update, context: ContextTypes.DEFAULT_TYPE, query: 
     if plan.route == "live":
         await _search_flow(msg, plan.intent, "", "ASK")
         return
-    prompt = _ASK_NORMAL_RULES + (f"\n\nYour previous message:\n{prev[:2000]}" if prev else "") + f"\n\nUser: {query}"
+    chat_id, uid = update.effective_chat.id, (user.id if user else 0)
+    prompt = (_ASK_NORMAL_RULES + _friend_history(chat_id, uid)
+              + (f"\n\nYour previous message (the user is replying to it):\n{prev[:2000]}" if prev else "")
+              + f"\n\nUser: {query}")
     try:
         text = await gemini_text(prompt)
         if nsfw_ai_blocked(text, "output"):
             text = NSFW_AI_REFUSAL
+        else:
+            _friend_remember(chat_id, uid, query, text)
         await _send_long(msg, text)
     except AIUnavailable as exc:
         await msg.reply_text(str(exc))
@@ -2351,13 +2381,162 @@ async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 cb_ai_menu = ai_menu_callback  # alias
 
 
+# =============================================================================
+#  /download <link>  (alias /dl): Instagram Reels, YouTube Shorts / videos and other public video links.
+#  /download audio <link> sends only the sound. Needs `yt-dlp` (pip). Optional env: YTDLP_COOKIES=<cookies.txt path>
+#  (helps when Instagram/YouTube block the server's IP). Telegram bots can upload at most 50 MB.
+# =============================================================================
+_DL_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
+_DL_HOSTS = ("instagram.com", "youtube.com", "youtu.be", "tiktok.com", "facebook.com", "fb.watch", "x.com",
+             "twitter.com", "pinterest.com", "reddit.com", "snapchat.com")
+_DL_MAX_BYTES = 49 * 1024 * 1024
+_dl_busy = set()
+
+
+def _dl_extract(url: str, audio: bool, outdir: str):
+    """Blocking yt-dlp download (run in a thread). Returns (file_path, title, uploader)."""
+    import yt_dlp
+    opts = {
+        "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
+        "noplaylist": True, "quiet": True, "no_warnings": True, "socket_timeout": 30,
+        "max_filesize": _DL_MAX_BYTES, "retries": 2, "restrictfilenames": True,
+        "format": ("bestaudio[ext=m4a]/bestaudio/best" if audio
+                   else "best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best"),
+    }
+    # ffmpeg (point 2): system ffmpeg if present, else the one bundled by the imageio-ffmpeg package.
+    import shutil
+    ff = shutil.which("ffmpeg")
+    if not ff:
+        try:
+            import imageio_ffmpeg
+            ff = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ff = ""
+    if ff:
+        opts["ffmpeg_location"] = ff
+        if not audio:  # with ffmpeg, join the best video and audio streams (better quality on Shorts/Reels)
+            opts["format"] = "bv*[height<=720]+ba/b[height<=720]/best[height<=720]/best"
+            opts["merge_output_format"] = "mp4"
+    # cookies (point 3): YTDLP_COOKIES env path, else Render's secret file, else ./cookies.txt next to the bot.
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cookies in ((os.environ.get("YTDLP_COOKIES") or "").strip(), "/etc/secrets/cookies.txt",
+                    os.path.join(here, "cookies.txt")):
+        if cookies and os.path.isfile(cookies):
+            opts["cookiefile"] = cookies
+            break
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if info.get("entries"):
+            info = next(iter(info["entries"]), None) or {}
+        path = ydl.prepare_filename(info) if info else ""
+    if not path or not os.path.isfile(path):
+        for name in os.listdir(outdir):
+            path = os.path.join(outdir, name)
+            break
+    return path, (info.get("title") or "")[:150], (info.get("uploader") or "")[:60]
+
+
+async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/download [audio] <link>: also works as a reply to a message that contains a link."""
+    import shutil
+    import tempfile
+    msg, user = update.effective_message, update.effective_user
+    args = list(context.args or [])
+    cmd = ((msg.text or msg.caption or "").split(None, 1) or [""])[0].lstrip("/").split("@")[0].lower()
+    audio = cmd == "da"  # /da = audio, /dl and /download = video
+    if args and args[0].lower() in ("audio", "mp3", "music"):
+        audio = True
+        args = args[1:]
+    text = " ".join(args)
+    if not text and msg.reply_to_message:
+        text = msg.reply_to_message.text or msg.reply_to_message.caption or ""
+    m = _DL_URL_RE.search(text)
+    if not m:
+        await msg.reply_text("Usage: /download <reel or shorts link>\nFor sound only: /da <link>\n"
+                             "Or reply to a message with a link using /download.")
+        return
+    url = m.group(0).rstrip(".,)")
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if not any(host == h or host.endswith("." + h) for h in _DL_HOSTS):
+        await msg.reply_text("❌ I can only download from Instagram, YouTube, TikTok, Facebook, X and similar video links.")
+        return
+    uid = user.id if user else 0
+    if uid in _dl_busy:
+        await msg.reply_text("⏳ Your previous download is still running. Please wait for it.")
+        return
+    left = _cooldown_left(uid) if user else 0
+    if left:
+        await msg.reply_text(f"Easy there! Try again in {int(left) + 1}s.")
+        return
+    _dl_busy.add(uid)
+    status = await msg.reply_text("⏳ Downloading… please wait.")
+    outdir = tempfile.mkdtemp(prefix="dl_")
+    try:
+        try:
+            import yt_dlp  # noqa: F401
+        except ImportError:
+            await status.edit_text("❌ Downloads aren't set up yet (the owner needs to install yt-dlp).")
+            return
+        try:
+            await context.bot.send_chat_action(
+                update.effective_chat.id, ChatAction.UPLOAD_VOICE if audio else ChatAction.UPLOAD_VIDEO)
+        except TelegramError:
+            pass
+        try:
+            path, title, uploader = await asyncio.wait_for(
+                asyncio.to_thread(_dl_extract, url, audio, outdir), timeout=180)
+        except asyncio.TimeoutError:
+            await status.edit_text("❌ The download took too long. Try again later.")
+            return
+        except Exception as exc:
+            low = str(exc).lower()
+            log.warning("download failed: %s", str(exc)[:300])
+            if "larger than max" in low or "max-filesize" in low or "file is larger" in low:
+                why = "That video is too big for Telegram (limit 50 MB)."
+            elif "private" in low or "login" in low or "log in" in low or "sign in" in low or "cookies" in low:
+                why = "That video is private, age-restricted or needs a login, so I can't download it."
+            elif "unsupported url" in low:
+                why = "I couldn't find a video at that link."
+            else:
+                why = "I couldn't download that video. Check the link and try again."
+            await status.edit_text("❌ " + why)
+            return
+        if not path or not os.path.isfile(path):
+            await status.edit_text("❌ I couldn't download that video. Check the link and try again.")
+            return
+        if os.path.getsize(path) > _DL_MAX_BYTES + 1024 * 1024:
+            await status.edit_text("❌ That video is too big for Telegram (limit 50 MB).")
+            return
+        caption = html.escape(title) + (f"\n👤 {html.escape(uploader)}" if uploader else "")
+        with open(path, "rb") as fh:
+            if audio:
+                await msg.reply_audio(fh, caption=caption[:1000], title=title or None, parse_mode="HTML",
+                                      read_timeout=120, write_timeout=120)
+            else:
+                await msg.reply_video(fh, caption=caption[:1000], parse_mode="HTML", supports_streaming=True,
+                                      read_timeout=120, write_timeout=120)
+        try:
+            await status.delete()
+        except TelegramError:
+            pass
+    except TelegramError as exc:
+        log.warning("download: Telegram error: %s", exc)
+        try:
+            await status.edit_text("❌ I couldn't send that file to Telegram.")
+        except TelegramError:
+            pass
+    finally:
+        _dl_busy.discard(uid)
+        shutil.rmtree(outdir, ignore_errors=True)
+
+
 def register_ai(app):
     """Wire up all AI commands, the menu buttons and the reply-to-bot chat."""
     handlers = {
         "ask": ask_command, "imagine": imagine_command, "search": search_command,
         "translate": translate_command, "joke": joke_command, "quote": quote_command,
         "fact": fact_command, "roll": roll_command, "flip": flip_command, "say": say_command,
-        "ai": ai_command,
+        "ai": ai_command, "download": download_command, "dl": download_command, "da": download_command,
     }
     for name, fn in handlers.items():
         app.add_handler(CommandHandler(name, fn))
