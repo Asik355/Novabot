@@ -106,6 +106,7 @@ except ModuleNotFoundError:  # the file was saved as extras.py: accept it instea
     import extras as extra
     sys.modules["extra"] = extra
 import fun_systems  # roast + court entertainment (wired up in main())
+import importexport  # /export /import /reset + the Import & Export page (wired up in main())
 import msgcount  # message count / leaderboard / milestones (wired up in main())
 import migrate_to_mongo as store  # the MongoDB data layer (the only file that talks to the database)
 from extra import (  # pure helpers (no bot state): see extra.py
@@ -1176,8 +1177,8 @@ HELP_SECTIONS = {
     ),
     # the ➕ More button (row under Count / AI Commands / Blocking); not in HELP_ORDER, opened by help:more
     "more": (
-        "➕ More",
-        "<b>➕ More</b>\n\nTap a button below.",
+        "📄 Page 2",
+        "<b>📄 Page 2</b>\n\nTap a button below.",
     ),
     "dl": (  # opened from the ➕ More page (help:dl)
         "📥 Download",
@@ -1185,6 +1186,32 @@ HELP_SECTIONS = {
         "• /download &lt;link&gt; (or /dl): download an Instagram Reel or other public video (YouTube links are not supported).\n"
         "• /da &lt;link&gt;: download only the audio.\n\n"
         "You can also reply to a message that has a link with /dl or /da.",
+    ),
+    "ie": (  # opened from Page 2 (help:ie)
+        "📦 Import & Export",
+        "<b>Import/Export</b>\n\n"
+        "Some people just want to see the world burn. Others, just want to have a way of grouping their chat data in one "
+        "place so they can export their configuration to other chats!\n\n"
+        "This bot allows you to import/export settings for chat, so you can quickly set up other chats using a "
+        "preexisting template. Instead of setting the same settings over and over again in different chats, you can use "
+        "this feature to copy the general configuration across groups.\n"
+        "The generated file is in standard JSON format, so if there are any settings you don't want to import to your "
+        "other chats, just open the file and edit it before importing.\n"
+        "Exporting settings can be done by any administrator, but for security reasons, importing can only be done by "
+        "the group creator.\n\n"
+        "The following modules will have their data exported:\n"
+        "- admin\n- antiflood\n- blocklists\n- clean_command\n- clean_service\n- disabled\n- federations\n"
+        "- filters\n- greetings\n- locks\n- notes\n- pins\n- raids\n- reports\n- rules\n- translations\n- warns\n\n"
+        "<b>Chat owner commands:</b>\n"
+        "- /export: Generate a file containing all your chat data.\n"
+        "- /import: Import the settings in the replied to data file.\n"
+        "- /reset: Reset all the chat settings. This means removing all settings; federation, blocklist, filters, notes, "
+        "greetings, etc.\n\n"
+        "<b>Examples:</b>\n"
+        "- To export only specific categories, use:\n-&gt; <code>/export notes filters</code>\n\n"
+        "- Or, to import only specific categories from a file, use:\n-&gt; <code>/import rules greetings</code>\n\n"
+        "<b>Note:</b> To avoid abuse, this command is heavily rate limited; this is to make sure that people "
+        "importing/exporting data don't slow down the bot.",
     ),
 }
 HELP_ORDER = ["mod", "warn", "flood", "captcha", "greet", "rules", "notes", "locks", "purge", "log", "reports", "approval", "disabling", "groupedit", "botedit", "other", "info", "extras", "roast", "court", "birthday"]
@@ -1415,7 +1442,7 @@ def help_main_keyboard(chat=None, user_id=None):
     
     fun_row = list(fun_systems.fun_help_row())  # 🎉 Fun, 🗑 Delete, placeholder -> the placeholder becomes ➕ More
     if len(fun_row) >= 3:
-        fun_row[2] = InlineKeyboardButton("➕ More", callback_data="help:more")
+        fun_row[2] = InlineKeyboardButton("📄 Page 2", callback_data="help:more")
     rows.append(fun_row)  # 🎉 Fun + two placeholders: its own row under Count / AI Commands / Blocking
     if user_id in OWNER_IDS:  # 👑 Owner: its own row, just above the Suggestion Bar, shown to the Bot Owner only
         rows.append([InlineKeyboardButton("👑 Owner", callback_data="own:m")])
@@ -1431,10 +1458,14 @@ def help_section_keyboard(key=None, chat=None):
         rows.append([InlineKeyboardButton("⏸ Pause", callback_data="pz:p"),
                      InlineKeyboardButton("▶️ Resume", callback_data="pz:r")])
     if key == "more":
-        rows.append([InlineKeyboardButton("📥 Download", callback_data="help:dl")])
+        rows.append([InlineKeyboardButton("📥 Download", callback_data="help:dl"),
+                     InlineKeyboardButton("📦 Import & Export", callback_data="help:ie")])
+    if key == "ie":  # Import and Export side by side on ONE row
+        rows.append([InlineKeyboardButton("📥 Import", callback_data="ie:imp"),
+                     InlineKeyboardButton("📤 Export", callback_data="ie:exp")])
     if key == "approval" and chat is not None and chat.type != "private":
         rows.append([InlineKeyboardButton("⚙️ Auto Approve", callback_data="jn:m")])
-    back = "help:more" if key == "dl" else "help:main"
+    back = "help:more" if key in ("dl", "ie") else "help:main"
     rows.append([InlineKeyboardButton("« Back", callback_data=back)])
     return InlineKeyboardMarkup(rows)
 
@@ -6012,6 +6043,7 @@ def main():
         log_action=log_action, MUTED=MUTED, is_super_admin=is_super_admin, owner_ids=OWNER_IDS,
         is_paused=is_paused, is_bot_owner=is_bot_owner, get_setting=store.get_setting, set_setting=store.set_setting,
         block_words=store.block_words))  # the Blocklist is the shared word source for NSFW Word
+    importexport.register(app, SimpleNamespace(is_admin=is_admin, is_bot_owner=is_bot_owner))  # /export /import /reset
     msgcount.register(app, owner_ids=OWNER_IDS, groups_source=_stats_refresh)  # /rank /top /today /week /overall /me /radmin /resetrank + counter + 📊 menu
     app.add_handler(CallbackQueryHandler(captcha_callback, pattern=r"^cap:"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:"))
