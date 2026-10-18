@@ -1182,7 +1182,7 @@ HELP_SECTIONS = {
     "dl": (  # opened from the ➕ More page (help:dl)
         "📥 Download",
         "<b>📥 Download</b>\n\n"
-        "• /download &lt;link&gt; (or /dl): download a Reel, YouTube Short or other public video.\n"
+        "• /download &lt;link&gt; (or /dl): download an Instagram Reel or other public video (YouTube links are not supported).\n"
         "• /da &lt;link&gt;: download only the audio.\n\n"
         "You can also reply to a message that has a link with /dl or /da.",
     ),
@@ -1230,7 +1230,7 @@ ESSENTIAL_COMMANDS = [
     ("search", "AI web search summary"),
     ("translate", "Translate to Hindi and English"),
     ("imagine", "Generate an AI image"),
-    ("download", "Download a reel or shorts video"),
+    ("download", "Download an Instagram reel or video"),
     ("quote", "Get a motivational quote"),
     ("fact", "Get an interesting fact"),
     ("roll", "Roll a dice"),

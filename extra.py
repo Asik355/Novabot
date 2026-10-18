@@ -2382,47 +2382,17 @@ cb_ai_menu = ai_menu_callback  # alias
 
 
 # =============================================================================
-#  /download <link>  (alias /dl): Instagram Reels, YouTube Shorts / videos and other public video links.
+#  /download <link>  (alias /dl): Instagram Reels and other public video links. YouTube is NOT supported: it blocks
+#  data-centre IPs such as Render's, so those links are refused with a clear message.
 #  /download audio <link> sends only the sound. Needs `yt-dlp` (pip). Optional env: YTDLP_COOKIES=<cookies.txt path>
-#  (helps when Instagram/YouTube block the server's IP). Telegram bots can upload at most 50 MB.
+#  (a cookies file for a site that asks for a login). Telegram bots can upload at most 50 MB.
 # =============================================================================
 _DL_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
-_DL_HOSTS = ("instagram.com", "youtube.com", "youtu.be", "tiktok.com", "facebook.com", "fb.watch", "x.com",
+_DL_BLOCKED_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+_DL_HOSTS = ("instagram.com", "tiktok.com", "facebook.com", "fb.watch", "x.com",
              "twitter.com", "pinterest.com", "reddit.com", "snapchat.com")
 _DL_MAX_BYTES = 49 * 1024 * 1024
 _dl_busy = set()
-
-
-# YouTube's real "are you a bot" replies. (yt-dlp's generic "Confirm you are on the latest version" is NOT one.)
-_DL_BOT_RE = re.compile(r"not a bot|confirm you.{0,6}re not|http error 429|too many requests")
-_DL_NO_PLAYER_RE = re.compile(r"failed to extract any player response|unable to extract (?:yt initial|player)")
-
-
-def _dl_diag() -> str:
-    """One log line: yt-dlp / yt-dlp-ejs versions and which JavaScript runtime and ffmpeg the server has."""
-    import shutil
-    import subprocess
-    parts = []
-    try:
-        from importlib import metadata as _md
-        for pkg in ("yt-dlp", "yt-dlp-ejs", "curl-cffi"):
-            try:
-                parts.append(f"{pkg} {_md.version(pkg)}")
-            except Exception:
-                parts.append(f"{pkg} missing")
-    except Exception:
-        pass
-    for rt in ("deno", "node"):
-        exe = shutil.which(rt)
-        ver = ""
-        if exe:
-            try:
-                ver = " " + subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=5).stdout.strip()[:30]
-            except Exception:
-                pass
-        parts.append(f"{rt}={'none' if not exe else 'found' + ver}")
-    parts.append("ffmpeg=" + ("found" if (shutil.which("ffmpeg") or "") else "bundled/none"))
-    return ", ".join(parts)
 
 
 def _dl_prepare_cookies(src: str, outdir: str) -> str:
@@ -2453,7 +2423,7 @@ def _dl_extract(url: str, audio: bool, outdir: str):
     import yt_dlp
     opts = {
         "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
-        "noplaylist": True, "quiet": True, "no_warnings": False, "socket_timeout": 30,
+        "noplaylist": True, "quiet": True, "no_warnings": True, "socket_timeout": 30,
         "max_filesize": _DL_MAX_BYTES, "retries": 2, "restrictfilenames": True,
         "format": ("bestaudio[ext=m4a]/bestaudio/best" if audio
                    else "best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best"),
@@ -2472,9 +2442,6 @@ def _dl_extract(url: str, audio: bool, outdir: str):
         if not audio:  # with ffmpeg, join the best video and audio streams (better quality on Shorts/Reels)
             opts["format"] = "bv*[height<=720]+ba/b[height<=720]/best[height<=720]/best"
             opts["merge_output_format"] = "mp4"
-    # YouTube needs a JavaScript runtime (node or deno) for its signature challenge; use whichever is installed.
-    opts["js_runtimes"] = {"deno": {}, "node": {}}
-    opts["remote_components"] = ["ejs:github"]  # fetch the challenge solver if the yt-dlp-ejs package is missing
     # cookies (point 3): YTDLP_COOKIES env path, else Render's secret file, else ./cookies.txt next to the bot.
     here = os.path.dirname(os.path.abspath(__file__))
     for cookies in ((os.environ.get("YTDLP_COOKIES") or "").strip(), "/etc/secrets/cookies.txt",
@@ -2482,43 +2449,12 @@ def _dl_extract(url: str, audio: bool, outdir: str):
         if cookies and os.path.isfile(cookies):
             opts["cookiefile"] = _dl_prepare_cookies(cookies, outdir)
             break
-    log.info("download: %s", ("using a cookies file (" + str(len(open(opts["cookiefile"], encoding="utf-8", errors="ignore").read().splitlines())) + " lines)") if opts.get("cookiefile")
-             else "no cookies file found (YTDLP_COOKIES, /etc/secrets/cookies.txt, ./cookies.txt)")
-
-    log.info("download: %s", _dl_diag())
-
-    def _run(o):
-        with yt_dlp.YoutubeDL(o) as ydl:
-            inf = ydl.extract_info(url, download=True)
-            if inf.get("entries"):
-                inf = next(iter(inf["entries"]), None) or {}
-            return inf, (ydl.prepare_filename(inf) if inf else "")
-
-    try:
-        info, path = _run(opts)
-    except Exception as exc:
-        low = str(exc).lower()
-        if "youtu" not in url.lower() or not (_DL_BOT_RE.search(low) or _DL_NO_PLAYER_RE.search(low)):
-            raise
-        # YouTube refused or could not be read: retry with other player clients, then once more without the cookies file
-        log.warning("download: YouTube extraction failed, retrying with other player clients")
-        alt = {"youtube": {"player_client": ["default", "tv", "mweb", "web_safari", "android_vr"]}}
-        tries = [("other player clients", dict(opts, extractor_args=alt))]
-        if opts.get("cookiefile"):
-            no_ck = dict(opts, extractor_args=alt)
-            no_ck.pop("cookiefile", None)
-            tries.append(("other player clients, no cookies file", no_ck))
-        last = exc
-        for label, o in tries:
-            try:
-                info, path = _run(o)
-                log.info("download: retry worked (%s)", label)
-                break
-            except Exception as exc2:
-                last = exc2
-                log.warning("download: retry failed (%s): %s", label, str(exc2)[:300])
-        else:
-            raise last
+    log.info("download: %s", "using a cookies file" if opts.get("cookiefile") else "no cookies file")
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if info.get("entries"):
+            info = next(iter(info["entries"]), None) or {}
+        path = ydl.prepare_filename(info) if info else ""
     if not path or not os.path.isfile(path):
         for name in os.listdir(outdir):
             path = os.path.join(outdir, name)
@@ -2542,13 +2478,17 @@ async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = msg.reply_to_message.text or msg.reply_to_message.caption or ""
     m = _DL_URL_RE.search(text)
     if not m:
-        await msg.reply_text("Usage: /download <reel or shorts link>\nFor sound only: /da <link>\n"
+        await msg.reply_text("Usage: /download <Instagram reel or video link>\nFor sound only: /da <link>\n"
                              "Or reply to a message with a link using /download.")
         return
     url = m.group(0).rstrip(".,)")
     host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if any(host == h or host.endswith("." + h) for h in _DL_BLOCKED_HOSTS):
+        await msg.reply_text("❌ YouTube links aren't supported (YouTube blocks this bot's server). "
+                             "Instagram, TikTok, Facebook, X and similar links work.")
+        return
     if not any(host == h or host.endswith("." + h) for h in _DL_HOSTS):
-        await msg.reply_text("❌ I can only download from Instagram, YouTube, TikTok, Facebook, X and similar video links.")
+        await msg.reply_text("❌ I can only download from Instagram, TikTok, Facebook, X and similar video links.")
         return
     uid = user.id if user else 0
     if uid in _dl_busy:
@@ -2574,7 +2514,7 @@ async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         try:
             path, title, uploader = await asyncio.wait_for(
-                asyncio.to_thread(_dl_extract, url, audio, outdir), timeout=240)
+                asyncio.to_thread(_dl_extract, url, audio, outdir), timeout=180)
         except asyncio.TimeoutError:
             await status.edit_text("❌ The download took too long. Try again later.")
             return
@@ -2583,12 +2523,8 @@ async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.warning("download failed (%s): %s", url, str(exc)[:600])
             if "larger than max" in low or "max-filesize" in low or "file is larger" in low:
                 why = "That video is too big for Telegram (limit 50 MB)."
-            elif _DL_BOT_RE.search(low):
-                why = ("YouTube is blocking my server right now (it thinks the server is a bot). "
-                       "The bot owner needs to add a YouTube cookies file. Instagram or other links may still work.")
-            elif _DL_NO_PLAYER_RE.search(low) or "javascript runtime" in low or "requested format is not available" in low or "nsig" in low:
-                why = ("YouTube downloads aren't working on this server right now (YouTube changed something). "
-                       "Please try again later. Instagram and other links may still work.")
+            elif "http error 429" in low or "too many requests" in low:
+                why = "That site is limiting my server right now. Please try again later."
             elif "private" in low or "login" in low or "log in" in low or "sign in" in low or "cookies" in low:
                 why = "That video is private, age-restricted or needs a login, so I can't download it."
             elif "unsupported url" in low:
