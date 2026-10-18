@@ -5816,7 +5816,7 @@ async def joinoff_cmd(update, context):
 
 
 async def raid_new_members(update, context):
-    """group=-5, before the captcha/welcome handler: counts joins, switches antiraid on by itself, and bans
+    """group=-9, before the captcha/welcome handler: counts joins, switches antiraid on by itself, and bans
     new members while antiraid is active. Never touches bots or admins."""
     chat, msg = update.effective_chat, update.effective_message
     people = [u for u in (msg.new_chat_members or []) if not u.is_bot]
@@ -6051,7 +6051,7 @@ def main():
         & (filters.ChatType.PRIVATE | filters.ChatType.GROUPS),
         edit_input,
     ), group=-1)
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, raid_new_members), group=-5)
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, raid_new_members), group=-9)  # -9: a group of its own (-8..-6 are the blocking guards)
     app.add_handler(ChatJoinRequestHandler(on_join_request))
     app.add_handler(CallbackQueryHandler(join_callback, pattern=r"^jn:"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))

@@ -2417,6 +2417,9 @@ def _dl_extract(url: str, audio: bool, outdir: str):
         if not audio:  # with ffmpeg, join the best video and audio streams (better quality on Shorts/Reels)
             opts["format"] = "bv*[height<=720]+ba/b[height<=720]/best[height<=720]/best"
             opts["merge_output_format"] = "mp4"
+    # YouTube needs a JavaScript runtime (node or deno) for its signature challenge; use whichever is installed.
+    opts["js_runtimes"] = {"deno": {}, "node": {}}
+    opts["remote_components"] = ["ejs:github"]  # fetch the challenge solver if the yt-dlp-ejs package is missing
     # cookies (point 3): YTDLP_COOKIES env path, else Render's secret file, else ./cookies.txt next to the bot.
     here = os.path.dirname(os.path.abspath(__file__))
     for cookies in ((os.environ.get("YTDLP_COOKIES") or "").strip(), "/etc/secrets/cookies.txt",
@@ -2490,9 +2493,14 @@ async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         except Exception as exc:
             low = str(exc).lower()
-            log.warning("download failed: %s", str(exc)[:300])
+            log.warning("download failed (%s): %s", url, str(exc)[:600])
             if "larger than max" in low or "max-filesize" in low or "file is larger" in low:
                 why = "That video is too big for Telegram (limit 50 MB)."
+            elif "not a bot" in low or "confirm you" in low or "429" in low or "too many requests" in low:
+                why = ("YouTube is blocking my server right now (it thinks the server is a bot). "
+                       "The bot owner needs to add a YouTube cookies file. Instagram or other links may still work.")
+            elif "javascript runtime" in low or "requested format is not available" in low or "nsig" in low:
+                why = "YouTube changed something and I can't read this video yet. The bot owner should update yt-dlp."
             elif "private" in low or "login" in low or "log in" in low or "sign in" in low or "cookies" in low:
                 why = "That video is private, age-restricted or needs a login, so I can't download it."
             elif "unsupported url" in low:
@@ -3211,6 +3219,95 @@ def is_authorized_promotion(chat_id, url):
 
 
 # ------------------------------------------------------------ the guard (one active enforcement path)
+# ------------------------------------------------------------ repeated promotion (RAM only, no AI, no database)
+# Only promotional-LOOKING messages (verdict "ambiguous": one promotional phrase, or a bare invite/referral link)
+# are counted, so ordinary repeated chat is never touched. The same / nearly the same promotional message, or the
+# same invite/referral link, BL_REPEAT_COUNT times inside BL_REPEAT_WINDOW seconds from one sender = promotion.
+BL_REPEAT_ENABLED = os.environ.get("BLOCKING_REPEAT", "1").strip().lower() not in ("0", "false", "no", "off")
+BL_REPEAT_WINDOW = 600        # seconds
+BL_REPEAT_COUNT = 3           # copies (the new one included) that make it repeated promotion
+BL_REPEAT_SIMILARITY = 0.8    # share of the same words that makes two texts "the same advertisement"
+BL_REPEAT_MIN_TOKENS = 4      # shorter texts are only compared by their invite/referral links
+BL_REPEAT_KEEP = 6            # remembered messages per sender
+BL_REPEAT_MAX_SENDERS = 20000
+_REPEAT_WORD_RE = re.compile(r"[^\W_]{2,}")
+_bl_repeat = OrderedDict()    # (chat_id, user_id) -> [(time, words, links), ...]
+
+
+def _promo_fingerprint(text):
+    """Normalised words of a message (case, accents, hidden characters, links and emoji ignored)."""
+    t = unicodedata.normalize("NFKC", text or "").lower()
+    t = _INVISIBLE_RE.sub("", t)
+    t = _AD_URL_RE.sub(" ", t)  # links are compared on their own
+    return frozenset(_REPEAT_WORD_RE.findall(t))
+
+
+def _repeat_promo(chat_id, user_id, ctx):
+    """'repeated promotion' when this sender keeps posting the same promotional-looking message in THIS group,
+    else None. Never raises (a failure just means 'not repeated')."""
+    if not BL_REPEAT_ENABLED:
+        return None
+    try:
+        now = time.time()
+        words = _promo_fingerprint(ctx.get("text"))
+        links = frozenset(_promo_key(u) for u in ctx.get("urls", ()) if _is_promo_link(u))
+        if len(words) < BL_REPEAT_MIN_TOKENS and not links:
+            return None  # too little to compare
+        key = (chat_id, user_id)
+        hist = [e for e in _bl_repeat.pop(key, ()) if now - e[0] < BL_REPEAT_WINDOW]
+        same = 0
+        for _, old_words, old_links in hist:
+            if links and old_links and (links & old_links):
+                same += 1
+            elif (len(words) >= BL_REPEAT_MIN_TOKENS and len(old_words) >= BL_REPEAT_MIN_TOKENS
+                  and len(words & old_words) / len(words | old_words) >= BL_REPEAT_SIMILARITY):
+                same += 1
+        if same + 1 >= BL_REPEAT_COUNT:
+            return "repeated promotion"  # the sender's history is dropped: the counter starts again
+        hist.append((now, words, links))
+        _bl_repeat[key] = hist[-BL_REPEAT_KEEP:]
+        while len(_bl_repeat) > BL_REPEAT_MAX_SENDERS:
+            _bl_repeat.popitem(last=False)
+    except Exception:
+        log.exception("Blocking: repeated-promotion check failed in chat %s", chat_id)
+    return None
+
+
+# ------------------------------------------------------------ repeat offenders: stronger action each time
+# Every removed ad/promotion is a strike for that sender in that group (kept in MongoDB, so it survives a restart
+# and a mute that an admin lifts to give a second chance). The punishment itself stays the group's /adpunish every
+# time (no ban); the notice just says "repeat offence #N". Strikes older than 30 days are forgotten.
+BL_STRIKE_BAN_AT = int(os.environ.get("BLOCKING_STRIKE_BAN_AT", "3") or 3)
+BL_STRIKE_RESET = 30 * 86400
+BL_STRIKE_MIN_MUTE = 86400
+
+
+def _bl_add_strike(chat_id, user_id) -> int:
+    """Count one more removed ad for this sender; returns how many (1 = first time)."""
+    key = f"ad_strikes_{user_id}"
+    try:
+        count, last = 0, 0
+        raw = str(_BD.get_setting(chat_id, key, "") or "")
+        if "," in raw:
+            c, t = raw.split(",", 1)
+            count, last = int(c), int(t)
+        now = int(time.time())
+        if now - last > BL_STRIKE_RESET:
+            count = 0
+        count += 1
+        _BD.set_setting(chat_id, key, f"{count},{now}")
+        return count
+    except Exception:
+        log.exception("Blocking: couldn't update the strike count for user %s in chat %s", user_id, chat_id)
+        return 1
+
+
+def _bl_escalate(action, secs, strikes):
+    """(action, mute_secs) after applying the strike rules. Escalation is OFF: the group's own /adpunish
+    (default: mute 30 minutes in new groups) applies every time; the strike count is only shown in the notice."""
+    return action, secs
+
+
 def bl_punishment(chat_id):
     """(action, mute_secs) for this group. Falls back to the original 24-hour mute on any bad/missing value."""
     action, secs = "mute", AUTOADS_MUTE_SECS
@@ -3278,13 +3375,20 @@ async def ads_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await _BD.lock_exempt(chat, msg, user, context.bot.id):
             return
         exempt_checked = True
-        label = await ai_classify(chat.id, ctx, image=image, bot=context.bot, user_id=user.id)
-        log.info("Blocking: chat=%s kind=%s local=%s image=%s (%s) ai=%s", chat.id, kind_name, verdict, bool(image), image_why, label)
-        if label not in ("PROMOTION", "ADVERTISEMENT"):
-            return  # NORMAL, or no decision (Gemini unavailable): allow
-        urls = []
-        reasons = ["advertisement in image (AI-confirmed)" if image else
-                   "advertisement (AI-confirmed)" if is_media else "promotion (AI-confirmed)"]
+        # Repeated promotion needs no AI: the same promotional-looking message / invite link posted again and again.
+        repeat_reason = _repeat_promo(chat.id, user.id, ctx) if verdict == "ambiguous" else None
+        if repeat_reason:
+            log.info("Blocking: chat=%s kind=%s repeated promotion by user %s (no AI needed)", chat.id, kind_name, user.id)
+            urls = []
+            reasons = [repeat_reason]
+        else:
+            label = await ai_classify(chat.id, ctx, image=image, bot=context.bot, user_id=user.id)
+            log.info("Blocking: chat=%s kind=%s local=%s image=%s (%s) ai=%s", chat.id, kind_name, verdict, bool(image), image_why, label)
+            if label not in ("PROMOTION", "ADVERTISEMENT"):
+                return  # NORMAL, or no decision (Gemini unavailable): allow
+            urls = []
+            reasons = ["advertisement in image (AI-confirmed)" if image else
+                       "advertisement (AI-confirmed)" if is_media else "promotion (AI-confirmed)"]
     elif authorized:
         reasons = []
         urls = [u for u in urls if not is_authorized_promotion(chat.id, u)]
@@ -3306,7 +3410,9 @@ async def ads_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     reason = ", ".join(reasons)
     action, mute_secs = bl_punishment(chat.id)
-    log.info("Blocking: chat=%s kind=%s action=delete+%s reason=%s", chat.id, kind_name, action, reason)
+    strikes = _bl_add_strike(chat.id, user.id) if msg.sender_chat is None else 1
+    action, mute_secs = _bl_escalate(action, mute_secs, strikes)
+    log.info("Blocking: chat=%s kind=%s action=delete+%s strikes=%s reason=%s", chat.id, kind_name, action, strikes, reason)
     deleted = False
     try:
         await msg.delete()
@@ -3329,6 +3435,8 @@ async def ads_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mention = user.mention_html() if msg.sender_chat is None else html.escape(getattr(msg.sender_chat, "title", None) or "that channel")
     if deleted:
         why = f"{'Advertisement with media' if is_media else 'Promotional text'} ({reason})"
+        if strikes > 1:
+            why += f" - repeat offence #{strikes}"
         if muted:
             label, punish = ACTION_LABEL[action], punishment_text(action, mute_secs if action == "mute" else None)
         elif action == "delete":

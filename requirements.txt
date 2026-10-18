@@ -16,5 +16,9 @@ certifi>=2024.2.2
 gTTS>=2.5,<3.0
 
 # /download, /dl, /da (reels, shorts, audio)
-yt-dlp>=2024.8.6
+yt-dlp[default]>=2025.11.12
 imageio-ffmpeg>=0.5.1
+
+# Local picture check for NSFW Content protection (extra.py imports PIL; without it photos are never sent to the AI
+# unless the caption/file name/spoiler already looks suspicious)
+Pillow>=10.0,<13.0
