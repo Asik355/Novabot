@@ -2393,6 +2393,38 @@ _DL_MAX_BYTES = 49 * 1024 * 1024
 _dl_busy = set()
 
 
+# YouTube's real "are you a bot" replies. (yt-dlp's generic "Confirm you are on the latest version" is NOT one.)
+_DL_BOT_RE = re.compile(r"not a bot|confirm you.{0,6}re not|http error 429|too many requests")
+_DL_NO_PLAYER_RE = re.compile(r"failed to extract any player response|unable to extract (?:yt initial|player)")
+
+
+def _dl_diag() -> str:
+    """One log line: yt-dlp / yt-dlp-ejs versions and which JavaScript runtime and ffmpeg the server has."""
+    import shutil
+    import subprocess
+    parts = []
+    try:
+        from importlib import metadata as _md
+        for pkg in ("yt-dlp", "yt-dlp-ejs", "curl-cffi"):
+            try:
+                parts.append(f"{pkg} {_md.version(pkg)}")
+            except Exception:
+                parts.append(f"{pkg} missing")
+    except Exception:
+        pass
+    for rt in ("deno", "node"):
+        exe = shutil.which(rt)
+        ver = ""
+        if exe:
+            try:
+                ver = " " + subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=5).stdout.strip()[:30]
+            except Exception:
+                pass
+        parts.append(f"{rt}={'none' if not exe else 'found' + ver}")
+    parts.append("ffmpeg=" + ("found" if (shutil.which("ffmpeg") or "") else "bundled/none"))
+    return ", ".join(parts)
+
+
 def _dl_prepare_cookies(src: str, outdir: str) -> str:
     """Return a writable temp copy of the cookies file (Render's /etc/secrets is read-only, and yt-dlp wants to
     save the jar). Cookie lines whose tabs became spaces (e.g. pasted through a chat app) are repaired."""
@@ -2421,7 +2453,7 @@ def _dl_extract(url: str, audio: bool, outdir: str):
     import yt_dlp
     opts = {
         "outtmpl": os.path.join(outdir, "%(id)s.%(ext)s"),
-        "noplaylist": True, "quiet": True, "no_warnings": True, "socket_timeout": 30,
+        "noplaylist": True, "quiet": True, "no_warnings": False, "socket_timeout": 30,
         "max_filesize": _DL_MAX_BYTES, "retries": 2, "restrictfilenames": True,
         "format": ("bestaudio[ext=m4a]/bestaudio/best" if audio
                    else "best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best"),
@@ -2453,6 +2485,8 @@ def _dl_extract(url: str, audio: bool, outdir: str):
     log.info("download: %s", ("using a cookies file (" + str(len(open(opts["cookiefile"], encoding="utf-8", errors="ignore").read().splitlines())) + " lines)") if opts.get("cookiefile")
              else "no cookies file found (YTDLP_COOKIES, /etc/secrets/cookies.txt, ./cookies.txt)")
 
+    log.info("download: %s", _dl_diag())
+
     def _run(o):
         with yt_dlp.YoutubeDL(o) as ydl:
             inf = ydl.extract_info(url, download=True)
@@ -2464,11 +2498,27 @@ def _dl_extract(url: str, audio: bool, outdir: str):
         info, path = _run(opts)
     except Exception as exc:
         low = str(exc).lower()
-        if "youtu" not in url.lower() or not ("not a bot" in low or "confirm you" in low or "sign in" in low):
+        if "youtu" not in url.lower() or not (_DL_BOT_RE.search(low) or _DL_NO_PLAYER_RE.search(low)):
             raise
-        # YouTube's "are you a bot" check: retry once with other YouTube player clients (some pass without a login)
-        log.warning("download: YouTube bot check, retrying with other player clients")
-        info, path = _run(dict(opts, extractor_args={"youtube": {"player_client": ["tv", "mweb", "android_vr", "web_safari"]}}))
+        # YouTube refused or could not be read: retry with other player clients, then once more without the cookies file
+        log.warning("download: YouTube extraction failed, retrying with other player clients")
+        alt = {"youtube": {"player_client": ["default", "tv", "mweb", "web_safari", "android_vr"]}}
+        tries = [("other player clients", dict(opts, extractor_args=alt))]
+        if opts.get("cookiefile"):
+            no_ck = dict(opts, extractor_args=alt)
+            no_ck.pop("cookiefile", None)
+            tries.append(("other player clients, no cookies file", no_ck))
+        last = exc
+        for label, o in tries:
+            try:
+                info, path = _run(o)
+                log.info("download: retry worked (%s)", label)
+                break
+            except Exception as exc2:
+                last = exc2
+                log.warning("download: retry failed (%s): %s", label, str(exc2)[:300])
+        else:
+            raise last
     if not path or not os.path.isfile(path):
         for name in os.listdir(outdir):
             path = os.path.join(outdir, name)
@@ -2524,7 +2574,7 @@ async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         try:
             path, title, uploader = await asyncio.wait_for(
-                asyncio.to_thread(_dl_extract, url, audio, outdir), timeout=180)
+                asyncio.to_thread(_dl_extract, url, audio, outdir), timeout=240)
         except asyncio.TimeoutError:
             await status.edit_text("❌ The download took too long. Try again later.")
             return
@@ -2533,11 +2583,12 @@ async def download_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.warning("download failed (%s): %s", url, str(exc)[:600])
             if "larger than max" in low or "max-filesize" in low or "file is larger" in low:
                 why = "That video is too big for Telegram (limit 50 MB)."
-            elif "not a bot" in low or "confirm you" in low or "429" in low or "too many requests" in low:
+            elif _DL_BOT_RE.search(low):
                 why = ("YouTube is blocking my server right now (it thinks the server is a bot). "
                        "The bot owner needs to add a YouTube cookies file. Instagram or other links may still work.")
-            elif "javascript runtime" in low or "requested format is not available" in low or "nsig" in low:
-                why = "YouTube changed something and I can't read this video yet. The bot owner should update yt-dlp."
+            elif _DL_NO_PLAYER_RE.search(low) or "javascript runtime" in low or "requested format is not available" in low or "nsig" in low:
+                why = ("YouTube downloads aren't working on this server right now (YouTube changed something). "
+                       "Please try again later. Instagram and other links may still work.")
             elif "private" in low or "login" in low or "log in" in low or "sign in" in low or "cookies" in low:
                 why = "That video is private, age-restricted or needs a login, so I can't download it."
             elif "unsupported url" in low:
