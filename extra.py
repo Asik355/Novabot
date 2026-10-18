@@ -2393,6 +2393,29 @@ _DL_MAX_BYTES = 49 * 1024 * 1024
 _dl_busy = set()
 
 
+def _dl_prepare_cookies(src: str, outdir: str) -> str:
+    """Return a writable temp copy of the cookies file (Render's /etc/secrets is read-only, and yt-dlp wants to
+    save the jar). Cookie lines whose tabs became spaces (e.g. pasted through a chat app) are repaired."""
+    try:
+        with open(src, encoding="utf-8", errors="ignore") as fh:
+            raw = fh.read()
+        out = []
+        for ln in raw.replace("\r\n", "\n").split("\n"):
+            is_comment = ln.lstrip().startswith("#") and not ln.startswith("#HttpOnly_")
+            if ln.strip() and not is_comment and "\t" not in ln:
+                parts = ln.split(None, 6)
+                if len(parts) == 7:
+                    ln = "\t".join(parts)
+            out.append(ln)
+        dst = os.path.join(outdir, "cookies_copy.txt")
+        with open(dst, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(out).strip("\n") + "\n")
+        return dst
+    except Exception as exc:
+        log.warning("download: could not prepare the cookies copy (%s); using the original file", exc)
+        return src
+
+
 def _dl_extract(url: str, audio: bool, outdir: str):
     """Blocking yt-dlp download (run in a thread). Returns (file_path, title, uploader)."""
     import yt_dlp
@@ -2425,13 +2448,27 @@ def _dl_extract(url: str, audio: bool, outdir: str):
     for cookies in ((os.environ.get("YTDLP_COOKIES") or "").strip(), "/etc/secrets/cookies.txt",
                     os.path.join(here, "cookies.txt")):
         if cookies and os.path.isfile(cookies):
-            opts["cookiefile"] = cookies
+            opts["cookiefile"] = _dl_prepare_cookies(cookies, outdir)
             break
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if info.get("entries"):
-            info = next(iter(info["entries"]), None) or {}
-        path = ydl.prepare_filename(info) if info else ""
+    log.info("download: %s", ("using a cookies file (" + str(len(open(opts["cookiefile"], encoding="utf-8", errors="ignore").read().splitlines())) + " lines)") if opts.get("cookiefile")
+             else "no cookies file found (YTDLP_COOKIES, /etc/secrets/cookies.txt, ./cookies.txt)")
+
+    def _run(o):
+        with yt_dlp.YoutubeDL(o) as ydl:
+            inf = ydl.extract_info(url, download=True)
+            if inf.get("entries"):
+                inf = next(iter(inf["entries"]), None) or {}
+            return inf, (ydl.prepare_filename(inf) if inf else "")
+
+    try:
+        info, path = _run(opts)
+    except Exception as exc:
+        low = str(exc).lower()
+        if "youtu" not in url.lower() or not ("not a bot" in low or "confirm you" in low or "sign in" in low):
+            raise
+        # YouTube's "are you a bot" check: retry once with other YouTube player clients (some pass without a login)
+        log.warning("download: YouTube bot check, retrying with other player clients")
+        info, path = _run(dict(opts, extractor_args={"youtube": {"player_client": ["tv", "mweb", "android_vr", "web_safari"]}}))
     if not path or not os.path.isfile(path):
         for name in os.listdir(outdir):
             path = os.path.join(outdir, name)
@@ -3868,19 +3905,22 @@ _NSFW_STRONG = {
     "bastard", "slut", "whore", "wanker", "twat", "faggot", "nigger",
     "blowjob", "handjob", "footjob", "rimjob", "cumshot", "creampie", "gangbang", "bukkake", "deepthroat",
     "dildo",
+    "threesome", "3some", "orgy", "orgies", "penis", "penises", "vagina", "incest", "xnxx", "xvideos",
+    # formerly "ambiguous": blocked even alone; the harmless-context rules below still clear names, medical
+    # talk, questions about a word and rule reminders (check 2)
+    "dick", "pussy", "pussies", "cock", "boob", "boobs", "tits", "titties", "porn", "porno", "pornhub", "horny", "orgasm",
+    "masturbate", "masturbation", "cum", "milf", "hentai", "onlyfans", "camgirl",
     # Hinglish
     "madarchod", "madarchodd", "behenchod", "bhenchod", "benchod", "bhosdike", "bhosdi", "bhosdika", "bsdk",
     "mkc", "chutiya", "chutiye", "chutia", "gandu", "gaandu", "randi", "raand", "lauda", "laude", "chudai",
-    "bhadwa", "bhadwe",
+    "bhadwa", "bhadwe", "lund", "lodu", "chut", "gand", "bhosda", "bhosdo",
     # Devanagari
     "मादरचोद", "बहनचोद", "भेनचोद", "चूतिया", "चुतिया", "गांडू", "रंडी", "भोसड़ीके",
 }
 # only count together with a second, different term (or a solicitation phrase): they are normal words in
 # medicine, names, cooking, news and everyday talk when they appear alone
 _NSFW_AMBIG = {
-    "sex", "sexy", "porn", "porno", "pornhub", "xxx", "nude", "nudes", "naked", "topless", "boob", "boobs",
-    "tits", "titties", "dick", "cock", "pussy", "ass", "anal", "horny", "orgasm", "masturbate",
-    "masturbation", "erotic", "nsfw", "hentai", "fetish", "cum", "milf", "bdsm", "onlyfans", "camgirl",
+    "sex", "sexy", "xxx", "nude", "nudes", "naked", "topless", "ass", "anal", "erotic", "nsfw", "fetish", "bdsm",
 }
 _NSFW_SAFE = _nsfw_words(os.environ.get("NSFW_SAFE_WORDS"))
 _NSFW_STRONG = (_NSFW_STRONG | _nsfw_words(os.environ.get("NSFW_EXTRA_WORDS"))) - _NSFW_SAFE
@@ -3909,7 +3949,10 @@ _NSFW_HARMLESS_RE = re.compile(
     r"|sex\s+and\s+the\s+city|breast\s+(?:cancer|feeding|milk)|chicken\s+breasts?|moby\s+dick"
     r"|dick\s+van\s+dyke|dick\s+cheney|(?:anti|against)[\s-]+(?:porn\w*|nsfw)|porn\s+addiction"
     r"|(?:ban(?:ning)?|block(?:ing)?|report(?:ing)?)\s+(?:the\s+)?(?:porn\w*|nsfw)"
-    r"|nsfw\s+(?:filter|protection|settings?|mode)|cock\s*(?:pit|tail|roach|atoo)|peacocks?|hancock)\b")
+    r"|nsfw\s+(?:filter|protection|settings?|mode)|cock\s*(?:pit|tail|roach|atoo)|peacocks?|hancock"
+    r"|dick\s+(?:grayson|tracy|whittington|dastardly)|cum\s+laude|anal\s+(?:fissures?|fistulas?|cancer|glands?)"
+    r"|(?:blue|great|coal|long[\s-]tailed)\s+tits?|naked\s+eyes?|nude\s+(?:shades?|lipstick|colou?rs?|makeup|polish)"
+    r"|cock\s+robin|cocker\s+spaniels?|pussy\s*(?:cats?|willows?))\b")
 # the message is about a word, or reminds people of a rule: not an offence
 _NSFW_META_RE = re.compile(
     r"\b(?:what\s+(?:does|is)\s+(?:the\s+)?\S+\s+mean|meaning\s+of|what\s+is\s+the\s+meaning|kya\s+matlab"
@@ -3936,6 +3979,7 @@ def _nsfw_forms(tok):
         base.add(t2)
         for f in (t, t2):
             base.add(_NSFW_REP3.sub(r"\1\1", f))
+            base.add(_NSFW_REP3.sub(r"\1", f))  # pussyyyy -> pussy (words that already contain a double letter)
             base.add(_NSFW_REP2.sub(r"\1", f))
     out = set(base)
     for f in base:
