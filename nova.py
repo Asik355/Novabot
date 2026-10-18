@@ -86,6 +86,7 @@ from telegram.ext import (
     ApplicationHandlerStop,
     CallbackQueryHandler,
     ChatMemberHandler,
+    ChatJoinRequestHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -904,6 +905,24 @@ async def _number_setting(update, context, cmd, key, default, low, high, unit):
 # ---------------------------------------------------------------- commands
 
 
+RAID_HELP_TEXT = (
+    "\n\n<b>AntiRaid</b>\n\n"
+    "Some people on Telegram find it entertaining to \"raid\" chats. During a raid, hundreds of users join a chat to spam.\n\n"
+    "The antiraid module allows you to quickly stop anyone from joining when such a raid is happening. "
+    "All new joins will be temporarily banned for the next few hours, allowing you to wait out the spam attack until the trolls stop.\n\n"
+    "<b>Admin commands:</b>\n"
+    "- /antiraid &lt;optional time/off/no&gt;: Toggle antiraid. All new joins will be temporarily banned for the next few hours.\n"
+    "- /raidtime &lt;time&gt;: View or set the desired antiraid duration. Default 6h.\n"
+    "- /raidactiontime &lt;time&gt;: View or set the time for antiraid to tempban users for. Default 1h.\n"
+    "- /autoantiraid &lt;number/off/no&gt;: Set the number of joins per minute after which to enable automatic antiraid. "
+    "Set to '0', 'off', or 'no' to disable.\n"
+    "\n<b>Examples:</b>\n"
+    "- Enable antiraid for 3 hours:\n-&gt; /antiraid 3h\n\n"
+    "- Disable antiraid:\n-&gt; /antiraid off\n\n"
+    "- Automatically enable antiraid if over 15 users join in under a minute:\n-&gt; /autoantiraid 15\n\n"
+    "- Disable automatic antiraid:\n-&gt; /autoantiraid off"
+)
+
 HELP_SECTIONS = {
     "mod": (
         "Admin",
@@ -933,7 +952,7 @@ HELP_SECTIONS = {
         ]),
     ),
     "flood": (
-        "Antiflood",
+        "Raid & Flood",
         "<b>Flood &amp; spam</b>\n\n" + _numbered([
             "/flood: Show the current antiflood settings.",
             "/setflood N [secs]|off: Set the message-flood threshold.",
@@ -942,7 +961,7 @@ HELP_SECTIONS = {
             "/spammode: Set the action taken on spammers.",
             "/repeatlimit N: How many identical messages count as spam.",
             "/mentionlimit N: How many @mentions in one message count as spam.",
-        ]),
+        ]) + RAID_HELP_TEXT,
     ),
     "captcha": (
         "CAPTCHA",
@@ -1051,7 +1070,16 @@ HELP_SECTIONS = {
             "/unapprove: Remove that exemption.",
             "/approved: List everyone approved in this chat.",
             "/unapproveall: Remove every approval in this chat (chat creator only, asks to confirm).",
-        ]),
+        ]) + (
+            "\n\n<b>Auto join approval</b>\n\n"
+            "Groups with \"Approve new members\" send the bot a join request. Turn this on and I approve people "
+            "automatically (they don't need to send /start). During an antiraid, requests are declined instead.\n\n"
+            "- /joinon (or /autoapprove on, /join on): Approve join requests automatically.\n"
+            "- /joinoff (or /autoapprove off, /join off): Stop; requests wait for an admin.\n"
+            "- /autoapprove: Show the current setting.\n"
+            "- /setjoinmsg &lt;text&gt;: Customize the welcome message sent when someone is approved.\n\n"
+            "Tap <b>⚙️ Auto Approve</b> below to change these with buttons.\n\n"
+            "I need the \"Invite users\" admin right."),
     ),
     "groupedit": (
         "👥 Group Edit",
@@ -1404,6 +1432,8 @@ def help_section_keyboard(key=None, chat=None):
                      InlineKeyboardButton("▶️ Resume", callback_data="pz:r")])
     if key == "more":
         rows.append([InlineKeyboardButton("📥 Download", callback_data="help:dl")])
+    if key == "approval" and chat is not None and chat.type != "private":
+        rows.append([InlineKeyboardButton("⚙️ Auto Approve", callback_data="jn:m")])
     back = "help:more" if key == "dl" else "help:main"
     rows.append([InlineKeyboardButton("« Back", callback_data=back)])
     return InlineKeyboardMarkup(rows)
@@ -1474,7 +1504,7 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         markup = help_main_keyboard(update.effective_chat, update.effective_user.id if update.effective_user else None)
     else:
         label, body = HELP_SECTIONS[key]
-        text = admin_section_text(update.effective_chat) if key == "mod" else f"<b>{label}</b>\n\n{body}"
+        text = admin_section_text(update.effective_chat) if key == "mod" else f"<b>{html.escape(label)}</b>\n\n{body}"
         markup = help_section_keyboard(key, update.effective_chat)
     try:
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
@@ -5556,6 +5586,336 @@ async def stats_callback(update, context):
         pass  # unchanged message (e.g. Refresh with no change)
 
 
+# ------------------------------------------------------------ AntiRaid + auto-approve join requests
+# Per-group settings (MongoDB settings store):
+#   raid_until        unix time antiraid switches itself off (0 = off)
+#   raid_time         how long /antiraid (or auto antiraid) stays on, seconds (default 6h)
+#   raid_action_time  how long each raider is banned for, seconds (default 1h)
+#   auto_raid         joins per minute that switch antiraid on by itself (0 = off)
+#   auto_approve      "True" = approve join requests automatically (never during a raid)
+RAID_TIME_DEFAULT = 6 * 3600
+RAID_ACTION_DEFAULT = 3600
+RAID_MAX_SECS = 30 * 86400
+_raid_joins = {}  # chat_id -> list of recent join times (for /autoantiraid)
+
+
+def raid_left(chat_id) -> int:
+    try:
+        until = int(get_setting(chat_id, "raid_until", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, until - int(time.time()))
+
+
+def _raid_secs(chat_id, key, default):
+    try:
+        return int(get_setting(chat_id, key, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+async def antiraid_cmd(update, context):
+    """/antiraid [time|off|no]: no argument toggles it."""
+    if not await group_only(update) or not await admin_only(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    arg = context.args[0].lower() if context.args else ""
+    left = raid_left(chat.id)
+    if arg in ("off", "no", "0", "false", "disable") or (not arg and left):
+        set_setting(chat.id, "raid_until", 0)
+        await msg.reply_text("✅ Antiraid is now OFF. New members can join again.")
+        return
+    secs = parse_duration(arg) if arg else _raid_secs(chat.id, "raid_time", RAID_TIME_DEFAULT)
+    if not secs or secs > RAID_MAX_SECS:
+        await msg.reply_text("Usage: /antiraid <time like 30m, 3h, 1d | off>\nExample: /antiraid 3h")
+        return
+    set_setting(chat.id, "raid_until", int(time.time()) + secs)
+    act = _raid_secs(chat.id, "raid_action_time", RAID_ACTION_DEFAULT)
+    await msg.reply_text(
+        f"🛡 Antiraid is ON for {fmt_duration(secs)}. Everyone who joins is banned for {fmt_duration(act)}.\n"
+        "Turn it off with /antiraid off.")
+
+
+async def _raid_time_cmd(update, context, key, default, label, usage_name):
+    if not await group_only(update) or not await admin_only(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    if context.args:
+        secs = parse_duration(context.args[0].lower())
+        if not secs or secs < 60 or secs > RAID_MAX_SECS:
+            await msg.reply_text(f"Usage: /{usage_name} <time from 1m to 30d>, for example /{usage_name} 6h")
+            return
+        set_setting(chat.id, key, secs)
+        await msg.reply_text(f"{label}: {fmt_duration(secs)}.")
+        return
+    await msg.reply_text(f"{label}: {fmt_duration(_raid_secs(chat.id, key, default))}.\n"
+                         f"Change it with /{usage_name} <time>.")
+
+
+async def raidtime_cmd(update, context):
+    await _raid_time_cmd(update, context, "raid_time", RAID_TIME_DEFAULT, "Antiraid duration", "raidtime")
+
+
+async def raidactiontime_cmd(update, context):
+    await _raid_time_cmd(update, context, "raid_action_time", RAID_ACTION_DEFAULT,
+                         "Antiraid ban time", "raidactiontime")
+
+
+async def autoantiraid_cmd(update, context):
+    """/autoantiraid <joins per minute | off>"""
+    if not await group_only(update) or not await admin_only(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    arg = context.args[0].lower() if context.args else ""
+    if arg in ("off", "no", "0", "false", "disable"):
+        set_setting(chat.id, "auto_raid", 0)
+        await msg.reply_text("Automatic antiraid is OFF.")
+    elif arg.isdigit() and 2 <= int(arg) <= 1000:
+        set_setting(chat.id, "auto_raid", int(arg))
+        await msg.reply_text(f"Automatic antiraid: ON when more than {int(arg)} users join within a minute.")
+    elif not arg:
+        n = _raid_secs(chat.id, "auto_raid", 0)
+        await msg.reply_text("Automatic antiraid: " + (f"ON above {n} joins per minute." if n else "OFF.")
+                             + "\nChange it with /autoantiraid <number|off>.")
+    else:
+        await msg.reply_text("Usage: /autoantiraid <number of joins per minute | off>\nExample: /autoantiraid 15")
+
+
+async def autoapprove_cmd(update, context):
+    """/autoapprove on|off: approve join requests automatically."""
+    if not await group_only(update) or not await admin_only(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    flag = parse_yes_no(context.args)
+    if flag is None:
+        on = get_setting(chat.id, "auto_approve", "False") == "True"
+        await msg.reply_text(f"Auto-approve join requests: {'ON' if on else 'OFF'}.\n"
+                             "Change it with /autoapprove on|off. I need the 'Invite users' admin right.")
+        return
+    set_setting(chat.id, "auto_approve", "True" if flag else "False")
+    await msg.reply_text("✅ Join requests will be approved automatically (never during a raid)." if flag
+                         else "Auto-approve is OFF. Join requests wait for an admin.")
+
+
+JOIN_DELAYS = (0, 600, 1800, 3600)  # seconds: instant, 10 minutes, 30 minutes, 1 hour
+_join_tasks = set()
+
+
+def _join_delay(chat_id) -> int:
+    try:
+        return max(0, int(get_setting(chat_id, "join_delay", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _delay_label(secs) -> str:
+    return "Instant" if not secs else fmt_duration(secs)
+
+
+JOIN_DM_DEFAULT = "✅ Your request to join {chat} was approved. Welcome, {name}!"
+
+
+def _join_dm_on(chat_id) -> bool:
+    return get_setting(chat_id, "join_dm", "True") != "False"
+
+
+def _join_dm_text(chat_id) -> str:
+    return get_setting(chat_id, "join_dm_text", "") or JOIN_DM_DEFAULT
+
+
+def _join_screen(chat_id):
+    on = get_setting(chat_id, "auto_approve", "False") == "True"
+    dm = _join_dm_on(chat_id)
+    custom = get_setting(chat_id, "join_dm_text", "")
+    text = (
+        "<b>⚙️ Auto Approve</b>\n\n"
+        "When this group uses \"Approve new members\", I can approve join requests for you. "
+        "People never need to send /start. During an antiraid, requests are declined instead.\n\n"
+        f"Auto approve: <b>{'ON ✅' if on else 'OFF ❌'}</b>\n"
+        f"Welcome message in private chat: <b>{'ON ✅' if dm else 'OFF ❌'}</b>\n"
+        f"Wait before approving: <b>{_delay_label(_join_delay(chat_id))}</b>\n\n"
+        "<b>Welcome message:</b>\n" + html.escape(_join_dm_text(chat_id)) +
+        ("" if custom else "\n<i>(default)</i>") + "\n\n"
+        "Change it with /setjoinmsg &lt;text&gt;. You can use {name} and {chat}.\n"
+        "I need the \"Invite users\" admin right.")
+    rows = [
+        [InlineKeyboardButton(f"{'🟢' if on else '🔴'} Auto Approve: {'ON' if on else 'OFF'}", callback_data="jn:t")],
+        [InlineKeyboardButton(f"💬 Welcome message: {'ON' if dm else 'OFF'}", callback_data="jn:d")],
+    ]
+    cur = _join_delay(chat_id)
+    rows.append([InlineKeyboardButton(("✅ " if cur == d else "") + ("⏱ " if d else "⚡ ") + _delay_label(d),
+                                      callback_data=f"jn:w:{d}") for d in JOIN_DELAYS])
+    if custom:
+        rows.append([InlineKeyboardButton("♻️ Reset message to default", callback_data="jn:r")])
+    rows.append([InlineKeyboardButton("« Back", callback_data="help:approval")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def join_callback(update, context):
+    """Buttons of the ⚙️ Auto Approve screen: jn:m (open), jn:t (on/off), jn:d (welcome on/off), jn:r (reset text)."""
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    if chat is None or chat.type == "private":
+        await q.answer("Open this inside a group.", show_alert=True)
+        return
+    if not (await is_admin(chat, q.from_user.id) or is_bot_owner(q.from_user.id)):
+        await q.answer("Admins only.", show_alert=True)
+        return
+    action = (q.data or "").partition(":")[2]
+    if action == "t":
+        on = get_setting(chat.id, "auto_approve", "False") == "True"
+        set_setting(chat.id, "auto_approve", "False" if on else "True")
+    elif action == "d":
+        set_setting(chat.id, "join_dm", "False" if _join_dm_on(chat.id) else "True")
+    elif action.startswith("w:"):
+        try:
+            d = int(action[2:])
+        except ValueError:
+            d = 0
+        if d in JOIN_DELAYS:
+            set_setting(chat.id, "join_delay", d)
+    elif action == "r":
+        set_setting(chat.id, "join_dm_text", "")
+    await q.answer()
+    text, markup = _join_screen(chat.id)
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    except TelegramError:
+        pass
+
+
+async def setjoinmsg_cmd(update, context):
+    """/setjoinmsg <text>  (use {name} and {chat}); /setjoinmsg reset"""
+    if not await group_only(update) or not await admin_only(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    text = " ".join(context.args).strip() if context.args else ""
+    if not text and msg.reply_to_message:
+        text = (msg.reply_to_message.text or "").strip()
+    if not text:
+        await msg.reply_text("Current welcome message:\n" + _join_dm_text(chat.id) +
+                             "\n\nSet a new one: /setjoinmsg <text> (use {name} and {chat}).\n"
+                             "Back to default: /setjoinmsg reset")
+        return
+    if text.lower() == "reset":
+        set_setting(chat.id, "join_dm_text", "")
+        await msg.reply_text("Welcome message reset to the default.")
+        return
+    set_setting(chat.id, "join_dm_text", text[:500])
+    await msg.reply_text("✅ Welcome message saved. Open /help → Approval → Auto Approve to see it.")
+
+
+async def joinon_cmd(update, context):
+    context.args = ["on"]
+    await autoapprove_cmd(update, context)
+
+
+async def joinoff_cmd(update, context):
+    context.args = ["off"]
+    await autoapprove_cmd(update, context)
+
+
+async def raid_new_members(update, context):
+    """group=-5, before the captcha/welcome handler: counts joins, switches antiraid on by itself, and bans
+    new members while antiraid is active. Never touches bots or admins."""
+    chat, msg = update.effective_chat, update.effective_message
+    people = [u for u in (msg.new_chat_members or []) if not u.is_bot]
+    if not people:
+        return
+    now = time.time()
+    limit = _raid_secs(chat.id, "auto_raid", 0)
+    if limit:
+        recent = [t for t in _raid_joins.get(chat.id, []) if now - t < 60] + [now] * len(people)
+        _raid_joins[chat.id] = recent
+        if len(recent) > limit and not raid_left(chat.id):
+            secs = _raid_secs(chat.id, "raid_time", RAID_TIME_DEFAULT)
+            set_setting(chat.id, "raid_until", int(now) + secs)
+            try:
+                await chat.send_message(
+                    f"🚨 Raid detected: more than {limit} users joined within a minute. "
+                    f"Antiraid is ON for {fmt_duration(secs)}. Turn it off with /antiraid off.")
+            except TelegramError:
+                pass
+    if not raid_left(chat.id):
+        return
+    act = _raid_secs(chat.id, "raid_action_time", RAID_ACTION_DEFAULT)
+    banned = 0
+    for user in people:
+        if is_bot_owner(user.id) or await is_admin(chat, user.id):
+            continue
+        if msg.from_user and msg.from_user.id != user.id and await is_admin(chat, msg.from_user.id):
+            continue  # an admin added them on purpose
+        try:
+            await chat.ban_member(user.id, until_date=int(now) + max(act, 60))
+            banned += 1
+        except TelegramError as e:
+            logging.warning("antiraid: couldn't ban %s in %s: %s", user.id, chat.id, e)
+    if banned:
+        try:
+            await msg.delete()
+        except TelegramError:
+            pass
+        if banned == len(people):
+            raise ApplicationHandlerStop  # nobody left to welcome or verify
+
+
+async def on_join_request(update, context):
+    """Join requests (groups with 'Approve new members'): approve automatically when /autoapprove is on,
+    decline during a raid. The person never has to send /start."""
+    req = update.chat_join_request
+    if req is None:
+        return
+    chat, user = req.chat, req.from_user
+    if is_paused(chat.id) or user.is_bot:
+        return
+    try:
+        if raid_left(chat.id):
+            await req.decline()
+            return
+        if get_setting(chat.id, "auto_approve", "False") != "True":
+            return
+        delay = _join_delay(chat.id)
+        if delay:
+            task = asyncio.create_task(_approve_later(context, req, delay))
+            _join_tasks.add(task)
+            task.add_done_callback(_join_tasks.discard)
+            return
+        await req.approve()
+    except TelegramError as e:
+        logging.warning("join request in %s: %s", chat.id, e)
+        return
+    await _join_hello(context, req)
+
+
+async def _approve_later(context, req, delay):
+    """Waits, then approves (or declines if a raid started meanwhile). Skipped if auto approve was switched off."""
+    await asyncio.sleep(delay)
+    chat = req.chat
+    try:
+        if is_paused(chat.id) or get_setting(chat.id, "auto_approve", "False") != "True":
+            return  # request stays pending for an admin
+        if raid_left(chat.id):
+            await req.decline()
+            return
+        await req.approve()
+    except TelegramError as e:
+        logging.warning("delayed join request in %s: %s", chat.id, e)
+        return
+    await _join_hello(context, req)
+
+
+async def _join_hello(context, req):
+    chat, user = req.chat, req.from_user
+    if not _join_dm_on(chat.id):
+        return
+    try:  # a short hello in private chat (allowed for a limited time after the request; ignored if refused)
+        dm = _join_dm_text(chat.id).replace("{name}", user.first_name or "friend").replace(
+            "{chat}", chat.title or "the group")
+        await context.bot.send_message(req.user_chat_id, dm[:1000])
+    except TelegramError:
+        pass
+
+
 def main():
     extra.start_web_server()  # Render: open the port first (health check / keep-alive)
     logging.warning("OWNER_IDS loaded: %s (the 👑 Owner button shows only for these Telegram user IDs)", OWNER_IDS)
@@ -5603,6 +5963,9 @@ def main():
         "modlog": modlog_cmd, "resetwarns": resetwarns, "warnlimit": warnlimit, "setwarnlimit": warnlimit,
         "warnmode": warnmode, "warntime": warntime,
         "flood": flood, "setflood": setflood, "floodmode": floodmode,
+        "antiraid": antiraid_cmd, "raidtime": raidtime_cmd, "raidactiontime": raidactiontime_cmd,
+        "autoantiraid": autoantiraid_cmd, "autoapprove": autoapprove_cmd,
+        "join": autoapprove_cmd, "joinon": joinon_cmd, "joinoff": joinoff_cmd, "setjoinmsg": setjoinmsg_cmd,
         "antispam": antispam, "spammode": spammode,
         "repeatlimit": repeatlimit, "mentionlimit": mentionlimit,
         "blocklistmode": blocklistmode, "report": report_cmd, "reports": reports_toggle,
@@ -5688,6 +6051,9 @@ def main():
         & (filters.ChatType.PRIVATE | filters.ChatType.GROUPS),
         edit_input,
     ), group=-1)
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, raid_new_members), group=-5)
+    app.add_handler(ChatJoinRequestHandler(on_join_request))
+    app.add_handler(CallbackQueryHandler(join_callback, pattern=r"^jn:"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
     app.add_handler(MessageHandler(~filters.COMMAND & ~filters.StatusUpdate.ALL, watcher))

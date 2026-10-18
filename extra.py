@@ -2734,13 +2734,14 @@ def _plain(text):
     return html.unescape(re.sub(r"<[^>]+>", "", str(text or ""))).strip()
 
 
-async def track_notice(sent):
-    """Remember a sent notice so the sweeper deletes it 1 day later (the schedule is in MongoDB: restarts don't lose it)."""
+async def track_notice(sent, secs=None):
+    """Remember a sent notice so the sweeper deletes it 1 day later (or after `secs`; the schedule is in MongoDB: restarts don't lose it)."""
     if sent is None:
         return
     try:
         import migrate_to_mongo as _m
-        await asyncio.to_thread(_m.notice_schedule, sent.chat_id, sent.message_id)
+        await asyncio.to_thread(_m.notice_schedule, sent.chat_id, sent.message_id,
+                                (int(time.time()) + int(secs)) if secs else None)
     except Exception:
         log.exception("Couldn't schedule the automatic deletion of a notice")
 
@@ -3338,6 +3339,11 @@ async def ads_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label = ACTION_LABEL["delete"]
             punish = f"Message deleted only. I couldn't {action} the user: please give me the 'Restrict members' admin right"
         text = action_notice(mention, label, why, punish)
+        shown = (msg.text or msg.caption or "").strip().replace("\n", " ")
+        if shown:  # so admins can check what was removed (in <code>: links are not clickable)
+            text += f"\n🗒 <b>Removed:</b> <code>{html.escape(shown[:200])}{'…' if len(shown) > 200 else ''}</code>"
+        elif is_media:
+            text += "\n🗒 <b>Removed:</b> a media message with no text"
     else:
         if time.time() - _ads_notice.get(chat.id, 0) > 600:
             _ads_notice[chat.id] = time.time()
@@ -3345,7 +3351,7 @@ async def ads_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
                            "Please give me the 'Delete messages' and 'Restrict members' admin rights.")
         return  # nothing was enforced: let the other handlers (locks, filters...) run as usual
     sent = await _bl_send(context.bot, chat.id, text)
-    await track_notice(sent)  # the notice disappears 1 day later (reliable: the schedule is in MongoDB)
+    await track_notice(sent, bl_notice_secs(chat.id))  # stays for the group's chosen time (5h/10h/1d), then disappears (schedule is in MongoDB)
     await record_action(chat.id, user.id, mention, label, why, punish, category="ads")
     await _BD.log_action(chat, "spam", f"🚫 Auto-ads: deleted a message from {mention} ({html.escape(reason)})"
                          + ({"mute": f" and muted them for {_bl_human(mute_secs)}.", "ban": " and banned them.",
@@ -3369,7 +3375,7 @@ BLOCK_CATEGORIES = {
 _BL_EXTRA_BUTTONS = {  # extra rows on a category screen
     "promo": [[InlineKeyboardButton("⭐ Authorized Promotions", callback_data="bl:auth")]],
 }
-BL_MENU_TEXT = ("<b>🔒 Blocking</b>\n\n"
+BL_MENU_TEXT = ("<b>🔒 Ads &amp; NSFW</b>\n\n"
                 "Choose what to manage. Settings apply to this group only.\n\n"
                 "<b>⚖️ Punishment for ads &amp; promotion</b> (admins)\n\n"
                 "1. /adpunish: Set the punishment for ads and promotion in this group, "
@@ -3392,7 +3398,7 @@ _BL_CATEGORY_CMDS = {  # "📖 Commands" footer of the Ads / Promotion screens (
 
 def blocking_menu_button():
     """The '🔒 Blocking' button for the main /help menu."""
-    return InlineKeyboardButton("🔒 Blocking", callback_data="bl:menu")
+    return InlineKeyboardButton("🔒 Ads & NSFW", callback_data="bl:menu")
 
 
 def _bl_menu_screen():
@@ -3413,6 +3419,14 @@ def _bl_promo_menu_screen():
     return text, InlineKeyboardMarkup(rows)
 
 
+BL_NOTICE_KEY = "bl_notice_secs"   # how long the "removed an ad / 18+ message" notice stays in the group
+BL_NOTICE_DEFAULT = 10 * 3600
+
+
+def bl_notice_secs(chat_id) -> int:
+    return BL_NOTICE_DEFAULT  # fixed: the removal notice stays 10 hours, then is deleted
+
+
 def _bl_category_screen(chat, key):
     label, setting, desc = BLOCK_CATEGORIES[key]
     on = _bl_on(chat.id, setting)
@@ -3424,6 +3438,9 @@ def _bl_category_screen(chat, key):
     toggle = (InlineKeyboardButton("🔴 Turn OFF", callback_data=f"bl:s:{key}:0") if on
               else InlineKeyboardButton("🟢 Turn ON", callback_data=f"bl:s:{key}:1"))
     rows = [[toggle]] + [list(r) for r in _BL_EXTRA_BUTTONS.get(key, [])]
+    if key in ("ads", "promo"):
+        text += (f"\n\n🧾 The removal notice (who, why, what was removed) stays "
+                 f"<b>{_bl_human(bl_notice_secs(chat.id))}</b> so admins can check it, then I delete it.")
     rows.append([InlineKeyboardButton("🔙 Back", callback_data="bl:p")])
     return text, InlineKeyboardMarkup(rows)
 
@@ -4214,6 +4231,8 @@ def _bl_nsfw_category_screen(chat, key):
     rows = [[toggle]]
     if key == "word":
         rows.append([InlineKeyboardButton(f"✅ Allowed Words ({len(nsfw_allow_list(chat.id))})", callback_data="bl:nw")])
+    text += (f"\n\n🧾 The removal notice stays <b>{_bl_human(bl_notice_secs(chat.id))}</b> so admins can check it, "
+             "then I delete it.")
     rows.append([InlineKeyboardButton("🔙 Back", callback_data="bl:n")])
     return text, InlineKeyboardMarkup(rows)
 
@@ -4560,7 +4579,7 @@ async def nsfw_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = ("⚠️ I spotted 18+ content but couldn't delete it. "
                     "Please give me the 'Delete messages' and 'Restrict members' admin rights.")
     if text:
-        await track_notice(await _bl_send(context.bot, chat.id, text))  # the notice disappears 1 day later
+        await track_notice(await _bl_send(context.bot, chat.id, text), bl_notice_secs(chat.id))  # stays 5h/10h/1d (group's choice)
     if deleted:
         await record_action(chat.id, user.id, mention, label, why, punish, category="protection")
     if not deleted:
