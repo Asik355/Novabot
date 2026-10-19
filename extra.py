@@ -2367,7 +2367,7 @@ async def menu_not_owner(q):
     owner = _menu_owners.get((chat.id, msg.message_id))
     if owner is None:
         owner = getattr(getattr(getattr(msg, "reply_to_message", None), "from_user", None), "id", None)
-    if owner == _MENU_ANON_ID or owner == q.from_user.id:
+    if owner is None or owner == _MENU_ANON_ID or owner == q.from_user.id:   # None: the command message was deleted
         return False
     try:
         await q.answer(MENU_NOT_YOURS, show_alert=True)
@@ -3660,7 +3660,7 @@ def _bl_add_screen():
 
 
 async def _bl_can_manage(chat, user_id):
-    """Same rule as the other admin buttons: a real admin of THIS group, the bot owner or a Super Admin."""
+    """Same rule as the other admin buttons: a real admin of THIS group, the bot owner or Bot Staff."""
     try:
         if _BD.is_bot_owner(user_id) or _BD.is_super_admin(user_id):
             return True

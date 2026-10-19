@@ -43,7 +43,7 @@ for _dir in dict.fromkeys((_HERE, os.getcwd())):  # script folder first, then cu
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # =====================================================================
 #  PRIMARY BOT OWNER  -  Telegram USER IDs (positive numbers, never a group/channel ID) that
-#  may use Bot Edit (/bot) and manage Super Admins. Super Admins and group owners/admins can NOT
+#  may use Bot Edit (/bot) and manage Bot Staff. Bot Staff and group owners/admins can NOT
 #  use Bot Edit. (send /id to the bot to see your own ID), e.g. OWNER_IDS = [123456789]
 # =====================================================================
 # Comma/space separated list in the OWNER_IDS environment variable; the default keeps the old owner.
@@ -53,7 +53,9 @@ OWNER_IDS = [int(x) for x in re.findall(r"(?<![\d-])[0-9]+", os.environ.get("OWN
 # =====================================================================
 
 import asyncio
+import base64
 import contextvars
+import json
 import functools
 import hashlib
 import html
@@ -106,7 +108,7 @@ except ModuleNotFoundError:  # the file was saved as extras.py: accept it instea
     import extras as extra
     sys.modules["extra"] = extra
 import fun_systems  # roast + court entertainment (wired up in main())
-import importexport  # /export /import /reset + the Import & Export page (wired up in main())
+import group  # /autoclose, /cleanservice, /cleancommand, /export /import /reset (wired up in main())
 import msgcount  # message count / leaderboard / milestones (wired up in main())
 import migrate_to_mongo as store  # the MongoDB data layer (the only file that talks to the database)
 from extra import (  # pure helpers (no bot state): see extra.py
@@ -997,16 +999,102 @@ HELP_SECTIONS = {
         ]),
     ),
     "notes": (
+        "Notes",
+        "<b>Notes</b>\n\n"
+        "Save data for future users with notes!\n\n"
+        "Notes are great to save random tidbits of information; a phone number, a nice gif, a funny picture - anything!\n\n"
+        "<b>User commands:</b>\n"
+        "- /get &lt;notename&gt;: Get a note.\n"
+        "- #notename: Same as /get.\n\n"
+        "<b>Admin commands:</b>\n"
+        "- /save &lt;notename&gt; &lt;note text&gt;: Save a new note called \"word\". Replying to a message will save that "
+        "message. Even works on media!\n"
+        "- /clear &lt;notename&gt;: Delete the associated note.\n"
+        "- /notes: List all notes in the current chat.\n"
+        "- /saved: Same as /notes.\n"
+        "- /clearall: Delete ALL notes in a chat. This cannot be undone.\n"
+        "- /privatenotes: Whether or not to send notes in PM. Will send a message with a button which users can click "
+        "to get the note in PM.",
+    ),
+    "filters": (
         "Filters",
-        "<b>Notes &amp; filters</b>\n\n" + _numbered([
-            "/save name text (or reply): Save a note, fetched later with #name.",
-            "/get name: Fetch a saved note.",
-            "/notes: List all saved notes.",
-            "/clear name: Delete a saved note.",
-            "/filter keyword reply: Auto-reply when a keyword is said (quote phrases).",
-            "/stop keyword: Remove a filter.",
-            "/filters: List all filters.",
-        ]),
+        "<b>Filters</b>\n\n"
+        "Make your chat more lively with filters; The bot will reply to certain words!\n\n"
+        "Filters are case insensitive; every time someone says your trigger words, the bot will reply something else! "
+        "can be used to create your own commands, if desired.\n\n"
+        "<b>Commands:</b>\n"
+        "- /filter &lt;trigger&gt; &lt;reply&gt;: Every time someone says \"trigger\", the bot will reply with "
+        "\"sentence\". For multiple word filters, quote the trigger.\n"
+        "- /filters: List all chat filters.\n"
+        "- /stop &lt;trigger&gt;: Stop the bot from replying to \"trigger\".\n"
+        "- /stopall: Stop ALL filters in the current chat. This cannot be undone.",
+    ),
+    "cleanservice": (
+        "Clean Service",
+        "<b>Clean Service</b>\n\n"
+        "Clean up automated telegram service messages! The available categories are:\n"
+        "- all: All service messages.\n"
+        "- join: When a new user joins, or is added. eg: 'X joined the chat'\n"
+        "- leave: When a user leaves, or is removed. eg: 'X left the chat'\n"
+        "- other: Miscellaneous items; such as chat boosts, successful telegram payments, proximity alerts, webapp "
+        "messages, message auto deletion changes, or checklist updates.\n"
+        "- photo: When chat photos or chat backgrounds are changed.\n"
+        "- pin: When a new message is pinned. eg: 'X pinned a message'\n"
+        "- title: When chat or topic titles are changed.\n"
+        "- videochat: When a video chat action occurs - eg starting, ending, scheduling, or adding members to the call.\n\n"
+        "<b>Admin commands:</b>\n"
+        "- /cleanservice &lt;type/yes/no/on/off&gt;: Select which service messages to delete.\n"
+        "- /keepservice &lt;type&gt;: Select which service messages to stop deleting.\n"
+        "- /nocleanservice &lt;type&gt;: (same as keepservice)\n"
+        "- /cleanservicetypes: List all the available service messages, with a brief explanation.\n\n"
+        "<b>Examples:</b>\n"
+        "- Stop all telegram service messages:\n-&gt; /cleanservice all\n\n"
+        "- Stop telegrams 'x joined the chat' messages:\n-&gt; /cleanservice join\n\n"
+        "- Keep telegrams 'x pinned a message' messages:\n-&gt; /keepservice pin",
+    ),
+    "cleancommand": (
+        "Clean Commands",
+        "<b>Clean Commands</b>\n\n"
+        "Keep your chat clean by cleaning up commands from both users and admins!\n\n"
+        "This module allows you to delete certain command categories, for both users and admins, to ensure your chat "
+        "is kept clean.\n"
+        "For example, you might choose to delete all user commands; this will stop users from accidentally pressing on "
+        "blue-text commands in other people's messages.\n\n"
+        "Available options are:\n"
+        "- all: Delete ALL commands sent to the group.\n"
+        "- admin: Delete any admin-only commands sent to the group (eg /ban, /mute, or any settings changes).\n"
+        "- user: Delete any user commands sent to the group (eg /id, /info, or /get). These commands will also be "
+        "cleaned when admins use them.\n"
+        "- other: Delete any commands which aren't recognised as being valid commands of this bot.\n\n"
+        "<b>Admin commands:</b>\n"
+        "- /cleancommand &lt;type&gt;: Select which command types to delete.\n"
+        "- /keepcommand &lt;type&gt;: Select which command types to stop deleting.\n"
+        "- /cleancommandtypes: List the different command types which can be cleaned.\n\n"
+        "<b>Examples:</b>\n"
+        "- Delete all commands, but still respond to them:\n-&gt; /cleancommand all\n\n"
+        "- Delete all users commands (but still respond), as well as commands for other bots:\n"
+        "-&gt; /cleancommand user other\n\n"
+        "- Stop deleting all commands:\n-&gt; /keepcommand all\n\n"
+        "<b>Note:</b> If you are looking to stop your users from using any commands altogether, and don't want the bot "
+        "to reply to them, have a look at the locks module instead. You may also want to set up log channels, to track "
+        "the settings changes that your admins are making!",
+    ),
+    "autoclose": (
+        "🕒 Auto Close",
+        "<b>Auto Close</b>\n\n"
+        "Close the group automatically at a set time every day and open it again later. While the group is closed, "
+        "only admins can write messages.\n\n"
+        "<b>Admin commands:</b>\n"
+        "- /autoclose &lt;close time&gt; &lt;open time&gt;: Close the group every day at the first time and open it at "
+        "the second.\n"
+        "- /autoclose off: Stop the schedule (a closed group is opened again).\n"
+        "- /autoclose: Show the schedule and whether the group is closed right now.\n\n"
+        "<b>Examples:</b>\n"
+        "- Close at 11 PM, open at 6 AM:\n-&gt; /autoclose 23:00 06:00\n\n"
+        "- The same, written the easy way:\n-&gt; /autoclose 11pm 6am\n\n"
+        "- Stop it:\n-&gt; /autoclose off\n\n"
+        "<b>Note:</b> The bot must be an admin with the \"Ban users\" right. Opening the group brings back the exact "
+        "permissions it had before closing.",
     ),
     "locks": (
         "Locks",
@@ -1095,10 +1183,10 @@ HELP_SECTIONS = {
         "<b>Bot Edit</b>\n\n" + _numbered([
             "/bot: Change the bot's name, username, photo or bio "
             "(Bot Owner only).",
-            "/addadmin: Add a Super Admin - reply to a user, or give an ID or @username "
+            "/addstaff: Add a Bot Staff member - reply to a user, or give an ID or @username "
             "(Primary Bot Owner only).",
-            "/removeadmin: Remove a Super Admin (Primary Bot Owner only).",
-            "/adminlist: List all Super Admins (Primary Bot Owner only).",
+            "/removestaff: Remove a Bot Staff member (Primary Bot Owner only).",
+            "/stafflist: List all Bot Staff (Primary Bot Owner only).",
         ]),
     ),
     "other": (
@@ -1176,9 +1264,13 @@ HELP_SECTIONS = {
         "<b>Birthday</b>\n\nSend /wish to open the Birthday System menu.",
     ),
     # the ➕ More button (row under Count / AI Commands / Blocking); not in HELP_ORDER, opened by help:more
+    "games": (
+        "🎮 Games",
+        "<b>🎮 Games</b>\n\nPick a game to see its commands.",
+    ),
     "more": (
         "📄 Page 2",
-        "<b>📄 Page 2</b>\n\nTap a button below.",
+        "<b>📄 Page 2</b>\n\nNothing here yet. More features are coming soon.",
     ),
     "dl": (  # opened from the ➕ More page (help:dl)
         "📥 Download",
@@ -1214,7 +1306,7 @@ HELP_SECTIONS = {
         "importing/exporting data don't slow down the bot.",
     ),
 }
-HELP_ORDER = ["mod", "warn", "flood", "captcha", "greet", "rules", "notes", "locks", "purge", "log", "reports", "approval", "disabling", "groupedit", "botedit", "other", "info", "extras", "roast", "court", "birthday"]
+HELP_ORDER = ["mod", "warn", "flood", "captcha", "greet", "rules", "notes", "filters", "locks", "purge", "log", "reports", "approval", "disabling", "cleanservice", "cleancommand", "autoclose", "groupedit", "botedit", "other", "info", "birthday"]
 
 
 def _build_bot_commands():
@@ -1343,9 +1435,9 @@ ESSENTIAL_COMMANDS = [
     ("approve", "Approve a user"),
     ("unapprove", "Unapprove a user"),
     ("approved", "List approved users"),
-    ("addadmin", "Add a bot admin"),
-    ("removeadmin", "Remove a bot admin"),
-    ("adminlist", "List the bot admins"),
+    ("addstaff", "Add a bot staff member"),
+    ("removestaff", "Remove a bot staff member"),
+    ("stafflist", "List the bot staff"),
     ("disable", "Disable a command in this chat"),
     ("enable", "Enable a command in this chat"),
     ("groupedit", "Open group settings"),
@@ -1413,8 +1505,232 @@ def style_help_buttons(rows):
 # already starts with a symbol (Group Edit, Bot Edit, Roast, Court, Birthday) are not listed.
 HELP_BUTTON_ICONS = {
     "mod": "🛡", "warn": "⚠️", "flood": "🌊", "captcha": "🧩", "greet": "👋", "rules": "📜",
-    "notes": "🔍", "locks": "🔐", "purge": "🧹", "log": "📝", "reports": "🚨", "approval": "❤️",
-    "disabling": "🚫", "other": "⚙️", "info": "ℹ️", "extras": "✨",
+    "notes": "🗒", "filters": "🔍", "locks": "🔐", "purge": "🧹", "log": "📝", "reports": "🚨", "approval": "❤️",
+    "disabling": "🚫", "cleanservice": "🧼", "cleancommand": "🧽", "other": "⚙️", "info": "ℹ️", "extras": "✨",
+}
+
+
+# 📖 Usage Guide text for the /help pages (HTML). One entry per help page; shown by the "📖 Usage Guide" button.
+USAGE_GUIDES = {
+    "mod": (
+        "<b>How to use it</b>\n"
+        "Reply to the person's message with the command, or give their user ID.\n\n"
+        "<b>Examples</b>\n"
+        "• Ban: reply <code>/ban posting spam</code>\n"
+        "• Mute for 2 hours: reply <code>/mute 2h</code> (or <code>/tmute 2h reason</code>)\n"
+        "• Mute until you unmute: reply <code>/mute</code>\n"
+        "• Mute and delete their message: reply <code>/dmute 1d</code>\n"
+        "• Undo: <code>/unmute</code> or <code>/unban</code>\n"
+        "• Remove from the group (can rejoin): <code>/kick</code>\n"
+        "• Make someone admin with a title: reply <code>/promote Helper</code>\n\n"
+        "<b>Time format</b>: 30m, 2h, 1d, 1w.\n"
+        "<b>Tip</b>: Pause / Resume above switch all automatic protection off or on."),
+    "warn": (
+        "<b>How it works</b>\n"
+        "Each /warn adds one warning. When a user reaches the warn limit, the bot takes the warn action.\n\n"
+        "<b>Set it up</b>\n"
+        "• Limit: <code>/warnlimit 3</code>\n"
+        "• Action at the limit: <code>/warnmode ban</code> (ban, kick, mute or tmute)\n"
+        "• Warnings expire after a week: <code>/warntime 7d</code> (or <code>/warntime off</code>)\n\n"
+        "<b>Use it</b>\n"
+        "• Reply <code>/warn spamming</code>\n"
+        "• Check: reply <code>/warns</code>\n"
+        "• Remove the latest one: reply <code>/rmwarn</code>\n"
+        "• Clear all: reply <code>/resetwarns</code>"),
+    "flood": (
+        "<b>Antiflood</b> stops people sending too many messages fast.\n"
+        "• 6 messages within 5 seconds: <code>/setflood 6 5</code>\n"
+        "• Turn off: <code>/setflood off</code>\n"
+        "• Action: <code>/floodmode mute</code> or <code>/floodmode tmute 30m</code>\n\n"
+        "<b>Antispam</b> catches repeated messages and mass mentions.\n"
+        "• <code>/antispam on</code>\n"
+        "• <code>/repeatlimit 4</code>: 4 identical messages count as spam\n"
+        "• <code>/mentionlimit 5</code>: 5 @mentions in one message count as spam\n"
+        "• <code>/spammode warn</code>: what happens to spammers\n\n"
+        "<b>AntiRaid</b>: <code>/antiraid 3h</code> blocks all new joins for 3 hours, "
+        "<code>/antiraid off</code> ends it, <code>/autoantiraid 15</code> turns it on by itself when 15 people join in a minute."),
+    "captcha": (
+        "<b>Set it up in 4 steps</b>\n"
+        "1. <code>/captcha on</code>\n"
+        "2. Choose the test: <code>/captchamode button</code> or <code>/captchamode math</code>\n"
+        "3. Time to solve it: <code>/captchatime 2m</code> (1m to 60m)\n"
+        "4. If they fail: <code>/captchaaction kick</code> (or mute / ban)\n\n"
+        "New members stay muted until they pass. Turn it off any time with <code>/captcha off</code>.\n"
+        "The bot needs the right to restrict and delete."),
+    "greet": (
+        "<b>Welcome message</b>\n"
+        "• <code>/setwelcome Welcome {mention} to {chat}!</code>\n"
+        "• Turn on/off: <code>/welcome on</code> / <code>/welcome off</code>\n"
+        "• Keep the chat tidy: <code>/cleanwelcome on</code>\n"
+        "• Back to default: <code>/resetwelcome</code>\n\n"
+        "<b>Goodbye message</b>: same with <code>/setgoodbye</code>, <code>/goodbye on|off</code>, <code>/resetgoodbye</code>.\n\n"
+        "You can also reply to a message with <code>/setwelcome</code> to use it as the text. "
+        "Placeholders that work in the text: {first} {last} {fullname} {username} {mention} {id} {chat} {count} and {rules} (rules button)."),
+    "rules": (
+        "<b>Set the rules</b>\n"
+        "• <code>/setrules Be kind and no spam</code> (or reply to a message with <code>/setrules</code>)\n"
+        "• Show them: <code>/rules</code> (<code>/rules raw</code> shows the unformatted text)\n"
+        "• Remove: <code>/resetrules</code>\n\n"
+        "<b>Rules in private</b>\n"
+        "• <code>/privaterules yes</code>: /rules shows a button that opens the rules in the user's private chat\n"
+        "• Rename the button: <code>/setrulesbutton Read the rules</code>"),
+    "notes": (
+        "<b>Save</b>\n"
+        "• Text: <code>/save wifi The password is 12345</code>\n"
+        "• A photo, GIF, video, file, voice or sticker: reply to it with <code>/save funny</code>\n"
+        "• Reply to a message and add text after the name to use it as the caption.\n\n"
+        "<b>Get</b>: <code>/get wifi</code> or just type <code>#wifi</code>\n"
+        "<b>List</b>: <code>/notes</code> or <code>/saved</code>\n"
+        "<b>Delete</b>: <code>/clear wifi</code>, or <code>/clearall</code> to delete every note (asks to confirm)\n\n"
+        "<b>Private notes</b>\n"
+        "<code>/privatenotes on</code>: when someone asks for a note, the bot shows a button and sends the note in "
+        "private. <code>/privatenotes off</code> sends it in the group again."),
+    "filters": (
+        "<b>Add a filter</b>\n"
+        "• <code>/filter hello Hi there!</code>: replies when someone says \"hello\"\n"
+        "• Phrases need quotes: <code>/filter \"good morning\" Morning {first}!</code>\n"
+        "• Or reply to a message with <code>/filter hello</code> to use that message as the reply\n\n"
+        "<b>Manage</b>\n"
+        "• List: <code>/filters</code>\n"
+        "• Remove one: <code>/stop hello</code>\n"
+        "• Remove all: <code>/stopall</code> (asks to confirm)\n\n"
+        "Filters are not case sensitive. Placeholders like {first}, {mention} and {chat} work in replies."),
+    "cleanservice": (
+        "<b>Delete the join / leave / pin messages</b>\n"
+        "• Everything: <code>/cleanservice all</code>\n"
+        "• Only \"X joined\": <code>/cleanservice join</code>\n"
+        "• Several at once: <code>/cleanservice join leave pin</code>\n"
+        "• Stop deleting one type: <code>/keepservice pin</code>\n"
+        "• Stop everything: <code>/cleanservice off</code> (or <code>/keepservice all</code>)\n"
+        "• See what is on now: <code>/cleanservice</code>\n"
+        "• Explain every type: <code>/cleanservicetypes</code>\n\n"
+        "The bot needs the \"Delete messages\" admin right. Welcome messages still work."),
+    "cleancommand": (
+        "<b>Keep the chat free of commands</b>\n"
+        "• Delete every command (the bot still answers it first): <code>/cleancommand all</code>\n"
+        "• Only member commands like /id and /get: <code>/cleancommand user</code>\n"
+        "• Only admin commands like /ban and /mute: <code>/cleancommand admin</code>\n"
+        "• Unknown commands and commands for other bots: <code>/cleancommand other</code>\n"
+        "• Combine: <code>/cleancommand user other</code>\n"
+        "• Stop deleting: <code>/keepcommand all</code> or <code>/keepcommand user</code>\n"
+        "• See what is on now: <code>/cleancommand</code>   Types: <code>/cleancommandtypes</code>\n\n"
+        "The bot needs the \"Delete messages\" admin right."),
+    "autoclose": (
+        "<b>Close the group every night</b>\n"
+        "1. Make the bot an admin with the \"Ban users\" right.\n"
+        "2. <code>/autoclose 23:00 06:00</code>: closes at 11 PM and opens at 6 AM, every day. "
+        "<code>/autoclose 11pm 6am</code> works too.\n"
+        "3. While it is closed only admins can write. Opening brings back the old permissions.\n\n"
+        "• Check: <code>/autoclose</code>\n"
+        "• Stop: <code>/autoclose off</code> (a closed group is opened again)\n\n"
+        "Times use India time unless the host sets BOT_TIMEZONE."),
+    "locks": (
+        "<b>Lock things for non-admins</b>\n"
+        "• See what you can lock: <code>/locktypes</code>\n"
+        "• Lock: <code>/lock stickers gifs links</code>\n"
+        "• Unlock: <code>/unlock stickers</code>\n"
+        "• What is locked now: <code>/locks</code>\n"
+        "• Warn people who break a lock: <code>/lockwarns yes</code>\n\n"
+        "<b>Allowlist</b> (exceptions to locks)\n"
+        "• <code>/allowlist example.com @somebot</code>\n"
+        "• Remove: <code>/rmallowlist example.com</code>, clear all: <code>/rmallowlistall</code>"),
+    "purge": (
+        "The bot needs the \"Delete messages\" right.\n\n"
+        "• Delete everything from a message to now: reply to the first message with <code>/purge</code>\n"
+        "• Delete that message and the next 10: reply with <code>/purge 10</code>\n"
+        "• Same, with no confirmation message: <code>/spurge</code>\n"
+        "• Delete one message: reply <code>/del</code>\n\n"
+        "<b>Delete a range</b>\n"
+        "1. Reply to the FIRST message with <code>/purgefrom</code>\n"
+        "2. Reply to the LAST message with <code>/purgeto</code> (within 10 minutes)"),
+    "log": (
+        "<b>Link a log channel</b>\n"
+        "1. Add the bot to your channel as admin.\n"
+        "2. Send <code>/setlog</code> in the channel. The bot posts a message there.\n"
+        "3. Forward that message to the group within 10 minutes to finish linking.\n\n"
+        "<b>Choose what is logged</b>\n"
+        "• <code>/logcategories</code>: all categories\n"
+        "• <code>/log ban</code> starts and <code>/nolog ban</code> stops a category (names: ban, mute, warn, admin, blocklist, flood, spam, lock, note, filter, purge, captcha...)\n"
+        "• <code>/logchannel</code> shows the current channel, <code>/unsetlog</code> removes it\n\n"
+        "<code>/modlog</code> shows the last actions in this group (kept for 15 days)."),
+    "reports": (
+        "• A member replies to a bad message with <code>/report</code> (or types <code>@admin</code> in the reply). "
+        "All admins are notified.\n"
+        "• Turn reports on/off: <code>/reports on</code> / <code>/reports off</code> (admins)."),
+    "disabling": (
+        "<b>Stop members using a command</b>\n"
+        "• <code>/disableable</code>: commands that can be disabled\n"
+        "• <code>/disable roast</code> (or <code>/disable all</code>)\n"
+        "• <code>/enable roast</code> (or <code>/enable all</code>)\n"
+        "• What is disabled now: <code>/disabled</code>\n\n"
+        "<b>Options</b>\n"
+        "• <code>/disabledel yes</code>: delete the message when someone uses a disabled command\n"
+        "• <code>/disableadmin yes</code>: block admins too"),
+    "approval": (
+        "<b>Approved users</b> are exempt from locks, blocklists and antiflood.\n"
+        "• Approve: reply <code>/approve</code>\n"
+        "• Remove: reply <code>/unapprove</code>\n"
+        "• Check: <code>/approval</code>   List: <code>/approved</code>\n"
+        "• Remove everyone: <code>/unapproveall</code> (group creator only)\n\n"
+        "<b>Join requests</b>\n"
+        "• <code>/joinon</code>: approve requests automatically   <code>/joinoff</code>: stop\n"
+        "• <code>/setjoinmsg Welcome!</code>: message sent to approved people\n"
+        "• Or tap Auto Approve on the previous page. The bot needs the \"Invite users\" right."),
+    "other": (
+        "• Switch every automatic protection off in this group: <code>/pause</code>, for a while: <code>/pause 30m</code>, "
+        "check: <code>/pause status</code>\n"
+        "• Switch it back on: <code>/resume</code>\n"
+        "• Pin a message: reply <code>/pin</code>\n"
+        "• Show or hide the / command menu: <code>/suggestions on</code> / <code>/suggestions off</code>"),
+    "info": (
+        "• <code>/id</code>: your ID (reply to someone for theirs, or use it in a group or channel)\n"
+        "• <code>/info</code>: reply to someone, or give an ID, to see their details\n"
+        "• <code>/limits</code>: this group's moderation settings at a glance"),
+    "extras": (
+        "• <code>/runs</code>: a random funny reply\n"
+        "• <code>/donate</code>: support the creator\n"
+        "• <code>/markdownhelp</code>: how to format text. It works in private chat only, so open the bot's DM."),
+    "roast": (
+        "<b>Quick roasts</b>\n"
+        "• Reply to someone or tag them: <code>/roast @user</code>\n"
+        "• Yourself: <code>/roastme</code>\n"
+        "• More styles: <code>/cook</code>, <code>/burn</code>, <code>/finisher</code>, and reply <code>/comeback</code> to a message\n\n"
+        "<b>Roast battle</b>\n"
+        "1. <code>/roastbattle @user</code>: challenge someone\n"
+        "2. They accept within 60 seconds with the button\n"
+        "3. Each fighter sends one roast (3+ words) within 60 seconds\n"
+        "4. Everyone votes: <code>/roastvote 1</code> or <code>/roastvote 2</code>\n\n"
+        "<b>Scores</b>: <code>/roastscore</code>, <code>/roaststats</code>, <code>/roastking</code>.\n"
+        "Win +10, draw +5, loss +2 points."),
+    "court": (
+        "<b>Start a trial</b>\n"
+        "1. <code>/court @user</code> (or reply to them)\n"
+        "2. The defendant picks a plea with the buttons\n"
+        "3. Everyone else is the jury: <code>/guilty</code> or <code>/innocent</code>\n"
+        "4. After 5 minutes the verdict is read, or an admin closes it early with <code>/verdict</code>\n\n"
+        "<b>Extras</b>: <code>/crime</code>, <code>/evidence</code>, <code>/alibi</code>, <code>/sentence</code>, "
+        "<code>/bail</code>, <code>/appeal</code>, <code>/wanted</code>. Admins can <code>/pardon</code>.\n"
+        "It is only a comedy game: nobody is really banned or muted."),
+    "games": (
+        "Games are for fun and run inside the group.\n"
+        "• <b>Roast</b>: playful roasts and 2-player roast battles with points\n"
+        "• <b>Court</b>: put a friend on a funny trial, the group is the jury\n\n"
+        "Tap Roast or Court above, then open its Usage Guide for step-by-step examples."),
+    "dl": (
+        "• Send a link: <code>/dl https://instagram.com/reel/...</code>\n"
+        "• Audio only: <code>/da &lt;link&gt;</code>\n"
+        "• Or reply to a message that contains the link with <code>/dl</code> or <code>/da</code>\n\n"
+        "Works for public videos like Instagram Reels. YouTube links are not supported."),
+    "ie": (
+        "<b>Copy one group's setup to another</b>\n"
+        "1. In the old group (any admin): <code>/export</code>. The bot sends a .json file.\n"
+        "2. Forward that file to the new group.\n"
+        "3. The group creator replies to the file with <code>/import</code>.\n\n"
+        "<b>Only some modules</b>\n"
+        "• <code>/export notes filters</code>\n"
+        "• <code>/import rules greetings</code>\n\n"
+        "<b>Start over</b>: <code>/reset</code> (creator only, asks to confirm). Export first if you may want it back.\n"
+        "Members' warnings, approvals and message counts are never touched."),
 }
 
 
@@ -1442,10 +1758,14 @@ def help_main_keyboard(chat=None, user_id=None):
     
     fun_row = list(fun_systems.fun_help_row())  # 🎉 Fun, 🗑 Delete, placeholder -> the placeholder becomes ➕ More
     if len(fun_row) >= 3:
-        fun_row[2] = InlineKeyboardButton("📄 Page 2", callback_data="help:more")
-    rows.append(fun_row)  # 🎉 Fun + two placeholders: its own row under Count / AI Commands / Blocking
-    if user_id in OWNER_IDS:  # 👑 Owner: its own row, just above the Suggestion Bar, shown to the Bot Owner only
-        rows.append([InlineKeyboardButton("👑 Owner", callback_data="own:m")])
+        fun_row[2] = InlineKeyboardButton("🎮 Games", callback_data="help:games")
+    rows.append(fun_row)  # 🎉 Fun, 🗑 Delete, 🎮 Games: its own row under Count / AI Commands / Blocking
+    rows.append([InlineKeyboardButton("✨ Extras", callback_data="help:extras"),
+                 InlineKeyboardButton("📥 Download", callback_data="help:dl"),
+                 InlineKeyboardButton("📦 Import & Export", callback_data="help:ie")])
+    rows.append([InlineKeyboardButton("📄 Page 2", callback_data="help:more")])  # full width, like Owner and the suggestions bar
+    if user_id in OWNER_IDS or (user_id and is_super_admin(user_id)):  # 🛡 Bot Staff: just above the Suggestion Bar, owner + bot staff only
+        rows.append([InlineKeyboardButton("🛡 Bot Staff", callback_data="own:m")])
     if chat is not None:  # always the last row, in groups and in private chat
         rows.append([suggestions_button(chat.id, "help")])
     return InlineKeyboardMarkup(style_help_buttons(rows))
@@ -1457,15 +1777,17 @@ def help_section_keyboard(key=None, chat=None):
         # Admin section: pause / resume every automatic function of this group (same state as /pause, /resume)
         rows.append([InlineKeyboardButton("⏸ Pause", callback_data="pz:p"),
                      InlineKeyboardButton("▶️ Resume", callback_data="pz:r")])
-    if key == "more":
-        rows.append([InlineKeyboardButton("📥 Download", callback_data="help:dl"),
-                     InlineKeyboardButton("📦 Import & Export", callback_data="help:ie")])
+    if key == "games":
+        rows.append([InlineKeyboardButton("🔥 Roast", callback_data="help:roast"),
+                     InlineKeyboardButton("⚖️ Court", callback_data="help:court")])
     if key == "ie":  # Import and Export side by side on ONE row
         rows.append([InlineKeyboardButton("📥 Import", callback_data="ie:imp"),
                      InlineKeyboardButton("📤 Export", callback_data="ie:exp")])
     if key == "approval" and chat is not None and chat.type != "private":
         rows.append([InlineKeyboardButton("⚙️ Auto Approve", callback_data="jn:m")])
-    back = "help:more" if key in ("dl", "ie") else "help:main"
+    if key in USAGE_GUIDES:  # 📖 every help page that has a guide gets the button, right above Back
+        rows.append([InlineKeyboardButton("📖 Usage Guide", callback_data=f"help:g_{key}")])
+    back = {"roast": "help:games", "court": "help:games"}.get(key, "help:main")
     rows.append([InlineKeyboardButton("« Back", callback_data=back)])
     return InlineKeyboardMarkup(rows)
 
@@ -1530,6 +1852,16 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await fun_systems.birthday_menu_from_help(update, context)
         return
     await q.answer()
+    if key.startswith("g_") and key[2:] in USAGE_GUIDES:  # 📖 Usage Guide of one help page
+        gkey = key[2:]
+        label = HELP_SECTIONS[gkey][0] if gkey in HELP_SECTIONS else gkey
+        try:
+            await q.edit_message_text(f"<b>📖 Usage Guide: {html.escape(label)}</b>\n\n{USAGE_GUIDES[gkey]}",
+                                      parse_mode="HTML",
+                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data=f"help:{gkey}")]]))
+        except TelegramError:
+            pass
+        return
     if key == "main" or key not in HELP_SECTIONS:
         text = f"<b>{html.escape(extra.bot_name())}</b>\n\n{HELP_INTRO}"
         markup = help_main_keyboard(update.effective_chat, update.effective_user.id if update.effective_user else None)
@@ -1543,7 +1875,7 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass  # message unchanged (double tap) or too old to edit; safe to ignore
 
 
-# ------------------------------------------------- 👑 Owner: default settings for NEW groups
+# ------------------------------------------------- 🛡 Bot Staff: default settings for NEW groups
 # kind "split": one key for the action + one key for the mute seconds (Ads, Protection)
 # kind "mode":  one key holding "ban" / "kick" / "tmute:<seconds>" ... (Flood, Spam, Blocklist, Warnings, Captcha)
 OWNER_DEFAULTS = {
@@ -1603,7 +1935,7 @@ def _owner_option_label(cat, option):
 
 
 def owner_main_text():
-    return ("<b>👑 Owner: default settings</b>\n\n"
+    return ("<b>🛡 Bot Staff: default settings</b>\n\n"
             "These are the settings every <b>new</b> group starts with when the bot is added. Groups that already "
             "exist are not changed, and each group's admins can still change their own group.\n\n"
             "Tap a category to see or change its default.")
@@ -1612,6 +1944,7 @@ def owner_main_text():
 def owner_main_keyboard():
     buttons = [InlineKeyboardButton(OWNER_DEFAULTS[c]["label"], callback_data=f"own:c:{c}") for c in OWNER_CAT_ORDER]
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([group.broadcast_button()])  # 📢 Broadcast (all in group.py)
     rows.append([InlineKeyboardButton("🔙 Back", callback_data="help:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -1654,11 +1987,11 @@ def _owner_save(cat, action=None, secs=None):
 
 
 async def owner_callback(update, context):
-    """👑 Owner panel buttons. Strictly the Bot Owner (OWNER_IDS): the button is hidden from others, and every
-    tap re-checks the person."""
+    """🛡 Bot Staff panel buttons. Only the Bot Owner (OWNER_IDS) and the bot's staff (not group admins): the button
+    is hidden from others, and every tap re-checks the person."""
     q = update.callback_query
-    if q.from_user.id not in OWNER_IDS:
-        await q.answer("This is for the bot owner only.", show_alert=True)
+    if q.from_user.id not in OWNER_IDS and not is_super_admin(q.from_user.id):
+        await q.answer("This is for the bot owner and bot staff only.", show_alert=True)
         return
     if await extra.menu_not_owner(q):
         return
@@ -2317,7 +2650,8 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if verify and not added_by_admin and not is_bot_owner(user.id) and not await is_admin(chat, user.id):
             await start_captcha(context, chat, user)
         else:
-            await send_welcome(context, chat, user, reply_to=msg)
+            await send_welcome(context, chat, user,
+                               reply_to=None if group.is_service_cleaned(chat.id, "join") else msg)
 
 
 async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2436,6 +2770,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await deliver_rules_pm(update, context, int(arg[len("rules_"):]))
         except ValueError:
             await update.effective_message.reply_text("That rules link isn't valid.")
+        return
+    if chat.type == "private" and arg.startswith("note_"):
+        await deliver_note_pm(update, context, arg[len("note_"):])
         return
     if chat.type != "private":
         await update.effective_message.reply_text(
@@ -2848,17 +3185,120 @@ async def captchaaction(update, context):
 
 
 # ------------------------------------------------------------ notes/filters
+# ---- notes can hold media: a replied-to photo/GIF/video/file/voice/sticker is stored as a small JSON record
+NOTE_MEDIA_PREFIX = "[[media]]"
+_NOTE_MEDIA_SENDERS = {"photo": "reply_photo", "video": "reply_video", "animation": "reply_animation",
+                       "document": "reply_document", "audio": "reply_audio", "voice": "reply_voice",
+                       "sticker": "reply_sticker", "video_note": "reply_video_note"}
+
+
+def note_media_from(message, caption_text=""):
+    """A stored note string for a media message, or None when the message has no media."""
+    if message is None:
+        return None
+    for kind in _NOTE_MEDIA_SENDERS:
+        obj = getattr(message, kind, None)
+        if not obj:
+            continue
+        file_id = obj[-1].file_id if kind == "photo" else obj.file_id
+        cap = html.escape(caption_text) if caption_text else (message.caption_html if message.caption else "")
+        return NOTE_MEDIA_PREFIX + json.dumps({"t": kind, "f": file_id, "c": cap}, ensure_ascii=False)
+    return None
+
+
+async def send_note(update, context, content, chat=None):
+    """Sends a saved note (text or media) as a reply. `chat` = the group the note belongs to (for placeholders)."""
+    msg = update.effective_message
+    if content.startswith(NOTE_MEDIA_PREFIX):
+        try:
+            data = json.loads(content[len(NOTE_MEDIA_PREFIX):])
+            send = getattr(msg, _NOTE_MEDIA_SENDERS[data["t"]])
+            file_id, cap = data["f"], data.get("c") or ""
+        except (ValueError, KeyError, TypeError, AttributeError):
+            await msg.reply_text("That note is damaged. Save it again.")
+            return
+        kw = {"caption": cap, "parse_mode": "HTML"} if cap and data["t"] not in ("sticker", "video_note") else {}
+        try:
+            await send(file_id, **kw)
+        except TelegramError:
+            try:
+                await send(file_id)
+            except TelegramError:
+                await msg.reply_text("I couldn't send that note's media.")
+        return
+    if chat is None or chat.id == update.effective_chat.id:
+        await reply_rendered(update, content)
+        return
+    count = ""
+    if "{count}" in content:
+        try:
+            count = await chat.get_member_count()
+        except TelegramError:
+            count = ""
+    await safe_html(msg.reply_text, render(content, update.effective_user, chat, count))
+
+
+def private_notes_on(chat_id):
+    return get_setting(chat_id, "private_notes", "False") == "True"
+
+
+async def deliver_note(update, context, name, content):
+    """In a group with /privatenotes ON: a button that opens the note in private; otherwise the note itself."""
+    chat = update.effective_chat
+    if chat.type != "private" and private_notes_on(chat.id):
+        token = base64.urlsafe_b64encode(name.encode("utf-8")).decode().rstrip("=")
+        payload = f"note_{chat.id}_{token}"
+        if len(payload) <= 64:  # Telegram's limit for a /start payload
+            link = f"https://t.me/{await bot_username(context)}?start={payload}"
+            await update.effective_message.reply_text(
+                f"Tap the button to get the note '{name}' in private.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📩 Click me!", url=link)]]))
+            return
+    await send_note(update, context, content)
+
+
+async def deliver_note_pm(update, context, payload):
+    """/start note_<chat id>_<name>: send one note of a group to someone in private."""
+    msg, user = update.effective_message, update.effective_user
+    try:
+        cid, _, token = payload.partition("_")
+        chat_id = int(cid)
+        name = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        await msg.reply_text("That note link isn't valid.")
+        return
+    try:
+        chat = await context.bot.get_chat(chat_id)
+    except TelegramError:
+        await msg.reply_text("I couldn't find that group. Ask an admin to add me back to it.")
+        return
+    if await get_role(chat, user.id) in (None, ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+        await msg.reply_text("You need to be a member of that group to read its notes.")
+        return
+    content = store.note_get(chat_id, name)
+    if content is None:
+        await msg.reply_text("Note not found.")
+        return
+    await send_note(update, context, content, chat=chat)
+
+
 async def save_note(update, context):
     if not await admin_only(update):
         return
     msg = update.effective_message
     if not context.args:
-        await msg.reply_text("Usage: /save name text (or reply to a message)")
+        await msg.reply_text("Usage: /save name text (or reply to a message, even a photo, GIF or file)")
         return
+    parts = msg.text.split(None, 2)
     name = context.args[0].lower()
-    content = msg.text.partition(name)[2].strip() if len(context.args) > 1 else ""
-    if not content and msg.reply_to_message:
-        content = msg.reply_to_message.text or ""
+    content = parts[2].strip() if len(parts) > 2 else ""
+    reply = msg.reply_to_message
+    if reply is not None:
+        media = note_media_from(reply, content)       # replying to media: the text after the name is its caption
+        if media:
+            content = media
+        elif not content:
+            content = reply.text or ""
     if not content:
         await msg.reply_text("Give me some text or reply to a message.")
         return
@@ -2870,9 +3310,10 @@ async def save_note(update, context):
 async def get_note(update, context):
     if not context.args:
         return
-    content = store.note_get(update.effective_chat.id, context.args[0].lower())
+    name = context.args[0].lower()
+    content = store.note_get(update.effective_chat.id, name)
     if content is not None:
-        await reply_rendered(update, content)
+        await deliver_note(update, context, name, content)
     else:
         await update.effective_message.reply_text("Note not found.")
 
@@ -2888,6 +3329,84 @@ async def clear_note(update, context):
     store.note_del(update.effective_chat.id, context.args[0].lower())
     await update.effective_message.reply_text("Note removed.")
     await log_action(update.effective_chat, "note", f"🗑 {update.effective_user.mention_html()} removed note '{context.args[0].lower()}'.")
+
+
+async def privatenotes_cmd(update, context):
+    """/privatenotes on|off: send notes in private (a button in the group opens them)."""
+    chat, msg = update.effective_chat, update.effective_message
+    if chat.type == "private":
+        await msg.reply_text("Private notes are a group setting. Use /privatenotes in your group.")
+        return
+    if not await admin_only(update):
+        return
+    flag = parse_yes_no(context.args)
+    if flag is None:
+        await msg.reply_text(f"Private notes: {'ON' if private_notes_on(chat.id) else 'OFF'}.\n"
+                             "Change it with /privatenotes on|off.")
+        return
+    set_setting(chat.id, "private_notes", "True" if flag else "False")
+    await msg.reply_text("✅ Notes will now be sent in private: members tap a button to get them." if flag
+                         else "✅ Notes will be sent in the group again.")
+
+
+# ---- /clearall (every note) and /stopall (every filter): ask first, then wipe
+async def _wipe_prompt(update, kind):
+    chat, msg = update.effective_chat, update.effective_message
+    if chat.type == "private":
+        await msg.reply_text("Use this command in a group.")
+        return
+    if not await admin_only(update):
+        return
+    n = len(store.note_names(chat.id)) if kind == "notes" else len(store.filter_rows(chat.id))
+    if not n:
+        await msg.reply_text("No notes saved." if kind == "notes" else "No filters set.")
+        return
+    await msg.reply_text(
+        f"⚠️ Delete ALL {n} {kind} in this chat? This cannot be undone.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, delete all", callback_data=f"wipe:{kind}:y"),
+                                            InlineKeyboardButton("❌ Cancel", callback_data=f"wipe:{kind}:n")]]))
+
+
+async def clearall_cmd(update, context):
+    await _wipe_prompt(update, "notes")
+
+
+async def stopall_cmd(update, context):
+    await _wipe_prompt(update, "filters")
+
+
+def _wipe_now(chat_id, kind):
+    if kind == "notes":
+        names = list(store.note_names(chat_id))
+        for n in names:
+            store.note_del(chat_id, n)
+        return len(names)
+    keys = [k for k, _ in store.filter_rows(chat_id)]
+    for k in keys:
+        store.filter_remove(chat_id, k)
+    return len(keys)
+
+
+async def wipe_callback(update, context):
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    parts = (q.data or "").split(":")
+    if chat is None or len(parts) < 3 or parts[1] not in ("notes", "filters"):
+        await q.answer()
+        return
+    if not (await is_admin(chat, q.from_user.id) or is_bot_owner(q.from_user.id) or store.is_super_admin(q.from_user.id)):
+        await q.answer("Admins only.", show_alert=True)
+        return
+    kind = parts[1]
+    if parts[2] != "y":
+        await q.answer("Cancelled.")
+        await q.edit_message_text("Cancelled. Nothing was deleted.")
+        return
+    await q.answer()
+    n = await asyncio.to_thread(_wipe_now, chat.id, kind)
+    await q.edit_message_text(f"🗑 Deleted {n} {kind}.")
+    await log_action(chat, "note" if kind == "notes" else "filter",
+                     f"🗑 {q.from_user.mention_html()} deleted ALL {kind} ({n}).")
 
 
 async def add_filter(update, context):
@@ -3070,7 +3589,7 @@ async def check_setlog_forward(update, context):
         await msg.reply_text("Only a group admin can finish setting up the log channel.")
         return True
     # The channel must belong to whoever links it: otherwise one group's logs could be pointed at (and mixed
-    # into) a channel another group uses. The Bot Owner and Super Admins are exempt.
+    # into) a channel another group uses. The Bot Owner and Bot Staff are exempt.
     if user.id not in OWNER_IDS and not is_super_admin(user.id):
         try:
             channel_admin = (await context.bot.get_chat_member(origin_chat.id, user.id)).status in ADMIN_STATUSES
@@ -3089,7 +3608,7 @@ _sug_synced = set()   # groups whose command list was already published this run
 _sug_locks = {}       # one toggle at a time per chat
 _BOT_ID = None        # set in post_init: settings that mirror Telegram state are keyed per bot
 
-SUG_DENIED = "Only Group Admins, Bot Owner, or Moderators can toggle this setting."
+SUG_DENIED = "Only Group Admins, Bot Owner, or Bot Staff can toggle this setting."
 HELP_ONLY = [BotCommand("help", "Open the help menu")]
 
 
@@ -3136,7 +3655,7 @@ async def _gather_limited(coros, limit=6):
 
 
 async def can_toggle_suggestions(chat, user_id, msg=None) -> bool:
-    """Bot Owner, Bot Moderators (Super Admins) and group admins/owner only."""
+    """Bot Owner, Bot Staff and group admins/owner only."""
     if is_bot_owner(user_id) or is_super_admin(user_id):
         return True
     if msg is not None and msg.sender_chat is not None and msg.sender_chat.id == chat.id:
@@ -3376,8 +3895,8 @@ async def _pause_allowed(update) -> bool:
     if chat.type == "private":
         await msg.reply_text("Use this command in a group.")
         return False
-    if not await can_toggle_suggestions(chat, user.id, msg):  # Bot Owner, Super Admins, group admins
-        await msg.reply_text("Only group admins, the Bot Owner or Moderators can use this command.")
+    if not await can_toggle_suggestions(chat, user.id, msg):  # Bot Owner, Bot Staff, group admins
+        await msg.reply_text("Only group admins, the Bot Owner or Bot Staff can use this command.")
         return False
     return True
 
@@ -3447,7 +3966,7 @@ async def pause_callback(update, context):
         await q.answer("This button is no longer valid.", show_alert=True)
         return
     if not await can_toggle_suggestions(chat, q.from_user.id):
-        await q.answer("Only group admins, the Bot Owner or Moderators can do this.", show_alert=True)
+        await q.answer("Only group admins, the Bot Owner or Bot Staff can do this.", show_alert=True)
         return
     pausing = q.data == "pz:p"
     if pausing == is_paused(chat.id):
@@ -4105,10 +4624,10 @@ async def watcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # #note shortcut
     if text.startswith("#"):
-        name = text[1:].split()[0]
+        name = text[1:].split()[0].lower()
         content = store.note_get(chat.id, name)
         if content is not None:
-            await reply_rendered(update, content)
+            await deliver_note(update, context, name, content)
             return
 
     # keyword filters
@@ -4250,7 +4769,7 @@ async def _purge_checks(update, context, need_reply=True):
         await msg.reply_text(PURGE_ERR["group_only"])
         return False
     anonymous_admin = msg.sender_chat is not None and msg.sender_chat.id == chat.id
-    # Bot Owner and Bot Moderators (Super Admins) may purge in any group.
+    # Bot Owner and Bot Staff may purge in any group.
     privileged = is_bot_owner(user.id) or is_super_admin(user.id)
     if not anonymous_admin and not privileged:
         try:
@@ -4482,8 +5001,8 @@ async def purgeto(update, context):
                        start_sent_at=state.get("sent_at"))
 
 
-# ------------------------------------------------- super admin management
-ERR_SA_DENIED = "⚠️ Access Denied: Only the Primary Bot Owner can manage Super Admins."
+# ------------------------------------------------- bot staff management
+ERR_SA_DENIED = "⚠️ Access Denied: Only the Primary Bot Owner can manage Bot Staff."
 ERR_SA_INVALID = (
     "⚠️ Invalid user. Please give a numeric User ID or an @username, "
     "or reply to the user's message with the command."
@@ -4527,7 +5046,7 @@ async def resolve_admin_target(update, context):
     if reply and reply.from_user:
         u = reply.from_user
         if u.is_bot:
-            return None, None, "⚠️ Bots can't be Super Admins."
+            return None, None, "⚠️ Bots can't be Bot Staff."
         return u.id, u.username, None
     for ent in msg.entities or []:
         if ent.type == "text_mention" and ent.user:
@@ -4565,10 +5084,10 @@ async def addadmin_cmd(update, context):
         await msg.reply_text("ℹ️ That user is the Primary Bot Owner and already has full access.")
         return
     if is_super_admin(uid):
-        await msg.reply_text("⚠️ User is already a Super Admin.")
+        await msg.reply_text("⚠️ User is already Bot Staff.")
         return
     store.sa_add(uid, username, update.effective_user.id, int(time.time()))
-    await msg.reply_html(f"✅ User {sa_label(uid, username)} has been added as a Super Admin.")
+    await msg.reply_html(f"✅ User {sa_label(uid, username)} has been added as Bot Staff.")
 
 
 async def removeadmin_cmd(update, context):
@@ -4583,12 +5102,12 @@ async def removeadmin_cmd(update, context):
         await msg.reply_text("⚠️ The Primary Bot Owner can't be removed.")
         return
     if not is_super_admin(uid):
-        await msg.reply_text("⚠️ User is not a Super Admin.")
+        await msg.reply_text("⚠️ User is not Bot Staff.")
         return
     stored = store.sa_remove(uid)
     await msg.reply_html(
         f"✅ User {sa_label(uid, username or stored)} "
-        "has been removed from Super Admins."
+        "has been removed from Bot Staff."
     )
 
 
@@ -4598,7 +5117,7 @@ async def adminlist_cmd(update, context):
         return
     rows = super_admin_rows()
     if not rows:
-        await msg.reply_text("ℹ️ No Super Admins have been added yet.")
+        await msg.reply_text("ℹ️ No Bot Staff have been added yet.")
         return
     lines = []
     for i, (uid, username) in enumerate(rows, 1):
@@ -4611,7 +5130,7 @@ async def adminlist_cmd(update, context):
                 store.sa_set_username(uid, username)
         who = f"@{html.escape(username)}" if username else "no username"
         lines.append(f"{i}. <code>{uid}</code> - {who}")
-    await msg.reply_html(f"<b>🛡 Super Admins ({len(rows)})</b>\n\n" + "\n".join(lines))
+    await msg.reply_html(f"<b>🛡 Bot Staff ({len(rows)})</b>\n\n" + "\n".join(lines))
 
 
 # ------------------------------------------- help-menu editors (group / bot)
@@ -4720,7 +5239,7 @@ def cancel_keyboard(kind):
 async def edit_perm_error(kind, chat, user_id):
     """Returns an error message if this user may not use the editor, else None."""
     if kind == "bot":
-        # Bot settings: ONLY the configured Bot Owner (never group roles or Super Admins).
+        # Bot settings: ONLY the configured Bot Owner (never group roles or Bot Staff).
         if user_id in OWNER_IDS:
             return None
         return ERR_BOT_DENIED if OWNER_IDS else owner_setup_hint(user_id)
@@ -5263,7 +5782,7 @@ async def _startup_sync_safe(app):
 async def post_init(app):
     """Must stay instant: polling doesn't begin until this returns."""
     if not OWNER_IDS:
-        logging.warning("OWNER_IDS is empty - Bot Edit and Super Admin commands are locked "
+        logging.warning("OWNER_IDS is empty - Bot Edit and Bot Staff commands are locked "
                         "until you set the OWNER_IDS environment variable to your Telegram ID.")
     global _BOT_ID
     _BOT_ID = app.bot.id  # main bot and test bot keep separate command-sync state
@@ -5272,6 +5791,7 @@ async def post_init(app):
     app.bot_data["captcha_task"] = asyncio.create_task(captcha_sweeper(app))
     app.bot_data["msgcount_task"] = asyncio.create_task(msgcount.outbox_sweeper(app))  # pending milestone messages
     app.bot_data["notice_task"] = asyncio.create_task(extra.notice_sweeper(app))  # deletes action notices after 1 day
+    app.bot_data["autoclose_task"] = asyncio.create_task(group.sweeper(app))  # closes / opens groups on schedule
     app.bot_data["startup_task"] = asyncio.create_task(_startup_sync_safe(app))
 
 
@@ -5398,7 +5918,7 @@ async def stats_record(update, context):
         _stats_remember(chat.id, chat.title)
 
 
-# Defaults a NEW group starts with when the bot is added to it. These are the ORIGINAL values; the 👑 Owner panel can
+# Defaults a NEW group starts with when the bot is added to it. These are the ORIGINAL values; the 🛡 Bot Staff panel can
 # change any of them (saved in MongoDB). Existing groups keep what they have: a value is only written when the group
 # has no value of its own yet.
 NEW_GROUP_DEFAULTS = {
@@ -5413,7 +5933,7 @@ NEW_GROUP_DEFAULTS = {
 
 
 def new_group_defaults():
-    """What a new group gets: the original values, replaced by whatever the owner changed in the 👑 Owner panel."""
+    """What a new group gets: the original values, replaced by whatever the owner changed in the 🛡 Bot Staff panel."""
     out = dict(NEW_GROUP_DEFAULTS)
     try:
         out.update(store.owner_defaults())
@@ -5949,7 +6469,7 @@ async def _join_hello(context, req):
 
 def main():
     extra.start_web_server()  # Render: open the port first (health check / keep-alive)
-    logging.warning("OWNER_IDS loaded: %s (the 👑 Owner button shows only for these Telegram user IDs)", OWNER_IDS)
+    logging.warning("OWNER_IDS loaded: %s (the 🛡 Bot Staff button shows for these IDs and for the bot's staff)", OWNER_IDS)
     missing = [n for n in ("BOT_TOKEN", "MONGO_URI") if not (os.getenv(n) or "").strip()]
     if missing:
         logging.critical("Missing required environment variable(s): %s. Add them in the Render "
@@ -6001,7 +6521,8 @@ def main():
         "repeatlimit": repeatlimit, "mentionlimit": mentionlimit,
         "blocklistmode": blocklistmode, "report": report_cmd, "reports": reports_toggle,
         "groupedit": groupedit_cmd, "bot": bot_cmd, "cancel": cancel_cmd,
-        "addadmin": addadmin_cmd, "removeadmin": removeadmin_cmd, "adminlist": adminlist_cmd,
+        "addstaff": addadmin_cmd, "removestaff": removeadmin_cmd, "stafflist": adminlist_cmd,
+        "addadmin": addadmin_cmd, "removeadmin": removeadmin_cmd, "adminlist": adminlist_cmd,  # the old names still work
         "disable": disable_cmd, "enable": enable_cmd, "disableable": disableable_cmd,
         "disabled": disabled_cmd, "disabledel": disabledel_toggle, "disableadmin": disableadmin_toggle,
         "approve": approve_user, "unapprove": unapprove_user, "approved": approved_list,
@@ -6017,7 +6538,8 @@ def main():
         "setrulesbutton": setrulesbutton, "resetrulesbutton": resetrulesbutton,
         "locks": locks_cmd, "lockwarns": lockwarns, "locktypes": locktypes,
         "allowlist": allowlist_cmd, "rmallowlist": rmallowlist, "rmallowlistall": rmallowlistall,
-        "save": save_note, "get": get_note, "notes": list_notes, "clear": clear_note,
+        "save": save_note, "get": get_note, "notes": list_notes, "saved": list_notes, "clear": clear_note,
+        "clearall": clearall_cmd, "stopall": stopall_cmd, "privatenotes": privatenotes_cmd,
         "filter": add_filter, "stop": stop_filter, "filters": list_filters,
         "pause": pause_cmd, "resume": resume_cmd,
         "lock": lock, "unlock": unlock, "pin": pin, "purge": purge, "spurge": spurge, "del": del_cmd,
@@ -6036,19 +6558,24 @@ def main():
     fun_systems.register(app, SimpleNamespace(
         is_admin=is_admin, admin_only=admin_only, lock_exempt=lock_exempt,
         load_allow=load_allow, url_allowed=url_allowed, log_action=log_action, MUTED=MUTED,
-        owner_ids=OWNER_IDS, is_super_admin=is_super_admin))  # 🎉 Fun management: the Bot Owner and the bot's admins
+        owner_ids=OWNER_IDS, is_super_admin=is_super_admin))  # 🎉 Fun management: the Bot Owner and the bot's staff
     # auto-ads / promotion blocker + the 🔒 Blocking menu (lives in extra.py; per-group settings in the settings store)
     extra.register_blocking(app, SimpleNamespace(
         is_admin=is_admin, lock_exempt=lock_exempt, load_allow=load_allow, url_allowed=url_allowed,
         log_action=log_action, MUTED=MUTED, is_super_admin=is_super_admin, owner_ids=OWNER_IDS,
         is_paused=is_paused, is_bot_owner=is_bot_owner, get_setting=store.get_setting, set_setting=store.set_setting,
         block_words=store.block_words))  # the Blocklist is the shared word source for NSFW Word
-    importexport.register(app, SimpleNamespace(is_admin=is_admin, is_bot_owner=is_bot_owner))  # /export /import /reset
+    group.register(app, SimpleNamespace(
+        group_only=group_only, get_setting=get_setting, set_setting=set_setting, is_paused=is_paused,
+        default_perms=DEFAULT_PERMS, fun_names=fun_systems._fun_names, is_admin=is_admin,
+        is_bot_owner=is_bot_owner, owner_ids=OWNER_IDS, is_super_admin=is_super_admin,
+        groups_source=_stats_refresh))  # /autoclose, /cleanservice, /cleancommand, /export /import /reset
     msgcount.register(app, owner_ids=OWNER_IDS, groups_source=_stats_refresh)  # /rank /top /today /week /overall /me /radmin /resetrank + counter + 📊 menu
+    app.add_handler(CallbackQueryHandler(wipe_callback, pattern=r"^wipe:"))  # /clearall and /stopall confirmation
     app.add_handler(CallbackQueryHandler(captcha_callback, pattern=r"^cap:"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:"))
     app.add_handler(CallbackQueryHandler(start_callback, pattern=r"^start:"))
-    app.add_handler(CallbackQueryHandler(owner_callback, pattern=r"^own:"))  # 👑 Owner: defaults for new groups
+    app.add_handler(CallbackQueryHandler(owner_callback, pattern=r"^own:"))  # 🛡 Bot Staff: defaults for new groups
     app.add_handler(CallbackQueryHandler(pause_callback, pattern=r"^pz:"))
     # /power: matched ONLY for a Primary Bot Owner in a private chat, so everyone else gets complete silence
     app.add_handler(CommandHandler(["power", "showpower"], power_cmd,

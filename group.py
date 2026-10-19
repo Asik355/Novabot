@@ -1,0 +1,1443 @@
+"""
+group.py: all group-management logic in ONE file (merged from autoclose.py, cleaner.py and importexport.py).
+
+  AUTO CLOSE / OPEN   /autoclose 23:00 06:00   /autoclose off   /autoclose
+  CLEAN SERVICE       /cleanservice <type>  /keepservice <type>  /nocleanservice <type>  /cleanservicetypes
+  CLEAN COMMANDS      /cleancommand <type>  /keepcommand <type>  /cleancommandtypes
+  IMPORT / EXPORT     /export [modules]  /import [modules]  /reset  (+ the Import / Export buttons on /help page 2)
+  BROADCAST           📢 button in the Bot Staff panel: send a message to all groups or chosen groups
+
+Sections of this file
+  1. Imports, shared state and constants
+  2. Auto close / auto open  (schedule, background loop, /autoclose)
+  3. Clean service + clean commands
+  4. Import / export / reset of a group's settings
+  5. Broadcast (Bot Staff panel)
+  6. register(app, deps)  <- the single entry point
+
+Wiring in nova.py (replaces the three old register calls and the old module names):
+
+    import group
+    group.register(app, SimpleNamespace(
+        group_only=..., get_setting=..., set_setting=..., is_paused=..., default_perms=...,
+        fun_names=fun_systems._fun_names, is_admin=..., is_bot_owner=...,
+        owner_ids=OWNER_IDS, is_super_admin=is_super_admin, groups_source=_stats_refresh))
+    # in the Bot Staff keyboard (owner_main_keyboard):  rows.append([group.broadcast_button()])
+    # in post_init:
+    asyncio.create_task(group.sweeper(app))
+    # anywhere you used cleaner.is_service_cleaned(...):
+    group.is_service_cleaned(chat_id, "join")
+
+deps needs:
+    group_only(update)       async, group + admin check (replies by itself)
+    get_setting, set_setting, is_paused(chat_id), default_perms
+    fun_names()              async, names of the Fun commands
+    is_admin(chat, user_id)  async
+    is_bot_owner(user_id)
+    owner_ids, is_super_admin(user_id)   who may broadcast (bot owner + bot staff)
+    groups_source(bot)       async, [(chat_id, title, link)] of every group the bot is in
+"""
+import asyncio
+import html
+import io
+import json
+import logging
+import os
+import re
+import time
+from datetime import datetime, timedelta, timezone
+
+from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatMemberStatus
+from telegram.error import BadRequest, ChatMigrated, Forbidden, RetryAfter, TelegramError
+from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
+
+import extra
+import migrate_to_mongo as store
+
+log = logging.getLogger("group")
+D = None            # helpers handed in by nova.py (see register)
+_app = None
+
+
+# ======================================================================================================
+# 2. AUTO CLOSE / AUTO OPEN
+# ======================================================================================================
+# A group is closed every day at a set time (only admins can write) and opened again later.
+#   * "Closed" = the group's default member permissions are switched off. Admins/owner/bots with the right are unaffected.
+#   * Before closing, the permissions are saved; at opening time exactly those are restored.
+#   * A background loop checks every 30 seconds, so a restart never skips an opening/closing time.
+#   * The bot needs the "Ban users" (restrict members) admin right.
+#   * Nothing happens while a group is paused with /pause.
+# Settings per group: autoclose = "HH:MM-HH:MM", autoclose_state = "closed" | "open", autoclose_saved = JSON perms.
+AUTOCLOSE_KEY, STATE_KEY, SAVED_KEY = "autoclose", "autoclose_state", "autoclose_saved"
+CHECK_EVERY = 30         # seconds between checks
+RETRY_AFTER = 600        # seconds before a failed close/open is tried again
+NOTICE_EVERY = 6 * 3600  # at most one "I couldn't do it" notice per group per 6 hours
+BOT_TIMEZONE = os.environ.get("BOT_TIMEZONE", "Asia/Kolkata")
+_retry_at = {}           # (chat_id, "close"|"open") -> monotonic time of the next try
+_notice_at = {}          # chat_id -> monotonic time of the last failure notice
+
+CLOSED_PERMS = ChatPermissions(
+    can_send_messages=False, can_send_audios=False, can_send_documents=False, can_send_photos=False,
+    can_send_videos=False, can_send_video_notes=False, can_send_voice_notes=False, can_send_polls=False,
+    can_send_other_messages=False, can_add_web_page_previews=False, can_invite_users=False,
+    can_pin_messages=False, can_change_info=False)
+
+
+def _tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(BOT_TIMEZONE)
+    except Exception:
+        if BOT_TIMEZONE == "Asia/Kolkata":
+            return timezone(timedelta(hours=5, minutes=30), "IST")
+        return timezone.utc
+
+
+# ------------------------------------------------------------------ times
+_TIME_RE = re.compile(r"^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$", re.I)
+
+
+def parse_time(text):
+    """'23:00' | '11pm' | '6:30 am' | '6' -> minutes since midnight, or None."""
+    m = _TIME_RE.match((text or "").strip())
+    if not m:
+        return None
+    hour, minute, ampm = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "").lower()
+    if minute > 59:
+        return None
+    if ampm:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if ampm == "pm" else 0)
+    elif hour > 23:
+        return None
+    return hour * 60 + minute
+
+
+def parse_two_times(text):
+    """'23:00 06:00' | '11pm 6am' | '11 pm 6 am' | '23:00-06:00' | '11pm to 6am' -> (close, open) in minutes, or (None, None)."""
+    text = (text or "").strip().lower()
+    parts = [p.strip() for p in re.split(r"\s*-\s*|\s+to\s+", text) if p.strip()]
+    if len(parts) != 2:
+        tokens = text.split()
+        if len(tokens) == 2:
+            parts = tokens
+        elif len(tokens) == 4 and tokens[1] in ("am", "pm") and tokens[3] in ("am", "pm"):
+            parts = [tokens[0] + tokens[1], tokens[2] + tokens[3]]
+        else:
+            return None, None
+    return parse_time(parts[0]), parse_time(parts[1])
+
+
+def fmt_minutes(mins):
+    return f"{mins // 60:02d}:{mins % 60:02d}"
+
+
+def fmt_12h(mins):
+    h, m = divmod(mins, 60)
+    return f"{(h % 12) or 12}:{m:02d} {'AM' if h < 12 else 'PM'}"
+
+
+def load_schedule(raw):
+    """'23:00-06:00' -> (1380, 360) or None."""
+    try:
+        a, _, b = str(raw or "").partition("-")
+        close, open_ = parse_time(a), parse_time(b)
+    except Exception:
+        return None
+    return (close, open_) if close is not None and open_ is not None and close != open_ else None
+
+
+def is_closed_at(now_minutes, close, open_):
+    """True when the clock time lies in the closed window. The window may run past midnight (23:00-06:00)."""
+    if close < open_:
+        return close <= now_minutes < open_
+    return now_minutes >= close or now_minutes < open_
+
+
+def _now_minutes():
+    now = datetime.now(_tz())
+    return now.hour * 60 + now.minute
+
+
+# ------------------------------------------------------------------ closing and opening
+def _saved_perms(chat):
+    perms = getattr(chat, "permissions", None)
+    return json.dumps(perms.to_dict()) if perms is not None else ""
+
+
+def _restore_perms(chat_id):
+    raw = D.get_setting(chat_id, SAVED_KEY, "") or ""
+    try:
+        perms = ChatPermissions(**json.loads(raw)) if raw else None
+    except (TypeError, ValueError):
+        perms = None
+    if perms is None or perms.can_send_messages is False:   # nothing saved, or it was already closed: use defaults
+        return D.default_perms
+    return perms
+
+
+async def _fail(bot, chat_id, what, exc):
+    _retry_at[(chat_id, what)] = time.monotonic() + RETRY_AFTER
+    log.warning("autoclose: couldn't %s %s: %s: %s", what, chat_id, type(exc).__name__, exc)
+    last = _notice_at.get(chat_id)
+    if last is not None and time.monotonic() - last < NOTICE_EVERY:
+        return
+    _notice_at[chat_id] = time.monotonic()
+    try:
+        await bot.send_message(chat_id, f"⚠️ I couldn't {what} the group on schedule. Please make me an admin with the "
+                                        "'Ban users' (restrict members) right. I will try again in a few minutes.")
+    except TelegramError:
+        pass
+
+
+async def close_group(bot, chat_id, until_minutes=None):
+    """Saves the permissions, switches them off, tells the group. Returns True when it worked."""
+    try:
+        chat = await bot.get_chat(chat_id)
+        current = _saved_perms(chat)
+        if getattr(getattr(chat, "permissions", None), "can_send_messages", True) is not False and current:
+            D.set_setting(chat_id, SAVED_KEY, current)             # only save a real "open" state, never a closed one
+        await bot.set_chat_permissions(chat_id, CLOSED_PERMS)
+    except TelegramError as e:
+        await _fail(bot, chat_id, "close", e)
+        return False
+    D.set_setting(chat_id, STATE_KEY, "closed")
+    until = f" until {fmt_12h(until_minutes)}" if until_minutes is not None else ""
+    try:
+        await bot.send_message(chat_id, f"🔒 Group closed{until}. Only admins can send messages right now.")
+    except TelegramError:
+        pass
+    return True
+
+
+async def open_group(bot, chat_id):
+    try:
+        await bot.set_chat_permissions(chat_id, _restore_perms(chat_id))
+    except TelegramError as e:
+        await _fail(bot, chat_id, "open", e)
+        return False
+    D.set_setting(chat_id, STATE_KEY, "open")
+    try:
+        await bot.send_message(chat_id, "🔓 Group is open again. Everyone can send messages.")
+    except TelegramError:
+        pass
+    return True
+
+
+# ------------------------------------------------------------------ the background loop
+def _scheduled_groups():
+    """[(chat_id, 'HH:MM-HH:MM')] for every group that has a schedule (one query, no per-group lookups)."""
+    rows = store.col("settings").find({"key": AUTOCLOSE_KEY}, {"chat_id": 1, "value": 1})
+    return [(int(r["chat_id"]), r.get("value")) for r in rows]
+
+
+async def run_once(bot):
+    now = _now_minutes()
+    for chat_id, raw in await asyncio.to_thread(_scheduled_groups):
+        sched = load_schedule(raw)
+        if not sched or chat_id >= 0 or D.is_paused(chat_id):
+            continue
+        close, open_ = sched
+        want_closed = is_closed_at(now, close, open_)
+        is_closed = D.get_setting(chat_id, STATE_KEY, "open") == "closed"
+        if want_closed and not is_closed:
+            if time.monotonic() >= _retry_at.get((chat_id, "close"), 0):
+                await close_group(bot, chat_id, open_)
+        elif not want_closed and is_closed:
+            if time.monotonic() >= _retry_at.get((chat_id, "open"), 0):
+                await open_group(bot, chat_id)
+
+
+async def sweeper(app):
+    """Started once in post_init. Never raises: one bad group or a database hiccup only skips that round."""
+    await asyncio.sleep(10)
+    while True:
+        try:
+            await run_once(app.bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("autoclose: round failed")
+        await asyncio.sleep(CHECK_EVERY)
+
+
+# ------------------------------------------------------------------ the command
+AUTOCLOSE_USAGE = ("Usage:\n"
+                   "1. /autoclose 23:00 06:00: close every day at 11 PM and open at 6 AM (24-hour or 11pm style)\n"
+                   "2. /autoclose off: stop the schedule\n"
+                   "3. /autoclose: show the schedule")
+
+
+async def autoclose_cmd(update, context):
+    if not await D.group_only(update):                 # group only + admins only
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    args = [a.lower() for a in context.args]
+    raw = D.get_setting(chat.id, AUTOCLOSE_KEY, "") or ""
+    sched = load_schedule(raw)
+    if not args:
+        if not sched:
+            await msg.reply_text("Auto close is OFF.\n\n" + AUTOCLOSE_USAGE)
+            return
+        state = "closed" if D.get_setting(chat.id, STATE_KEY, "open") == "closed" else "open"
+        await msg.reply_text(f"🕒 Auto close is ON ({BOT_TIMEZONE}).\n"
+                             f"Closes at {fmt_12h(sched[0])} and opens at {fmt_12h(sched[1])}, every day.\n"
+                             f"The group is {state} right now.\n\nTurn it off with /autoclose off.")
+        return
+    if args[0] in ("off", "no", "stop", "disable", "0"):
+        was_closed = D.get_setting(chat.id, STATE_KEY, "open") == "closed"
+        store.del_setting(chat.id, AUTOCLOSE_KEY)
+        if was_closed and not await open_group(context.bot, chat.id):
+            await msg.reply_text("Auto close is OFF, but I couldn't open the group. Please make me an admin with the "
+                                 "'Ban users' right, or change the group permissions yourself.")
+            return
+        store.del_setting(chat.id, STATE_KEY)
+        store.del_setting(chat.id, SAVED_KEY)
+        await msg.reply_text("✅ Auto close is OFF." + (" The group is open again." if was_closed else ""))
+        return
+    close, open_ = parse_two_times(" ".join(args))
+    if close is None or open_ is None:
+        await msg.reply_text("I couldn't read those times.\n\n" + AUTOCLOSE_USAGE)
+        return
+    if close == open_:
+        await msg.reply_text("The closing and opening time must be different.\n\n" + AUTOCLOSE_USAGE)
+        return
+    D.set_setting(chat.id, AUTOCLOSE_KEY, f"{fmt_minutes(close)}-{fmt_minutes(open_)}")
+    await msg.reply_text(f"✅ Auto close is ON ({BOT_TIMEZONE}).\n"
+                         f"Every day I close the group at {fmt_12h(close)} (only admins can write) and open it at "
+                         f"{fmt_12h(open_)}.\nGive me the 'Ban users' admin right so I can do it.")
+    await run_once(context.bot)                      # apply it right away if the group is inside the closed window now
+
+
+# ======================================================================================================
+# 3. CLEAN SERVICE + CLEAN COMMANDS
+# ======================================================================================================
+# Keeps a group tidy by deleting Telegram service messages and bot commands. Only admins change the settings.
+#   * Commands are deleted AFTER the bot has answered them (late handler group), so the bot can still reply.
+#   * Service messages are deleted after the other handlers (welcome, captcha, antiraid ...) have seen them.
+#   * Nothing is deleted while a group is paused (/pause) or in private chats.
+#   * The bot needs the "Delete messages" admin right.
+_registered_cache = None
+
+SERVICE_KEY = "clean_service"
+COMMAND_KEY = "clean_command"
+
+SERVICE_TYPES = ("join", "leave", "other", "photo", "pin", "title", "videochat")
+COMMAND_TYPES = ("admin", "user", "other")
+YES_WORDS = {"yes", "on", "true", "enable", "enabled", "1"}
+NO_WORDS = {"no", "off", "false", "disable", "disabled", "0"}
+
+# Telegram message attributes that make a message a service message of each type. Read with getattr(), so an
+# attribute that this python-telegram-bot version doesn't know is simply skipped.
+SERVICE_ATTRS = {
+    "join": ("new_chat_members",),
+    "leave": ("left_chat_member",),
+    "photo": ("new_chat_photo", "delete_chat_photo", "chat_background_set"),
+    "pin": ("pinned_message",),
+    "title": ("new_chat_title", "forum_topic_edited"),
+    "videochat": ("video_chat_started", "video_chat_ended", "video_chat_scheduled",
+                  "video_chat_participants_invited"),
+    "other": ("boost_added", "successful_payment", "refunded_payment", "proximity_alert_triggered", "web_app_data",
+              "message_auto_delete_timer_changed", "checklist_tasks_done", "checklist_tasks_added",
+              "forum_topic_created", "forum_topic_closed", "forum_topic_reopened", "general_forum_topic_hidden",
+              "general_forum_topic_unhidden", "group_chat_created", "supergroup_chat_created", "channel_chat_created",
+              "write_access_allowed", "users_shared", "chat_shared", "giveaway_created", "giveaway_completed",
+              "paid_message_price_changed", "direct_message_price_changed"),
+}
+# Never touched on purpose: migrate_to_chat_id / migrate_from_chat_id (the bot needs them to follow a group that
+# turns into a supergroup).
+
+SERVICE_INFO = (
+    ("all", "All service messages."),
+    ("join", "When a new user joins, or is added. eg: 'X joined the chat'"),
+    ("leave", "When a user leaves, or is removed. eg: 'X left the chat'"),
+    ("other", "Miscellaneous items; such as chat boosts, successful telegram payments, proximity alerts, webapp "
+              "messages, message auto deletion changes, or checklist updates."),
+    ("photo", "When chat photos or chat backgrounds are changed."),
+    ("pin", "When a new message is pinned. eg: 'X pinned a message'"),
+    ("title", "When chat or topic titles are changed."),
+    ("videochat", "When a video chat action occurs - eg starting, ending, scheduling, or adding members to the call."),
+)
+COMMAND_INFO = (
+    ("all", "Delete ALL commands sent to the group."),
+    ("admin", "Delete any admin-only commands sent to the group (eg /ban, /mute, or any settings changes)."),
+    ("user", "Delete any user commands sent to the group (eg /id, /info, or /get). These commands will also be "
+             "cleaned when admins use them."),
+    ("other", "Delete any commands which aren't recognised as being valid commands of this bot (or that are meant "
+              "for other bots)."),
+)
+
+# Commands that members may use. Every OTHER command this bot has registered counts as an admin command; a name the
+# bot doesn't know (or a command written for another bot, /cmd@otherbot) counts as "other". The Fun commands made
+# in the Fun menu (/hug, /slap ...) are read from the database and count as user commands too.
+USER_COMMANDS = frozenset({
+    "start", "help", "id", "info", "runs", "donate", "limits", "markdownhelp", "warns", "report", "approval",
+    "approved", "get", "notes", "saved", "rules", "filters", "locks", "locktypes", "disableable", "disabled",
+    "ask", "imagine", "search", "translate", "joke", "quote", "fact", "roll", "flip", "say", "ai",
+    "download", "dl", "da", "rank", "top", "overall", "count", "today", "week", "me",
+    "fun", "wish", "birthday",
+    "roast", "roastme", "cook", "burn", "finisher", "comeback", "roastbattle", "roastvote", "roastscore",
+    "roaststats", "roastking",
+    "court", "trial", "guilty", "innocent", "verdict", "crime", "evidence", "alibi", "sentence", "bail", "appeal",
+    "execute", "wanted",
+    "cleanservicetypes", "cleancommandtypes",
+})
+_CMD_RE = re.compile(r"^/([A-Za-z0-9_]{1,64})(?:@([A-Za-z0-9_]{1,64}))?")
+
+
+# ------------------------------------------------------------------ stored settings
+def _load(chat_id, key, valid):
+    raw = D.get_setting(chat_id, key, "") or ""
+    return {t for t in str(raw).replace(" ", "").lower().split(",") if t in valid}
+
+
+def _save(chat_id, key, chosen, order):
+    D.set_setting(chat_id, key, ",".join(t for t in order if t in chosen))
+
+
+def is_service_cleaned(chat_id, category):
+    """True when this group deletes that kind of service message (nova uses it so the welcome message is not sent
+    as a reply to an 'X joined' message that is about to be deleted)."""
+    try:
+        return D is not None and category in _load(chat_id, SERVICE_KEY, SERVICE_TYPES)
+    except Exception:
+        return False
+
+
+def _describe(chosen, order):
+    if not chosen:
+        return "nothing"
+    if set(order) <= set(chosen):
+        return "all"
+    return ", ".join(t for t in order if t in chosen)
+
+
+def _words(args):
+    """['join,leave', 'Pin'] -> ['join', 'leave', 'pin']"""
+    return [w for a in args for w in re.split(r"[,\s]+", a.lower()) if w]
+
+
+def _esc(text):
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def what_cmd(what):
+    return "service" if what.startswith("service") else "command"
+
+
+# ------------------------------------------------------------------ shared command logic
+async def _set_cmd(update, context, key, valid, order, what, types_cmd):
+    """/cleanservice and /cleancommand: add types (or all / yes / no)."""
+    if not await D.group_only(update):          # group only + admin only, with its own reply
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    chosen = _load(chat.id, key, valid)
+    words = _words(context.args)
+    if not words:
+        await msg.reply_html(
+            f"Currently deleting <b>{_describe(chosen, order)}</b> {what}.\n\n"
+            f"Usage: <code>/clean{what_cmd(what)} &lt;type&gt;</code>. See /{types_cmd} for the types, "
+            f"<code>/keep{what_cmd(what)} &lt;type&gt;</code> to stop deleting a type.")
+        return
+    if words[0] in YES_WORDS:
+        new = set(order)
+    elif words[0] in NO_WORDS:
+        new = set()
+    else:
+        bad = [w for w in words if w != "all" and w not in valid]
+        if bad:
+            await msg.reply_html(f"Unknown type: <code>{_esc(', '.join(bad))}</code>\n"
+                                 f"Available: all, {', '.join(order)}. See /{types_cmd}.")
+            return
+        new = chosen | (set(order) if "all" in words else set(words))
+    _save(chat.id, key, new, order)
+    if new:
+        await msg.reply_html(f"✅ I will now delete <b>{_describe(new, order)}</b> {what}.")
+    else:
+        await msg.reply_html(f"✅ I will no longer delete any {what}.")
+
+
+async def _keep_cmd(update, context, key, valid, order, what, types_cmd):
+    """/keepservice, /nocleanservice and /keepcommand: stop deleting types."""
+    if not await D.group_only(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    words = _words(context.args)
+    if not words:
+        await msg.reply_html(f"Usage: <code>/keep{what_cmd(what)} &lt;type&gt;</code>. See /{types_cmd} for the types.")
+        return
+    bad = [w for w in words if w != "all" and w not in valid]
+    if bad:
+        await msg.reply_html(f"Unknown type: <code>{_esc(', '.join(bad))}</code>\n"
+                             f"Available: all, {', '.join(order)}. See /{types_cmd}.")
+        return
+    chosen = _load(chat.id, key, valid)
+    new = set() if "all" in words else chosen - set(words)
+    _save(chat.id, key, new, order)
+    left = f" Still deleting: <b>{_describe(new, order)}</b>." if new else ""
+    await msg.reply_html(f"✅ I will keep {'all' if 'all' in words else ', '.join(words)} {what}.{left}")
+
+
+# ------------------------------------------------------------------ the commands
+async def cleanservice_cmd(update, context):
+    await _set_cmd(update, context, SERVICE_KEY, SERVICE_TYPES, SERVICE_TYPES, "service messages", "cleanservicetypes")
+
+
+async def keepservice_cmd(update, context):
+    await _keep_cmd(update, context, SERVICE_KEY, SERVICE_TYPES, SERVICE_TYPES, "service messages", "cleanservicetypes")
+
+
+async def cleanservicetypes_cmd(update, context):
+    lines = ["<b>Service message types</b>", ""] + [f"- <code>{n}</code>: {_esc(d)}" for n, d in SERVICE_INFO]
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+async def cleancommand_cmd(update, context):
+    await _set_cmd(update, context, COMMAND_KEY, COMMAND_TYPES, COMMAND_TYPES, "commands", "cleancommandtypes")
+
+
+async def keepcommand_cmd(update, context):
+    await _keep_cmd(update, context, COMMAND_KEY, COMMAND_TYPES, COMMAND_TYPES, "commands", "cleancommandtypes")
+
+
+async def cleancommandtypes_cmd(update, context):
+    lines = ["<b>Command types</b>", ""] + [f"- <code>{n}</code>: {_esc(d)}" for n, d in COMMAND_INFO]
+    await update.effective_message.reply_html("\n".join(lines))
+
+
+# ------------------------------------------------------------------ the automatic deleting
+def service_category(msg):
+    """'join' | 'leave' | ... for a service message, None for an ordinary message."""
+    for category, attrs in SERVICE_ATTRS.items():
+        for attr in attrs:
+            if getattr(msg, attr, None):
+                return category
+    return None
+
+
+def _registered_commands():
+    """Every command name the bot answers to, read once from the live handler list."""
+    global _registered_cache
+    if _registered_cache is None:
+        names = set()
+        try:
+            for handlers in _app.handlers.values():
+                for h in handlers:
+                    if isinstance(h, CommandHandler):
+                        cmds = getattr(h, "commands", None)
+                        if cmds is None:
+                            cmds = getattr(h, "command", ())
+                        names.update(str(c).lower() for c in ((cmds,) if isinstance(cmds, str) else cmds))
+        except Exception:
+            log.exception("cleaner: couldn't read the registered commands")
+        _registered_cache = frozenset(names)
+    return _registered_cache
+
+
+async def command_category(context, text):
+    """'admin' | 'user' | 'other' for a message that starts with /command, None if it isn't one."""
+    m = _CMD_RE.match(text or "")
+    if not m:
+        return None
+    name, tag = m.group(1).lower(), m.group(2)
+    if tag and tag.lower() != (context.bot.username or "").lower():
+        return "other"                              # written for another bot
+    if name in USER_COMMANDS:
+        return "user"
+    try:
+        if name in await D.fun_names():             # /hug, /slap ... made in the Fun menu
+            return "user"
+    except Exception:
+        log.debug("cleaner: couldn't read the Fun command names", exc_info=True)
+    return "admin" if name in _registered_commands() else "other"
+
+
+async def clean_command_handler(update, context):
+    """group=100: runs after the command has been answered, then deletes the command message if its type is on."""
+    msg, chat = update.effective_message, update.effective_chat
+    if msg is None or chat is None or chat.type not in ("group", "supergroup") or D.is_paused(chat.id):
+        return
+    chosen = _load(chat.id, COMMAND_KEY, COMMAND_TYPES)
+    if not chosen:
+        return
+    category = await command_category(context, msg.text or "")
+    if category not in chosen:
+        return
+    try:
+        await msg.delete()
+    except TelegramError as e:
+        log.debug("cleaner: couldn't delete a command in %s: %s", chat.id, e)
+
+
+async def clean_service_handler(update, context):
+    """group=101: deletes a service message if its type is on (after welcome, captcha and antiraid saw it)."""
+    msg, chat = update.effective_message, update.effective_chat
+    if msg is None or chat is None or chat.type not in ("group", "supergroup"):
+        return
+    category = service_category(msg)
+    if category is None or D.is_paused(chat.id):
+        return
+    if category not in _load(chat.id, SERVICE_KEY, SERVICE_TYPES):
+        return
+    try:
+        await msg.delete()
+    except TelegramError as e:
+        log.debug("cleaner: couldn't delete a service message in %s: %s", chat.id, e)
+
+
+# ======================================================================================================
+# 4. IMPORT / EXPORT / RESET
+# ======================================================================================================
+#   /export [modules]   any admin: sends a JSON file with the group's configuration.
+#   /import [modules]   group CREATOR only: reply to an exported file; imports everything (or only listed modules).
+#   /reset              group CREATOR only: removes the saved configuration of this group (asks to confirm first).
+# Only configuration is moved: never members' data (warnings, approvals, message counts, ranks).
+FORMAT = "bot-chat-settings"
+VERSION = 1
+MAX_FILE_BYTES = 1_000_000
+MAX_ITEMS = 1000            # notes / filters / blocklist words accepted from one file
+MAX_VALUE_CHARS = 8000
+COOLDOWN_SECS = 20          # "heavily rate limited": one import/export per group every 20 seconds
+ANON_ADMIN_ID = 1087968824  # Telegram's "Group" anonymous-admin account
+
+# module -> the per-group setting keys it owns (exact names; "prefixes" cover families such as lock_<type>)
+MODULES = {
+    "admin": {"keys": ("auto_approve", "autoclose")},
+    "antiflood": {"keys": ("flood_limit", "flood_secs", "flood_mode", "repeat_limit", "mention_limit",
+                           "antispam", "spam_mode")},
+    "blocklists": {"keys": ("blocklist_mode", "block_ads", "block_promo", "block_promo_auth", "block_punish",
+                            "block_punish_secs", "bl_notice_secs", "nsfw_word", "nsfw_content", "nsfw_action",
+                            "nsfw_secs", "nsfw_allow"),
+                   "blocklist": True, "allowlist": True},
+    "clean_command": {"keys": ("clean_command",)},
+    "clean_service": {"keys": ("clean_service",)},
+    "disabled": {"keys": ("disabled_cmds", "disable_del", "disable_admin")},
+    "federations": {"keys": ()},
+    "filters": {"keys": (), "filters": True},
+    "greetings": {"keys": ("welcome", "welcome_on", "goodbye", "goodbye_on", "clean_welcome", "join_dm",
+                           "join_dm_text", "join_delay", "captcha", "captcha_mode", "captcha_time",
+                           "captcha_action")},
+    "locks": {"keys": ("lock", "lockwarns"), "prefixes": ("lock_",)},
+    "notes": {"keys": ("private_notes",), "notes": True},
+    "pins": {"keys": ()},
+    "raids": {"keys": ("auto_raid", "raid_time", "raid_action_time")},
+    "reports": {"keys": ("reports_on",)},
+    "rules": {"keys": ("rules", "rules_private", "rules_button")},
+    "translations": {"keys": ()},
+    "warns": {"keys": ("warn_limit", "warn_time", "warn_mode")},
+}
+ORDER = tuple(MODULES)
+_last_use = {}
+
+
+# ------------------------------------------------------------------ helpers
+def _owns(module, key):
+    spec = MODULES[module]
+    return key in spec["keys"] or any(key.startswith(p) for p in spec.get("prefixes", ()))
+
+
+def _module_of(key):
+    for m in ORDER:
+        if _owns(m, key):
+            return m
+    return None
+
+
+def _parse_modules(args):
+    """(modules or None, error text or None). None = every module."""
+    if not args:
+        return None, None
+    names = [a.lower().strip(",") for a in args if a.strip(",")]
+    bad = [n for n in names if n not in MODULES]
+    if bad:
+        return None, ("Unknown module: " + ", ".join(bad) + "\nAvailable: " + ", ".join(ORDER))
+    return list(dict.fromkeys(names)), None
+
+
+def _cooldown(chat_id):
+    now = time.monotonic()
+    if now - _last_use.get(chat_id, 0) < COOLDOWN_SECS:
+        return int(COOLDOWN_SECS - (now - _last_use.get(chat_id, 0))) + 1
+    if len(_last_use) > 2000:
+        _last_use.clear()
+    _last_use[chat_id] = now
+    return 0
+
+
+async def _is_creator(chat, user):
+    """Only the real group creator (never an anonymous admin: we can't tell who it is)."""
+    if user is None or user.id == ANON_ADMIN_ID:
+        return False
+    if D.is_bot_owner(user.id):
+        return True
+    try:
+        member = await chat.get_member(user.id)
+    except TelegramError:
+        return False
+    return member.status == ChatMemberStatus.OWNER
+
+
+async def _is_admin(chat, user):
+    if user is None:
+        return False
+    if user.id == ANON_ADMIN_ID or D.is_bot_owner(user.id):
+        return True
+    return await D.is_admin(chat, user.id)
+
+
+# ------------------------------------------------------------------ export
+def _collect(chat_id, modules):
+    """{module: {...}} with only what is actually saved for this group (synchronous: reads the database)."""
+    chat_id = int(chat_id)
+    settings = store.settings_snapshot(chat_id)
+    out = {}
+    for m in modules:
+        spec, block = MODULES[m], {}
+        values = {k: v for k, v in settings.items() if _owns(m, k)}
+        if values:
+            block["settings"] = values
+        if spec.get("notes"):
+            names = store.note_names(chat_id)
+            if names:
+                block["notes"] = [{"name": n, "content": store.note_get(chat_id, n)} for n in names]
+        if spec.get("filters"):
+            rows = store.filter_rows(chat_id)
+            if rows:
+                block["filters"] = [{"keyword": k, "reply": r} for k, r in rows]
+        if spec.get("blocklist"):
+            words = store.block_words(chat_id)
+            if words:
+                block["blocklist"] = list(words)
+        if spec.get("allowlist"):
+            allow = [{"kind": kind, "value": v} for kind, vals in store.allow_load(chat_id).items() for v in sorted(vals)]
+            if allow:
+                block["allowlist"] = allow
+        if block:
+            out[m] = block
+    return out
+
+
+async def _send_export(chat, msg, bot, modules, reply_to=None):
+    data = await asyncio.to_thread(_collect, chat.id, modules or ORDER)
+    payload = {"format": FORMAT, "version": VERSION, "exported_at": int(time.time()),
+               "chat_title": chat.title or "", "modules": data}
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    buf = io.BytesIO(raw)
+    safe = "".join(c if c.isalnum() else "_" for c in (chat.title or "chat"))[:30].strip("_") or "chat"
+    buf.name = f"{safe}_settings.json"
+    chosen = modules or ORDER
+    empty = [m for m in chosen if m not in data]
+    caption = ("📤 Exported: " + (", ".join(data) or "nothing") + "."
+               + (f"\nNothing saved / not used here: {', '.join(empty)}." if empty and not modules else "")
+               + "\nImport it in another group: reply to this file with /import (group creator only).")
+    await bot.send_document(chat.id, buf, filename=buf.name, caption=caption[:1000],
+                            reply_to_message_id=reply_to, allow_sending_without_reply=True)
+
+
+async def export_cmd(update, context):
+    chat, msg, user = update.effective_chat, update.effective_message, update.effective_user
+    if not msg or chat.type == "private":
+        if msg:
+            await msg.reply_text("Use /export inside the group you want to export.")
+        return
+    if not await _is_admin(chat, user):
+        await msg.reply_text("Only admins can export the settings.")
+        return
+    modules, err = _parse_modules(context.args)
+    if err:
+        await msg.reply_text(err)
+        return
+    wait = _cooldown(chat.id)
+    if wait:
+        await msg.reply_text(f"⏳ Slow down: try again in {wait}s.")
+        return
+    try:
+        await _send_export(chat, msg, context.bot, modules, reply_to=msg.message_id)
+    except Exception:
+        log.exception("export failed")
+        await msg.reply_text("⚠️ The export failed. Please try again later.")
+
+
+# ------------------------------------------------------------------ import
+def _apply(chat_id, wanted, payload):
+    """Writes the file's data into this group (synchronous). Returns ({module: count}, [skipped text])."""
+    chat_id = int(chat_id)
+    done, notes = {}, []
+    mods = payload.get("modules")
+    if not isinstance(mods, dict):
+        raise ValueError("The file has no 'modules' section.")
+    for m in (wanted or ORDER):
+        block = mods.get(m)
+        if m not in MODULES or not isinstance(block, dict):
+            continue
+        n = 0
+        settings = block.get("settings")
+        if isinstance(settings, dict):
+            for k, v in settings.items():
+                if not isinstance(k, str) or not _owns(m, k) or not isinstance(v, (str, int, float)):
+                    continue                                   # a key this module doesn't own is ignored
+                if len(str(v)) > MAX_VALUE_CHARS:
+                    notes.append(f"{k}: too long, skipped")
+                    continue
+                store.set_setting(chat_id, k, v)
+                n += 1
+        if MODULES[m].get("notes") and isinstance(block.get("notes"), list):
+            for item in block["notes"][:MAX_ITEMS]:
+                if isinstance(item, dict) and isinstance(item.get("name"), str) and isinstance(item.get("content"), str) \
+                        and item["name"] and len(item["content"]) <= MAX_VALUE_CHARS:
+                    store.note_set(chat_id, item["name"][:64], item["content"])
+                    n += 1
+        if MODULES[m].get("filters") and isinstance(block.get("filters"), list):
+            for item in block["filters"][:MAX_ITEMS]:
+                if isinstance(item, dict) and isinstance(item.get("keyword"), str) and isinstance(item.get("reply"), str) \
+                        and item["keyword"] and len(item["reply"]) <= MAX_VALUE_CHARS:
+                    store.filter_add(chat_id, item["keyword"][:100], item["reply"])
+                    n += 1
+        if MODULES[m].get("blocklist") and isinstance(block.get("blocklist"), list):
+            for w in block["blocklist"][:MAX_ITEMS]:
+                if isinstance(w, str) and w and len(w) <= 200:
+                    store.block_add(chat_id, w)
+                    n += 1
+        if MODULES[m].get("allowlist") and isinstance(block.get("allowlist"), list):
+            for item in block["allowlist"][:MAX_ITEMS]:
+                if isinstance(item, dict) and isinstance(item.get("kind"), str) and isinstance(item.get("value"), str) \
+                        and item["kind"] and item["value"] and len(item["value"]) <= 300:
+                    store.allow_add(chat_id, item["kind"], item["value"])
+                    n += 1
+        done[m] = n
+    return done, notes
+
+
+async def import_cmd(update, context):
+    chat, msg, user = update.effective_chat, update.effective_message, update.effective_user
+    if not msg:
+        return
+    if chat.type == "private":
+        await msg.reply_text("Use /import inside the group you want to import into.")
+        return
+    if not await _is_creator(chat, user):
+        await msg.reply_text("For security, only the group creator can import settings "
+                             "(and not while posting anonymously).")
+        return
+    doc = msg.reply_to_message.document if msg.reply_to_message else None
+    if doc is None:
+        await msg.reply_text("Reply to an exported settings file with /import.\n"
+                             "To import only some modules: /import rules greetings")
+        return
+    if (doc.file_size or 0) > MAX_FILE_BYTES:
+        await msg.reply_text("⚠️ That file is too big to be a settings export.")
+        return
+    wanted, err = _parse_modules(context.args)
+    if err:
+        await msg.reply_text(err)
+        return
+    wait = _cooldown(chat.id)
+    if wait:
+        await msg.reply_text(f"⏳ Slow down: try again in {wait}s.")
+        return
+    try:
+        raw = bytes(await (await context.bot.get_file(doc.file_id)).download_as_bytearray())
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict) or payload.get("format") != FORMAT:
+            raise ValueError("This is not a settings file exported by this bot.")
+        done, notes = await asyncio.to_thread(_apply, chat.id, wanted, payload)
+    except (ValueError, UnicodeDecodeError) as e:
+        await msg.reply_text(f"⚠️ I couldn't read that file: {e}")
+        return
+    except TelegramError:
+        await msg.reply_text("⚠️ I couldn't download that file.")
+        return
+    except Exception:
+        log.exception("import failed")
+        await msg.reply_text("⚠️ The import failed. Nothing more was changed.")
+        return
+    if not done:
+        await msg.reply_text("Nothing to import: the file has no data for " + (", ".join(wanted) if wanted else "any module") + ".")
+        return
+    lines = ["✅ <b>Imported</b>"] + [f"• {html.escape(m)}: {n} item{'s' if n != 1 else ''}" for m, n in done.items()]
+    if notes:
+        lines.append("\nSkipped: " + html.escape("; ".join(notes[:5])))
+    await msg.reply_html("\n".join(lines))
+
+
+# ------------------------------------------------------------------ reset
+def _wipe(chat_id):
+    chat_id = int(chat_id)
+    settings = store.settings_snapshot(chat_id)
+    for k in list(settings):
+        if _module_of(k):
+            store.del_setting(chat_id, k)
+    for n in list(store.note_names(chat_id)):
+        store.note_del(chat_id, n)
+    for k, _ in list(store.filter_rows(chat_id)):
+        store.filter_remove(chat_id, k)
+    for w in list(store.block_words(chat_id)):
+        store.block_remove(chat_id, w)
+    store.allow_clear(chat_id)
+
+
+async def reset_cmd(update, context):
+    chat, msg, user = update.effective_chat, update.effective_message, update.effective_user
+    if not msg:
+        return
+    if chat.type == "private":
+        await msg.reply_text("Use /reset inside a group.")
+        return
+    if not await _is_creator(chat, user):
+        await msg.reply_text("Only the group creator can reset the settings (and not while posting anonymously).")
+        return
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, reset", callback_data=f"ie:rst:y:{user.id}"),
+                                InlineKeyboardButton("❌ Cancel", callback_data=f"ie:rst:n:{user.id}")]])
+    await msg.reply_html("⚠️ <b>Reset all settings of this group?</b>\n\nThis removes the saved configuration: rules, "
+                         "greetings, locks, filters, notes, blocklist, warn settings, antiflood and the other modules "
+                         "listed in /help > Import & Export. Members' data (warnings, approvals, message counts) is kept. "
+                         "This can't be undone. Tip: /export first.", reply_markup=kb)
+
+
+# ------------------------------------------------------------------ the buttons on /help page 2
+async def ie_callback(update, context):
+    q = update.callback_query
+    parts = (q.data or "").split(":")
+    act = parts[1] if len(parts) > 1 else ""
+    chat, user = q.message.chat if q.message else None, q.from_user
+    if chat is None:
+        await q.answer()
+        return
+    if act == "rst":                                           # reset confirmation (only the person who asked)
+        if len(parts) < 4 or not parts[3].isdigit() or int(parts[3]) != user.id:
+            await q.answer("Only the person who started the reset can answer.", show_alert=True)
+            return
+        if parts[2] != "y":
+            await q.answer("Cancelled.")
+            await q.edit_message_text("Reset cancelled. Nothing was changed.")
+            return
+        if not await _is_creator(chat, user):
+            await q.answer("Only the group creator can do this.", show_alert=True)
+            return
+        await q.answer()
+        try:
+            await asyncio.to_thread(_wipe, chat.id)
+            await q.edit_message_text("✅ This group's settings were reset.")
+        except Exception:
+            log.exception("reset failed")
+            await q.edit_message_text("⚠️ The reset failed part-way. Please run /reset again.")
+        return
+    if await extra.menu_not_owner(q):                           # help buttons belong to who opened /help
+        return
+    if act == "imp":
+        await q.answer("To import: reply to an exported .json file with /import (group creator only). "
+                       "To import only some modules: /import rules greetings", show_alert=True)
+        return
+    if act == "exp":
+        if chat.type == "private":
+            await q.answer("Open /help inside the group you want to export.", show_alert=True)
+            return
+        if not await _is_admin(chat, user):
+            await q.answer("Only admins can export the settings.", show_alert=True)
+            return
+        wait = _cooldown(chat.id)
+        if wait:
+            await q.answer(f"Slow down: try again in {wait}s.", show_alert=True)
+            return
+        await q.answer("Exporting...")
+        try:
+            await _send_export(chat, q.message, context.bot, None)
+        except Exception:
+            log.exception("export (button) failed")
+            await context.bot.send_message(chat.id, "⚠️ The export failed. Please try again later.")
+        return
+    await q.answer()
+
+
+# ======================================================================================================
+# 5. BROADCAST (📢 button in the Bot Staff panel)
+# ======================================================================================================
+# Send one message to every group the bot is in, or only to the groups you choose.
+#   * Only the bot owner and bot staff (never group admins), and only in a private chat with the bot.
+#   * Flow: targets (all / chosen groups) -> the message -> pin yes/no -> summary -> Confirm / Edit / Cancel.
+#   * The message is COPIED (copy_message), so text, photos, videos and files all work, with their formatting.
+#   * Sending runs in the background, slowly (Telegram limits), one broadcast at a time, with a Stop button.
+#   * The group list is the bot's own list (the one /stats uses), handed in as deps.groups_source(bot).
+BC_PAGE = 8              # groups per page in the picker
+BC_DELAY = 0.15          # seconds between two groups (Telegram allows about 30 messages per second in total)
+BC_PROGRESS_EVERY = 4    # seconds between two progress updates
+BC_LAST_KEY = "broadcast_last"   # settings(0, key): JSON of the last report
+_bc_state = {}           # staff user id -> the broadcast that is being prepared
+_bc_job = None           # the broadcast that is sending right now (only one at a time)
+_bc_task = None
+
+
+def broadcast_button():
+    """The 📢 Broadcast button for the Bot Staff panel in nova.py."""
+    return InlineKeyboardButton("📢 Broadcast", callback_data="bc:m")
+
+
+async def _bc_allowed(user_id):
+    if user_id in (getattr(D, "owner_ids", None) or ()):
+        return True
+    try:
+        return bool(await asyncio.to_thread(D.is_super_admin, user_id))
+    except Exception:
+        log.exception("broadcast: staff check failed")
+        return False
+
+
+def _bc_short(title, n=28):
+    title = (title or "?").strip() or "?"
+    return title if len(title) <= n else title[:n - 1] + "…"
+
+
+def _bc_plural(n, word="group"):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def _bc_new_state(groups, panel):
+    return {"groups": groups, "panel": panel, "mode": None, "sel": set(), "sel_done": False, "page": 0,
+            "msg": None, "pin": None, "await_msg": False, "ask_pin": False, "menu": False, "snap": None}
+
+
+def _bc_step(st):
+    if st["mode"] is None:
+        return "target"
+    if st["mode"] == "pick" and not st["sel_done"]:
+        return "pick"
+    if st["msg"] is None or st["await_msg"]:
+        return "msg"
+    if st["pin"] is None or st["ask_pin"]:
+        return "pin"
+    return "sum"
+
+
+def _bc_targets_short(st):
+    n = len(st["groups"]) if st["mode"] == "all" else len(st["sel"])
+    return ("all " if st["mode"] == "all" else "") + _bc_plural(n) + ("" if st["mode"] == "all" else " selected")
+
+
+def _bc_targets_long(st):
+    if st["mode"] == "all":
+        return f"All groups ({len(st['groups'])})"
+    names = [html.escape(_bc_short(t, 40)) for c, t in st["groups"] if c in st["sel"]]
+    lines = "\n".join(f"   • {n}" for n in names[:10])
+    more = f"\n   …and {len(names) - 10} more" if len(names) > 10 else ""
+    return f"{_bc_plural(len(names))} selected:\n{lines}{more}"
+
+
+def _bc_screen(st):
+    """(text, keyboard) for the step the broadcast is on."""
+    step = _bc_step(st)
+    n = len(st["groups"])
+    cancel = [InlineKeyboardButton("❌ Cancel", callback_data="bc:x")]
+    back = [InlineKeyboardButton("🔙 Back to summary", callback_data="bc:sum")] if st.get("snap") else cancel
+    if step == "sum" and st.get("menu"):
+        rows = [[InlineKeyboardButton("🎯 Targets", callback_data="bc:et")],
+                [InlineKeyboardButton("📝 Message", callback_data="bc:em")],
+                [InlineKeyboardButton("📌 Pin", callback_data="bc:ep")],
+                [InlineKeyboardButton("🔙 Back to summary", callback_data="bc:sum")]]
+        return "<b>✏️ What do you want to change?</b>", InlineKeyboardMarkup(rows)
+    if step == "target":
+        rows = [[InlineKeyboardButton(f"🌐 All groups ({n})", callback_data="bc:ta")],
+                [InlineKeyboardButton("🎯 Specific groups", callback_data="bc:tp")], back]
+        return (f"<b>📢 Broadcast: who gets it?</b>\n\nThe bot is in <b>{_bc_plural(n)}</b>.\n"
+                "Send it to all of them, or pick one or more groups."), InlineKeyboardMarkup(rows)
+    if step == "pick":
+        pages = max(1, -(-n // BC_PAGE))
+        st["page"] = min(max(st["page"], 0), pages - 1)
+        start = st["page"] * BC_PAGE
+        rows = []
+        for i in range(start, min(start + BC_PAGE, n)):
+            cid, title = st["groups"][i]
+            rows.append([InlineKeyboardButton(("✅ " if cid in st["sel"] else "⬜ ") + _bc_short(title),
+                                              callback_data=f"bc:g:{i}")])
+        if pages > 1:
+            rows.append([InlineKeyboardButton("◀", callback_data=f"bc:pg:{st['page'] - 1}"),
+                         InlineKeyboardButton(f"{st['page'] + 1}/{pages}", callback_data="bc:noop"),
+                         InlineKeyboardButton("▶", callback_data=f"bc:pg:{st['page'] + 1}")])
+        rows.append([InlineKeyboardButton("☑️ Select all", callback_data="bc:sa"),
+                     InlineKeyboardButton("🧹 Clear", callback_data="bc:cl")])
+        rows.append([InlineKeyboardButton(f"✅ Done ({len(st['sel'])})", callback_data="bc:dn")])
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data="bc:bk"), cancel[0]])
+        return (f"<b>🎯 Pick the groups</b>\n\nTap a group to select or unselect it. "
+                f"Selected: <b>{len(st['sel'])}</b> of {n}."), InlineKeyboardMarkup(rows)
+    if step == "msg":
+        return (f"<b>📝 Send the message</b>\n\nTargets: <b>{html.escape(_bc_targets_short(st))}</b>\n\n"
+                "Now send me the message you want to broadcast, here in this chat. Text, photo, video or a file all "
+                "work, and the formatting is kept."), InlineKeyboardMarkup([back])
+    if step == "pin":
+        rows = [[InlineKeyboardButton("✅ Yes, pin it", callback_data="bc:py"),
+                 InlineKeyboardButton("❌ No", callback_data="bc:pn")], back]
+        return ("<b>📌 Pin the message?</b>\n\nShould the bot pin it in each group? A group where the bot has no pin "
+                "right still gets the message, just not pinned."), InlineKeyboardMarkup(rows)
+    info = st["msg"]
+    preview = html.escape(info["text"][:120]) + ("…" if len(info["text"]) > 120 else "")
+    what = info["kind"] if info["kind"] != "text" else "text"
+    text = (f"<b>📋 Broadcast summary</b>\n\n"
+            f"🎯 <b>Groups:</b> {_bc_targets_long(st)}\n\n"
+            f"📝 <b>Message:</b> {what}" + (f"\n<i>{preview}</i>" if preview else "") + "\n\n"
+            f"📌 <b>Pin:</b> {'ON' if st['pin'] else 'OFF'}\n\nCheck everything, then confirm.")
+    rows = [[InlineKeyboardButton("✅ Confirm", callback_data="bc:ok")],
+            [InlineKeyboardButton("✏️ Edit", callback_data="bc:ed"), cancel[0]]]
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def _bc_render(context, uid, q=None):
+    """Shows the current screen: edits the tapped message (q) or sends a new one below the staff's message."""
+    st = _bc_state[uid]
+    text, markup = _bc_screen(st)
+    if q is not None:
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+        except TelegramError:
+            pass                                          # unchanged (double tap) or too old to edit
+        st["panel"] = (q.message.chat.id, q.message.message_id)
+        return
+    sent = await context.bot.send_message(st["panel"][0], text, parse_mode="HTML", reply_markup=markup,
+                                          disable_web_page_preview=True)
+    st["panel"] = (sent.chat_id, sent.message_id)
+
+
+def _bc_panel():
+    text = ("<b>📢 Broadcast</b>\n\nSend one message to every group the bot is in, or only to the groups you choose."
+            + ("\n\n⏳ A broadcast is sending right now." if _bc_job else ""))
+    rows = [[InlineKeyboardButton("✍️ New Broadcast", callback_data="bc:new")],
+            [InlineKeyboardButton("📜 Last Report", callback_data="bc:last")],
+            [InlineKeyboardButton("🔙 Back", callback_data="own:m")]]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _bc_report_text(rep):
+    when = datetime.fromtimestamp(rep.get("time", 0), _tz()).strftime("%d %b %Y, %I:%M %p")
+    head = "⏹ Broadcast stopped" if rep.get("stopped") else "📣 Broadcast finished"
+    lines = [f"<b>{head}</b>", f"🕒 {when} ({BOT_TIMEZONE})", "",
+             f"✅ Sent: <b>{rep.get('sent', 0)}</b> of {rep.get('total', 0)}",
+             f"❌ Failed: <b>{len(rep.get('failed', []))}</b>"]
+    if rep.get("pin"):
+        lines.append(f"📌 Pinned: <b>{rep.get('pinned', 0)}</b> (pin failed: {rep.get('pin_failed', 0)})")
+    failed = rep.get("failed", [])
+    if failed:
+        lines.append("\n<b>Failed groups:</b>")
+        lines += [f"• {html.escape(_bc_short(t, 30))}: {html.escape(r)}" for t, r in failed[:10]]
+        if len(failed) > 10:
+            lines.append(f"…and {len(failed) - 10} more")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ sending
+def _bc_wait(exc):
+    value = getattr(exc, "retry_after", 1)
+    value = value.total_seconds() if hasattr(value, "total_seconds") else value
+    return min(float(value) + 1, 60)
+
+
+def _bc_reason(exc):
+    text = str(exc).lower()
+    if "not found" in text:
+        return "group not found"
+    if "not enough rights" in text or "have no rights" in text:
+        return "no right to write"
+    return str(exc)[:40] or type(exc).__name__
+
+
+async def _bc_send_one(bot, job, cid, title):
+    target = cid
+    for _ in range(3):
+        try:
+            sent = await bot.copy_message(target, job["src_chat"], job["src_msg"])
+            break
+        except RetryAfter as e:
+            await asyncio.sleep(_bc_wait(e))
+        except ChatMigrated as e:
+            target = e.new_chat_id
+        except Forbidden:
+            job["failed"].append((title, "bot was removed or can't write"))
+            return
+        except BadRequest as e:
+            job["failed"].append((title, _bc_reason(e)))
+            return
+        except TelegramError as e:
+            job["failed"].append((title, type(e).__name__))
+            return
+    else:
+        job["failed"].append((title, "Telegram asked to wait too often"))
+        return
+    job["sent"] += 1
+    if job["pin"]:
+        try:
+            await bot.pin_chat_message(target, sent.message_id)
+            job["pinned"] += 1
+        except RetryAfter as e:
+            await asyncio.sleep(_bc_wait(e))
+            job["pin_failed"] += 1
+        except TelegramError:
+            job["pin_failed"] += 1
+
+
+async def _bc_progress(bot, job, force=False):
+    now = time.monotonic()
+    if not force and now - job["last_edit"] < BC_PROGRESS_EVERY:
+        return
+    job["last_edit"] = now
+    text = (f"<b>📤 Broadcasting…</b>\n\nDone: <b>{job['done']}</b> of {len(job['targets'])}\n"
+            f"✅ Sent: {job['sent']}\n❌ Failed: {len(job['failed'])}"
+            + (f"\n📌 Pinned: {job['pinned']}" if job["pin"] else ""))
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Stop", callback_data="bc:stop")]])
+    try:
+        await bot.edit_message_text(text, chat_id=job["panel"][0], message_id=job["panel"][1],
+                                    parse_mode="HTML", reply_markup=kb)
+    except TelegramError:
+        pass
+
+
+async def _bc_run(bot, job):
+    global _bc_job
+    try:
+        await _bc_progress(bot, job, force=True)
+        for cid, title in job["targets"]:
+            if job["stop"]:
+                break
+            await _bc_send_one(bot, job, cid, title)
+            job["done"] += 1
+            await _bc_progress(bot, job)
+            await asyncio.sleep(BC_DELAY)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("broadcast: stopped by an error")
+    finally:
+        rep = {"time": int(time.time()), "total": len(job["targets"]), "sent": job["sent"],
+               "failed": [[t, r] for t, r in job["failed"][:30]], "pin": job["pin"], "pinned": job["pinned"],
+               "pin_failed": job["pin_failed"], "stopped": job["stop"] or job["done"] < len(job["targets"])}
+        _bc_job = None
+        try:
+            await asyncio.to_thread(D.set_setting, 0, BC_LAST_KEY, json.dumps(rep, ensure_ascii=False))
+        except Exception:
+            log.exception("broadcast: couldn't save the report")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="bc:m")]])
+        try:
+            await bot.edit_message_text(_bc_report_text(rep), chat_id=job["panel"][0], message_id=job["panel"][1],
+                                        parse_mode="HTML", reply_markup=kb)
+        except TelegramError:
+            try:
+                await bot.send_message(job["panel"][0], _bc_report_text(rep), parse_mode="HTML", reply_markup=kb)
+            except TelegramError:
+                pass
+
+
+async def _bc_start(context, q, uid, st):
+    global _bc_job, _bc_task
+    if _bc_job:
+        await q.answer("A broadcast is already sending. Wait until it finishes.", show_alert=True)
+        return
+    if st["mode"] == "all":
+        try:
+            targets = [(int(c), t) for c, t, _ in await D.groups_source(context.bot)]
+        except Exception:
+            log.exception("broadcast: couldn't refresh the group list, using the saved one")
+            targets = list(st["groups"])
+    else:
+        targets = [(c, t) for c, t in st["groups"] if c in st["sel"]]
+    if not targets:
+        await q.answer("There are no groups to send to.", show_alert=True)
+        return
+    _bc_job = {"targets": targets, "src_chat": st["msg"]["chat_id"], "src_msg": st["msg"]["message_id"],
+               "pin": bool(st["pin"]), "panel": (q.message.chat.id, q.message.message_id), "stop": False,
+               "done": 0, "sent": 0, "failed": [], "pinned": 0, "pin_failed": 0, "last_edit": 0.0}
+    _bc_state.pop(uid, None)
+    await q.answer("Sending…")
+    _bc_task = asyncio.create_task(_bc_run(context.bot, _bc_job))
+
+
+# ------------------------------------------------------------------ buttons and the message
+async def bc_callback(update, context):
+    q = update.callback_query
+    uid = q.from_user.id
+    if not await _bc_allowed(uid):
+        await q.answer("This is for the bot owner and bot staff only.", show_alert=True)
+        return
+    chat = q.message.chat if q.message else None
+    if chat is None or chat.type != "private":
+        await q.answer("Open me in a private chat to broadcast: send /help there, then Bot Staff > Broadcast.",
+                       show_alert=True)
+        return
+    parts = (q.data or "").split(":")
+    act = parts[1] if len(parts) > 1 else "m"
+    arg = parts[2] if len(parts) > 2 else ""
+
+    async def show_panel():
+        text, markup = _bc_panel()
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except TelegramError:
+            pass
+
+    if act == "noop":
+        await q.answer()
+        return
+    if act == "m":
+        await q.answer()
+        await show_panel()
+        return
+    if act == "last":
+        raw = await asyncio.to_thread(D.get_setting, 0, BC_LAST_KEY, "")
+        try:
+            rep = json.loads(raw) if raw else None
+        except ValueError:
+            rep = None
+        await q.answer()
+        text = _bc_report_text(rep) if isinstance(rep, dict) else "There is no broadcast report yet."
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Back", callback_data="bc:m")]]))
+        except TelegramError:
+            pass
+        return
+    if act == "stop":
+        if _bc_job:
+            _bc_job["stop"] = True
+            await q.answer("Stopping…")
+        else:
+            await q.answer("Nothing is sending right now.")
+        return
+    if act == "new":
+        if _bc_job:
+            await q.answer("A broadcast is already sending. Wait until it finishes.", show_alert=True)
+            return
+        await q.answer("Loading the groups…")
+        try:
+            found = await D.groups_source(context.bot)
+        except Exception:
+            log.exception("broadcast: couldn't load the groups")
+            await q.edit_message_text("⚠️ I couldn't load the group list. Please try again in a moment.",
+                                      reply_markup=InlineKeyboardMarkup(
+                                          [[InlineKeyboardButton("🔙 Back", callback_data="bc:m")]]))
+            return
+        groups = sorted(((int(c), t) for c, t, _ in found), key=lambda g: (g[1] or "").lower())
+        if not groups:
+            await q.edit_message_text("The bot is not in any group yet.", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Back", callback_data="bc:m")]]))
+            return
+        _bc_state[uid] = _bc_new_state(groups, (chat.id, q.message.message_id))
+        await _bc_render(context, uid, q)
+        return
+
+    st = _bc_state.get(uid)
+    if st is None:
+        await q.answer("This broadcast is no longer active. Please start again.", show_alert=True)
+        await show_panel()
+        return
+    if act == "x":
+        _bc_state.pop(uid, None)
+        await q.answer("Cancelled.")
+        await show_panel()
+        return
+    st["menu"] = False
+    if act == "ta":
+        st["mode"] = "all"
+    elif act == "tp":
+        st["mode"], st["sel_done"], st["page"] = "pick", False, 0
+    elif act == "bk":
+        st["mode"] = None
+    elif act == "g" and arg.isdigit() and int(arg) < len(st["groups"]):
+        cid = st["groups"][int(arg)][0]
+        st["sel"].symmetric_difference_update({cid})
+    elif act == "pg" and arg.lstrip("-").isdigit():
+        st["page"] = int(arg)
+    elif act == "sa":
+        st["sel"] = {c for c, _ in st["groups"]}
+    elif act == "cl":
+        st["sel"] = set()
+    elif act == "dn":
+        if not st["sel"]:
+            await q.answer("Pick at least one group first.", show_alert=True)
+            return
+        st["sel_done"] = True
+    elif act in ("py", "pn"):
+        st["pin"], st["ask_pin"] = act == "py", False
+    elif act == "ed":
+        st["menu"] = True
+    elif act in ("et", "em", "ep"):
+        st["snap"] = (st["mode"], set(st["sel"]), st["sel_done"], st["msg"], st["pin"])   # "Back" restores it
+        if act == "et":
+            st["mode"], st["sel_done"] = None, False
+        elif act == "em":
+            st["await_msg"] = True
+        else:
+            st["ask_pin"] = True
+    elif act == "sum":
+        if st["snap"]:
+            st["mode"], st["sel"], st["sel_done"], st["msg"], st["pin"] = st["snap"]
+        st["snap"], st["await_msg"], st["ask_pin"] = None, False, False
+    elif act == "ok":
+        if _bc_step(st) != "sum":
+            await q.answer("Please finish the steps first.", show_alert=True)
+            return
+        await _bc_start(context, q, uid, st)
+        return
+    else:
+        await q.answer()
+        return
+    if _bc_step(st) == "sum" and not st["menu"]:
+        st["snap"] = None                                  # the edit is finished: "Back to summary" is not needed
+    await q.answer()
+    await _bc_render(context, uid, q)
+
+
+async def bc_message(update, context):
+    """The message the staff member sends after 'Send the message'. Ignored unless a broadcast waits for it."""
+    msg, user = update.effective_message, update.effective_user
+    if msg is None or user is None:
+        return
+    st = _bc_state.get(user.id)
+    if st is None or _bc_step(st) != "msg":
+        return
+    if not await _bc_allowed(user.id):
+        _bc_state.pop(user.id, None)
+        return
+    kind = next((k for k in ("photo", "video", "animation", "document", "audio", "voice", "video_note", "sticker",
+                             "poll") if getattr(msg, k, None)), "text")
+    st["msg"] = {"chat_id": msg.chat_id, "message_id": msg.message_id, "kind": kind,
+                 "text": (msg.text or msg.caption or "").strip()}
+    st["await_msg"] = False
+    if _bc_step(st) == "sum":
+        st["snap"] = None
+    await _bc_render(context, user.id)
+
+
+# ======================================================================================================
+# 6. REGISTRATION (single entry point)
+# ======================================================================================================
+def register(app, deps):
+    """Registers every handler of this file. See the module docstring for what `deps` needs."""
+    global D, _app
+    D, _app = deps, app
+
+    # auto close
+    app.add_handler(CommandHandler("autoclose", autoclose_cmd))
+
+    # clean service + clean commands
+    commands = {
+        "cleanservice": cleanservice_cmd, "keepservice": keepservice_cmd, "nocleanservice": keepservice_cmd,
+        "cleanservicetypes": cleanservicetypes_cmd,
+        "cleancommand": cleancommand_cmd, "keepcommand": keepcommand_cmd, "cleancommandtypes": cleancommandtypes_cmd,
+    }
+    for name, fn in commands.items():
+        app.add_handler(CommandHandler(name, fn))
+    # their own late groups: a handler group runs at most one handler, so these never compete with each other or
+    # with the bot's other handlers (which all run first)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.UpdateType.MESSAGE & filters.COMMAND,
+                                   clean_command_handler), group=100)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.UpdateType.MESSAGE & ~filters.COMMAND,
+                                   clean_service_handler), group=101)
+
+    # import / export / reset
+    app.add_handler(CommandHandler("export", export_cmd))
+    app.add_handler(CommandHandler("import", import_cmd))
+    app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CallbackQueryHandler(ie_callback, pattern=r"^ie:"))
+
+    # broadcast (Bot Staff panel): buttons + the message the staff member sends
+    app.add_handler(CallbackQueryHandler(bc_callback, pattern=r"^bc:"))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+                                   bc_message), group=102)
