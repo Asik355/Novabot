@@ -2,6 +2,7 @@
 group.py: all group-management logic in ONE file (merged from autoclose.py, cleaner.py and importexport.py).
 
   AUTO CLOSE / OPEN   /autoclose 23:00 06:00   /autoclose off   /autoclose
+                      (+ the 🕒 Auto Close and ⌨️ Command buttons on /help > Auto Close: hour, minute, AM/PM pickers)
   CLEAN SERVICE       /cleanservice <type>  /keepservice <type>  /nocleanservice <type>  /cleanservicetypes
   CLEAN COMMANDS      /cleancommand <type>  /keepcommand <type>  /cleancommandtypes
   IMPORT / EXPORT     /export [modules]  /import [modules]  /reset  (+ the Import / Export buttons on /help page 2)
@@ -50,7 +51,7 @@ from datetime import datetime, timedelta, timezone
 from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatMemberStatus
 from telegram.error import BadRequest, ChatMigrated, Forbidden, RetryAfter, TelegramError
-from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 import extra
 import migrate_to_mongo as store
@@ -271,6 +272,18 @@ AUTOCLOSE_USAGE = ("Usage:\n"
                    "3. /autoclose: show the schedule")
 
 
+async def turn_off(bot, chat_id):
+    """Stops the schedule and opens the group again if it is closed. Shared by /autoclose off and the OFF button.
+    Returns (ok, was_closed); ok is False when the group was closed and could not be opened."""
+    was_closed = D.get_setting(chat_id, STATE_KEY, "open") == "closed"
+    store.del_setting(chat_id, AUTOCLOSE_KEY)
+    if was_closed and not await open_group(bot, chat_id):
+        return False, was_closed
+    store.del_setting(chat_id, STATE_KEY)
+    store.del_setting(chat_id, SAVED_KEY)
+    return True, was_closed
+
+
 async def autoclose_cmd(update, context):
     if not await D.group_only(update):                 # group only + admins only
         return
@@ -288,14 +301,11 @@ async def autoclose_cmd(update, context):
                              f"The group is {state} right now.\n\nTurn it off with /autoclose off.")
         return
     if args[0] in ("off", "no", "stop", "disable", "0"):
-        was_closed = D.get_setting(chat.id, STATE_KEY, "open") == "closed"
-        store.del_setting(chat.id, AUTOCLOSE_KEY)
-        if was_closed and not await open_group(context.bot, chat.id):
+        ok, was_closed = await turn_off(context.bot, chat.id)
+        if not ok:
             await msg.reply_text("Auto close is OFF, but I couldn't open the group. Please make me an admin with the "
                                  "'Ban users' right, or change the group permissions yourself.")
             return
-        store.del_setting(chat.id, STATE_KEY)
-        store.del_setting(chat.id, SAVED_KEY)
         await msg.reply_text("✅ Auto close is OFF." + (" The group is open again." if was_closed else ""))
         return
     close, open_ = parse_two_times(" ".join(args))
@@ -310,6 +320,237 @@ async def autoclose_cmd(update, context):
                          f"Every day I close the group at {fmt_12h(close)} (only admins can write) and open it at "
                          f"{fmt_12h(open_)}.\nGive me the 'Ban users' admin right so I can do it.")
     await run_once(context.bot)                      # apply it right away if the group is inside the closed window now
+
+
+# ------------------------------------------------------------------ the /help > Auto Close page (buttons)
+# nova.py builds /help > Auto Close with only "Usage Guide" and "Back". The handler below runs BEFORE nova's own help
+# handler (handler group -20, then ApplicationHandlerStop), so nothing in nova.py has to change. The page gets one row
+# with two ways to set up auto close; both work on the same settings as /autoclose:
+#   🕒 Auto Close  choose the times with buttons: hour, then minute, then AM/PM (12-hour clock), first for closing,
+#                  then for opening. Also shows the status and a Turn OFF button.
+#   ⌨️ Command     explains the /autoclose command with examples.
+# Button data: "acb:<step>:<args>". Everything the next screen needs travels inside the button, so no state is kept.
+#   a            the Auto Close panel            c            the Command page             off          turn it OFF
+#   H:<w>:<c>    hour screen                     M:<w>:<c>:<h>             minute screen
+#   A:<w>:<c>:<h>:<m>  AM/PM screen              S:<w>:<c>:<h>:<m>:<A|P>   time chosen
+#   <w> = "c" (closing time) or "o" (opening time); <c> = the closing time in minutes while choosing the opening time.
+AC_HOME = "help:autoclose"
+AC_MINUTES = (0, 15, 30, 45)
+
+
+def _tz_label():
+    return "India time (IST)" if BOT_TIMEZONE == "Asia/Kolkata" else html.escape(BOT_TIMEZONE)
+
+
+def _ac_status(chat):
+    if chat is None or chat.type == "private":
+        return "Open /help inside a group to set up auto close for that group."
+    sched = load_schedule(D.get_setting(chat.id, AUTOCLOSE_KEY, "") or "")
+    if not sched:
+        return "Status: <b>OFF ❌</b>"
+    state = "closed 🔒" if D.get_setting(chat.id, STATE_KEY, "open") == "closed" else "open 🔓"
+    return (f"Status: <b>ON ✅</b> ({html.escape(BOT_TIMEZONE)})\n"
+            f"Closes at <b>{fmt_12h(sched[0])}</b> and opens at <b>{fmt_12h(sched[1])}</b>, every day.\n"
+            f"The group is {state} right now.")
+
+
+def _ac_home(chat):
+    text = ("<b>🕒 Auto Close</b>\n\n"
+            "Close the group automatically at a set time every day and open it again later. While the group is "
+            "closed, only admins can write messages.\n\n"
+            "Choose how you want to set it up:\n"
+            "• <b>🕒 Auto Close</b>: pick the times with buttons\n"
+            "• <b>⌨️ Command</b>: set it by typing a command\n\n"
+            f"{_ac_status(chat)}\n\n"
+            "<b>Note:</b> The bot must be an admin with the \"Ban users\" right. Opening the group brings back the "
+            "exact permissions it had before closing.")
+    rows = [[InlineKeyboardButton("🕒 Auto Close", callback_data="acb:a"),
+             InlineKeyboardButton("⌨️ Command", callback_data="acb:c")],
+            [InlineKeyboardButton("📖 Usage Guide", callback_data="help:g_autoclose")],
+            [InlineKeyboardButton("« Back", callback_data="help:main")]]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _ac_panel(chat, note=""):
+    sched = load_schedule(D.get_setting(chat.id, AUTOCLOSE_KEY, "") or "")
+    text = ("<b>🕒 Auto Close</b>\n\n" + (f"{note}\n\n" if note else "") + f"{_ac_status(chat)}\n\n"
+            "Tap <b>Set Time</b> to choose when the group closes and when it opens.")
+    rows = [[InlineKeyboardButton("⏰ Set Time", callback_data="acb:H:c:-")]]
+    if sched:
+        rows.append([InlineKeyboardButton("🔴 Turn OFF", callback_data="acb:off")])
+    rows.append([InlineKeyboardButton("« Back", callback_data=AC_HOME)])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _ac_command_page():
+    text = ("<b>⌨️ Auto Close: Command</b>\n\n"
+            "Prefer typing? Use these commands in the group (admins only):\n\n"
+            "<b>Set the schedule</b>\n"
+            "<code>/autoclose 11pm 6am</code>\n"
+            "Closes every day at 11:00 PM and opens at 6:00 AM.\n\n"
+            "<code>/autoclose 11:30pm 6:15am</code>\n"
+            "The same, with minutes: closes at 11:30 PM and opens at 6:15 AM.\n\n"
+            "<b>Turn it off</b>\n"
+            "<code>/autoclose off</code>\n"
+            "Stops the schedule. A closed group is opened again.\n\n"
+            "<b>Check it</b>\n"
+            "<code>/autoclose</code>\n"
+            "Shows the schedule and whether the group is closed right now.\n\n"
+            f"<b>Note:</b> The bot must be an admin with the \"Ban users\" right. Times use {_tz_label()}.")
+    return text, InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data=AC_HOME)]])
+
+
+def _ac_head(which, carry):
+    head = f"<b>🕒 Auto Close: {'Close' if which == 'c' else 'Open'} time</b>"
+    if which == "o":
+        head += f"\nThe group closes at <b>{fmt_12h(int(carry))}</b>."
+    return head
+
+
+def _ac_hour(which, carry):
+    text = _ac_head(which, carry) + "\n\n<b>Step 1 of 3:</b> pick the hour."
+    rows = [[InlineKeyboardButton(str(h), callback_data=f"acb:M:{which}:{carry}:{h}") for h in range(first, first + 4)]
+            for first in (1, 5, 9)]
+    rows.append([InlineKeyboardButton("« Back", callback_data="acb:a" if which == "c" else "acb:H:c:-")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _ac_minute(which, carry, hour):
+    text = _ac_head(which, carry) + f"\nHour: <b>{hour}</b>\n\n<b>Step 2 of 3:</b> pick the minute."
+    rows = [[InlineKeyboardButton(f"{m:02d}", callback_data=f"acb:A:{which}:{carry}:{hour}:{m}") for m in AC_MINUTES],
+            [InlineKeyboardButton("« Back", callback_data=f"acb:H:{which}:{carry}")]]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _ac_ampm(which, carry, hour, minute):
+    text = _ac_head(which, carry) + f"\nTime: <b>{hour}:{minute:02d}</b>\n\n<b>Step 3 of 3:</b> pick AM or PM."
+    rows = [[InlineKeyboardButton("☀️ AM", callback_data=f"acb:S:{which}:{carry}:{hour}:{minute}:A"),
+             InlineKeyboardButton("🌙 PM", callback_data=f"acb:S:{which}:{carry}:{hour}:{minute}:P")],
+            [InlineKeyboardButton("« Back", callback_data=f"acb:M:{which}:{carry}:{hour}")]]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _ac_num(text, low, high):
+    """int(text) when it is a whole number from low to high, else None."""
+    return int(text) if text.isascii() and text.isdigit() and low <= int(text) <= high else None
+
+
+async def _ac_edit(q, text, markup):
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+    except TelegramError:
+        pass                                          # unchanged (double tap) or too old to edit
+
+
+async def _ac_allowed(chat, user_id):
+    """Group admins, the bot owner (power ON) and bot staff."""
+    if D.is_bot_owner(user_id):
+        return True
+    try:
+        if await asyncio.to_thread(D.is_super_admin, user_id):
+            return True
+    except Exception:
+        log.exception("autoclose: staff check failed")
+    return await D.is_admin(chat, user_id)
+
+
+async def help_autoclose_callback(update, context):
+    """group=-20: /help > Auto Close. Replaces nova's plain page and stops nova's handler from answering too."""
+    q = update.callback_query
+    if q is None:
+        return
+    if await extra.menu_not_owner(q):                  # help buttons belong to the person who opened /help
+        raise ApplicationHandlerStop
+    await q.answer()
+    await _ac_edit(q, *_ac_home(q.message.chat if q.message else None))
+    raise ApplicationHandlerStop
+
+
+async def acb_callback(update, context):
+    """The buttons on the Auto Close page. Changing anything needs a group admin (checked on every tap)."""
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    if chat is None:
+        await q.answer()
+        return
+    if await extra.menu_not_owner(q):
+        return
+    parts = (q.data or "").split(":")
+    act = parts[1] if len(parts) > 1 else ""
+    invalid = "This button is no longer valid."
+    if act == "c":                                     # the Command page is only information: anyone may read it
+        await q.answer()
+        await _ac_edit(q, *_ac_command_page())
+        return
+    if chat.type == "private":
+        await q.answer("Open /help inside a group to set up auto close for that group.", show_alert=True)
+        return
+    if not await _ac_allowed(chat, q.from_user.id):
+        await q.answer("Only group admins can change auto close.", show_alert=True)
+        return
+
+    if act == "a":
+        await q.answer()
+        await _ac_edit(q, *_ac_panel(chat))
+        return
+    if act == "off":
+        try:
+            ok, was_closed = await turn_off(context.bot, chat.id)
+        except Exception:
+            log.exception("autoclose: turning off failed in %s", chat.id)
+            await q.answer("The database had a problem. Nothing was changed.", show_alert=True)
+            return
+        if not ok:
+            await q.answer("Auto close is OFF, but I couldn't open the group. Please make me an admin with the "
+                           "'Ban users' right.", show_alert=True)
+        else:
+            await q.answer("Auto close is OFF." + (" The group is open again." if was_closed else ""))
+        await _ac_edit(q, *_ac_panel(chat))
+        return
+
+    which = parts[2] if len(parts) > 2 else ""
+    carry = parts[3] if len(parts) > 3 else ""
+    carry_mins = _ac_num(carry, 0, 1439) if which == "o" else None
+    if which not in ("c", "o") or (which == "o" and carry_mins is None) or (which == "c" and carry != "-"):
+        await q.answer(invalid, show_alert=True)
+        return
+    hour = _ac_num(parts[4], 1, 12) if len(parts) > 4 else None
+    minute = _ac_num(parts[5], 0, 59) if len(parts) > 5 else None
+
+    if act == "H" and len(parts) == 4:
+        await q.answer()
+        await _ac_edit(q, *_ac_hour(which, carry))
+    elif act == "M" and len(parts) == 5 and hour:
+        await q.answer()
+        await _ac_edit(q, *_ac_minute(which, carry, hour))
+    elif act == "A" and len(parts) == 6 and hour and minute in AC_MINUTES:
+        await q.answer()
+        await _ac_edit(q, *_ac_ampm(which, carry, hour, minute))
+    elif act == "S" and len(parts) == 7 and hour and minute in AC_MINUTES and parts[6] in ("A", "P"):
+        mins = (hour % 12 + (12 if parts[6] == "P" else 0)) * 60 + minute
+        if which == "c":                               # closing time chosen: now ask for the opening time
+            await q.answer(f"Closes at {fmt_12h(mins)}")
+            await _ac_edit(q, *_ac_hour("o", str(mins)))
+            return
+        if mins == carry_mins:
+            await q.answer("The opening time must be different from the closing time.", show_alert=True)
+            return
+        try:
+            D.set_setting(chat.id, AUTOCLOSE_KEY, f"{fmt_minutes(carry_mins)}-{fmt_minutes(mins)}")
+        except Exception:
+            log.exception("autoclose: saving the schedule failed in %s", chat.id)
+            await q.answer("The database had a problem. Nothing was changed.", show_alert=True)
+            return
+        await q.answer("✅ Auto close is ON.")
+        note = (f"✅ Saved. Every day I close the group at <b>{fmt_12h(carry_mins)}</b> and open it at "
+                f"<b>{fmt_12h(mins)}</b>.\nGive me the \"Ban users\" admin right so I can do it.")
+        await _ac_edit(q, *_ac_panel(chat, note))
+        try:
+            await run_once(context.bot)                # apply it right away if the group is inside the closed window now
+        except Exception:
+            log.exception("autoclose: applying the new schedule failed")
+    else:
+        await q.answer(invalid, show_alert=True)
 
 
 # ======================================================================================================
@@ -1413,8 +1654,11 @@ def register(app, deps):
     global D, _app
     D, _app = deps, app
 
-    # auto close
+    # auto close: the command, plus the buttons on /help > Auto Close. The help:autoclose handler sits in group -20 so it
+    # runs before nova.py's own help handler and stops it (ApplicationHandlerStop): no change in nova.py is needed.
     app.add_handler(CommandHandler("autoclose", autoclose_cmd))
+    app.add_handler(CallbackQueryHandler(help_autoclose_callback, pattern=r"^help:autoclose$"), group=-20)
+    app.add_handler(CallbackQueryHandler(acb_callback, pattern=r"^acb:"))
 
     # clean service + clean commands
     commands = {
