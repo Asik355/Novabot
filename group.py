@@ -470,17 +470,12 @@ def _ac_panel(chat, note=""):
 def _ac_command_page():
     text = ("<b>⌨️ Auto Close: Command</b>\n\n"
             "Prefer typing? Use these commands in the group (admins only):\n\n"
-            "<b>Set the schedule</b>\n"
-            "<code>/autoclose 11pm 6am</code>\n"
-            "Closes every day at 11:00 PM and opens at 6:00 AM.\n\n"
-            "<code>/autoclose 11:30pm 6:15am</code>\n"
-            "The same, with minutes: closes at 11:30 PM and opens at 6:15 AM.\n\n"
-            "<b>Turn it off</b>\n"
-            "<code>/autoclose off</code>\n"
-            "Stops the schedule. A closed group is opened again.\n\n"
-            "<b>Check it</b>\n"
-            "<code>/autoclose</code>\n"
-            "Shows the schedule and whether the group is closed right now.\n\n"
+            "1. /autoclose 11pm 6am: Close every day at 11:00 PM and open at 6:00 AM.\n"
+            "2. /autoclose 11:30pm 6:15am: The same, with minutes: closes at 11:30 PM and opens at 6:15 AM.\n"
+            "3. /autoclose off: Stop the schedule. A closed group is opened again.\n"
+            "4. /autoclose: Show the schedule and whether the group is closed right now.\n"
+            "5. /autoclose closemsg text: Set your own message for when the group closes.\n"
+            "6. /autoclose openmsg text: Set your own message for when the group opens.\n\n"
             f"<b>Note:</b> The bot must be an admin with the \"Ban users\" right. Times use {_tz_label()}.")
     return text, InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data=AC_HOME)]])
 
@@ -1002,9 +997,9 @@ async def cleancommand_cmd(update, context):
         await msg.reply_html(
             f"Currently deleting <b>{_esc(_describe_clean(chat.id))}</b> commands.\n\n"
             "Usage:\n"
-            "<code>/clean &lt;type&gt;</code>: all, admin, user or other (see /cleancommandtypes)\n"
-            "<code>/clean /roast</code>: delete one command by name\n"
-            "<code>/keep &lt;type or /command&gt;</code>: stop deleting")
+            "1. /clean user: Delete a type: all, admin, user or other (see /cleancommandtypes).\n"
+            "2. /clean /roast: Delete one command by name.\n"
+            "3. /keep user: Stop deleting a type (or /keep /roast, /keep all).")
         return
     types = _load(chat.id, COMMAND_KEY, COMMAND_TYPES)
     names = set(_load_names(chat.id))
@@ -1019,7 +1014,7 @@ async def cleancommand_cmd(update, context):
         new_names, bad_names = parse_command_names(slash, context.bot.username)
         if bad or bad_names:
             shown = _esc(", ".join(bad + bad_names))
-            hint = " To delete one command, write it with a slash, for example <code>/clean /roast</code>." if bad else ""
+            hint = " To delete one command, write it with a slash, for example /clean /roast." if bad else ""
             await msg.reply_html(f"Unknown: <code>{shown}</code>\nTypes: all, {', '.join(COMMAND_TYPES)}. "
                                  f"See /cleancommandtypes.{hint}")
             return
@@ -1043,8 +1038,8 @@ async def keepcommand_cmd(update, context):
     chat, msg = update.effective_chat, update.effective_message
     words = _words(context.args)
     if not words:
-        await msg.reply_html("Usage:\n<code>/keep &lt;type&gt;</code>: all, admin, user or other\n"
-                             "<code>/keep /roast</code>: stop deleting one command\n"
+        await msg.reply_html("Usage:\n1. /keep user: Stop deleting a type: all, admin, user or other.\n"
+                             "2. /keep /roast: Stop deleting one command.\n"
                              "See /cleancommandtypes for the types.")
         return
     slash = [w for w in words if w.startswith("/")]
@@ -1053,7 +1048,7 @@ async def keepcommand_cmd(update, context):
     drop_names, bad_names = parse_command_names(slash, context.bot.username)
     if bad or bad_names:
         shown = _esc(", ".join(bad + bad_names))
-        hint = " To stop one command, write it with a slash, for example <code>/keep /roast</code>." if bad else ""
+        hint = " To stop one command, write it with a slash, for example /keep /roast." if bad else ""
         await msg.reply_html(f"Unknown: <code>{shown}</code>\nTypes: all, {', '.join(COMMAND_TYPES)}. "
                              f"See /cleancommandtypes.{hint}")
         return
@@ -1073,8 +1068,8 @@ async def keepcommand_cmd(update, context):
 
 async def cleancommandtypes_cmd(update, context):
     lines = ["<b>Command types</b>", ""] + [f"- <code>{n}</code>: {_esc(d)}" for n, d in COMMAND_INFO]
-    lines += ["- <code>/name</code>: Delete one specific command whatever its type, eg <code>/clean /roast</code>. "
-              "Stop it with <code>/keep /roast</code>."]
+    lines += ["- <code>/name</code>: Delete one specific command whatever its type, eg /clean /roast. "
+              "Stop it with /keep /roast."]
     await update.effective_message.reply_html("\n".join(lines))
 
 
@@ -1197,7 +1192,11 @@ def _cc_home(chat):
             "• <b>➕ Add Command</b>: choose what to delete\n"
             "• <b>➖ Remove</b>: stop deleting something\n\n"
             f"{_cc_status(chat)}\n\n"
-            "Prefer typing? <code>/clean user</code>, <code>/clean /roast</code> and <code>/keep user</code>.\n"
+            "Prefer typing? Use these commands (admins only):\n"
+            "1. /clean user: Delete user commands (or admin, other, all).\n"
+            "2. /clean /roast: Delete one specific command.\n"
+            "3. /keep user: Stop deleting user commands (or /keep /roast, /keep all).\n"
+            "4. /clean: Show what is being deleted now.\n\n"
             "<b>Note:</b> The bot must be an admin with the \"Delete messages\" right.")
     rows = [[InlineKeyboardButton("➕ Add Command", callback_data="ccb:add"),
              InlineKeyboardButton("➖ Remove", callback_data="ccb:rem")],
@@ -1220,7 +1219,7 @@ def _cc_add_screen(chat, note=""):
 
 def _cc_remove_screen(chat, note=""):
     names = _load_names(chat.id)
-    more = (f"\n…and {len(names) - CC_NAMES_SHOWN} more: remove them with <code>/keep /name</code>."
+    more = (f"\n…and {len(names) - CC_NAMES_SHOWN} more: remove them with /keep /name."
             if len(names) > CC_NAMES_SHOWN else "")
     text = ("<b>➖ Remove</b>\n\n" + (f"{note}\n\n" if note else "") +
             "Tap a type to stop deleting it. <b>All</b> stops everything." +
