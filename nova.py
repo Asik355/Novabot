@@ -1269,8 +1269,8 @@ HELP_SECTIONS = {
         "<b>🎮 Games</b>\n\nPick a game to see its commands.",
     ),
     "more": (
-        "📄 Page 2",
-        "<b>📄 Page 2</b>\n\nNothing here yet. More features are coming soon.",
+        "➡️ More Features",
+        "<b>➡️ More Features</b>\n\nPick a category to see its commands.",
     ),
     "dl": (  # opened from the ➕ More page (help:dl)
         "📥 Download",
@@ -1279,7 +1279,7 @@ HELP_SECTIONS = {
         "• /da &lt;link&gt;: download only the audio.\n\n"
         "You can also reply to a message that has a link with /dl or /da.",
     ),
-    "ie": (  # opened from Page 2 (help:ie)
+    "ie": (  # opened from the front page (help:ie)
         "📦 Import & Export",
         "<b>Import/Export</b>\n\n"
         "Some people just want to see the world burn. Others, just want to have a way of grouping their chat data in one "
@@ -1756,18 +1756,29 @@ def help_main_keyboard(chat=None, user_id=None):
     # Do not move it, combine it with another button, or place any
     # button after it.
     
-    fun_row = list(fun_systems.fun_help_row())  # 🎉 Fun, 🗑 Delete, placeholder -> the placeholder becomes ➕ More
-    if len(fun_row) >= 3:
-        fun_row[2] = InlineKeyboardButton("🎮 Games", callback_data="help:games")
-    rows.append(fun_row)  # 🎉 Fun, 🗑 Delete, 🎮 Games: its own row under Count / AI Commands / Blocking
-    rows.append([InlineKeyboardButton("✨ Extras", callback_data="help:extras"),
-                 InlineKeyboardButton("📥 Download", callback_data="help:dl"),
+    fun_row = list(fun_systems.fun_help_row())  # 🎉 Fun, 🗑 Delete, placeholder (🗑 Delete now lives on page 2)
+    # front page: 🎉 Fun and 🎮 Games side by side (🗑 Delete and ✨ Extras moved to "More Features")
+    rows.append([fun_row[0] if fun_row else InlineKeyboardButton("🎉 Fun", callback_data="help:fun"),
+                 InlineKeyboardButton("🎮 Games", callback_data="help:games")])
+    rows.append([InlineKeyboardButton("📥 Download", callback_data="help:dl"),
                  InlineKeyboardButton("📦 Import & Export", callback_data="help:ie")])
-    rows.append([InlineKeyboardButton("📄 Page 2", callback_data="help:more")])  # full width, like Owner and the suggestions bar
+    rows.append([InlineKeyboardButton("More Features ➡️", callback_data="help:more")])  # full width, changes the page
     if user_id in OWNER_IDS or (user_id and is_super_admin(user_id)):  # 🛡 Bot Staff: just above the Suggestion Bar, owner + bot staff only
         rows.append([InlineKeyboardButton("🛡 Bot Staff", callback_data="own:m")])
     if chat is not None:  # always the last row, in groups and in private chat
         rows.append([suggestions_button(chat.id, "help")])
+    return InlineKeyboardMarkup(style_help_buttons(rows))
+
+
+MORE_FEATURES_TEXT = "<b>➡️ More Features</b>\n\nPick a category to see its commands."
+
+
+def help_more_keyboard():
+    """Page 2 of /help ("More Features"): 🗑 Delete and ✨ Extras, with a Back button to the front page."""
+    fun_row = list(fun_systems.fun_help_row())  # [🎉 Fun, 🗑 Delete, placeholder]: Delete is the second button
+    delete_btn = fun_row[1] if len(fun_row) >= 2 else InlineKeyboardButton("🗑 Delete", callback_data="help:delete")
+    rows = [[delete_btn, InlineKeyboardButton("✨ Extras", callback_data="help:extras")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="help:main")]]
     return InlineKeyboardMarkup(style_help_buttons(rows))
 
 
@@ -1787,7 +1798,7 @@ def help_section_keyboard(key=None, chat=None):
         rows.append([InlineKeyboardButton("⚙️ Auto Approve", callback_data="jn:m")])
     if key in USAGE_GUIDES:  # 📖 every help page that has a guide gets the button, right above Back
         rows.append([InlineKeyboardButton("📖 Usage Guide", callback_data=f"help:g_{key}")])
-    back = {"roast": "help:games", "court": "help:games"}.get(key, "help:main")
+    back = {"roast": "help:games", "court": "help:games", "extras": "help:more"}.get(key, "help:main")
     rows.append([InlineKeyboardButton("« Back", callback_data=back)])
     return InlineKeyboardMarkup(rows)
 
@@ -1862,7 +1873,9 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except TelegramError:
             pass
         return
-    if key == "main" or key not in HELP_SECTIONS:
+    if key == "more":  # ➡️ page 2: the whole menu changes to More Features (edited in place)
+        text, markup = MORE_FEATURES_TEXT, help_more_keyboard()
+    elif key == "main" or key not in HELP_SECTIONS:
         text = f"<b>{html.escape(extra.bot_name())}</b>\n\n{HELP_INTRO}"
         markup = help_main_keyboard(update.effective_chat, update.effective_user.id if update.effective_user else None)
     else:

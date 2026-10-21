@@ -1316,7 +1316,7 @@ def _del_card_view():
             "💤 <b>Inactive Members</b>\nSee members with no message for N days.")
     return text, KB([[B("👻 Deleted List", callback_data="mcd:l"), B(f"💤 Inactive {INACTIVE_DEFAULT}", callback_data=f"mcd:i:{INACTIVE_DEFAULT}:0")],
                      [B("ℹ️ How it works", callback_data="mcd:h")],
-                     [B("« Back", callback_data="help:main")]])
+                     [B("« Back", callback_data="help:more")]])
 
 
 _DEL_HELP = ("ℹ️ <b>HOW IT WORKS</b>\n\n"
