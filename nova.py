@@ -533,7 +533,7 @@ async def announce(chat, text, uid=None):
     kb = None
     # when the bot itself just muted this user, attach the same Unmute button /mute uses
     if uid is not None and time.time() - _recent_mutes.pop((chat.id, uid), 0) < 15:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Unmute", callback_data=f"unmute:{uid}")]])
+        kb = group.appeal_markup(chat.id, uid, "mute", InlineKeyboardMarkup([[InlineKeyboardButton("✅ Unmute", callback_data=f"unmute:{uid}")]]))
     try:
         sent = await chat.send_message(text, parse_mode="HTML", reply_markup=kb)
     except TelegramError as e:
@@ -1096,6 +1096,25 @@ HELP_SECTIONS = {
         "<b>Note:</b> The bot must be an admin with the \"Ban users\" right. Opening the group brings back the exact "
         "permissions it had before closing.",
     ),
+    "night": (
+        "🌙 Night Mode",
+        "<b>Night Mode</b>\n\n"
+        "At night the group stays open, but members can only send plain text. Admins are not affected.\n\n"
+        "<b>Admin commands:</b>\n"
+        "1. /night 11pm 6am: Text only every day from the first time to the second.\n"
+        "2. /night off: Turn Night Mode off.\n"
+        "3. /night: Show the schedule.\n\n"
+        "<b>Note:</b> The bot must be an admin with the \"Ban users\" right. Auto Close comes first.",
+    ),
+    "appeal": (
+        "📩 Appeal",
+        "<b>Appeal</b>\n\n"
+        "A muted or warned member can ask the admins to look at it again. It is OFF until you turn it on.\n\n"
+        "<b>Admin commands:</b>\n"
+        "1. /appeal on: Turn Appeal on (or /appeal off).\n"
+        "2. /appeal group: Send appeals to the group (or /appeal log, /appeal dm).\n"
+        "3. /appeal: Show the settings.",
+    ),
     "locks": (
         "Locks",
         "<b>Locks</b>\n\n" + _numbered([
@@ -1306,7 +1325,7 @@ HELP_SECTIONS = {
         "importing/exporting data don't slow down the bot.",
     ),
 }
-HELP_ORDER = ["mod", "warn", "flood", "captcha", "greet", "rules", "notes", "filters", "locks", "purge", "log", "reports", "approval", "disabling", "cleanservice", "cleancommand", "autoclose", "groupedit", "botedit", "other", "info", "birthday"]
+HELP_ORDER = ["mod", "warn", "flood", "captcha", "greet", "rules", "notes", "filters", "locks", "purge", "log", "reports", "approval", "disabling", "cleanservice", "cleancommand", "autoclose", "night", "appeal", "groupedit", "botedit", "other", "info", "birthday"]
 
 
 def _build_bot_commands():
@@ -1778,6 +1797,7 @@ def help_more_keyboard():
     fun_row = list(fun_systems.fun_help_row())  # [🎉 Fun, 🗑 Delete, placeholder]: Delete is the second button
     delete_btn = fun_row[1] if len(fun_row) >= 2 else InlineKeyboardButton("🗑 Delete", callback_data="help:delete")
     rows = [[delete_btn, InlineKeyboardButton("✨ Extras", callback_data="help:extras")],
+            [InlineKeyboardButton("🌐 Language", callback_data="lang:m")],  # lang/ folder, opened by group.py's handlers
             [InlineKeyboardButton("⬅️ Back", callback_data="help:main")]]
     return InlineKeyboardMarkup(style_help_buttons(rows))
 
@@ -2293,6 +2313,7 @@ async def _mute_cmd(update, context, timed_required=False, delete_replied=False)
     why = reason[:200] or "Muted by an admin (no reason given)"
     by, punish = update.effective_user.mention_html(), extra.punishment_text("mute", secs)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Unmute", callback_data=f"unmute:{uid}")]])
+    kb = group.appeal_markup(chat.id, uid, "mute", kb)  # adds 📩 Appeal when Appeal is ON
     sent = await msg.reply_html(extra.action_notice(name, "Muted", why, punish, by), reply_markup=kb)
     await extra.track_notice(sent)
     await extra.record_action(chat.id, uid, name, "Muted", why, punish, by, "mute")
@@ -2346,6 +2367,7 @@ async def _warn_cmd(update, context, delete_replied=False):
     kb = None
     if warn_summary(chat.id, uid).split("/")[0] != "0":
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Remove warning", callback_data=f"rmwarn:{uid}")]])
+        kb = group.appeal_markup(chat.id, uid, "warn", kb)  # adds 📩 Appeal when Appeal is ON
     await extra.track_notice(await msg.reply_html(text, reply_markup=kb))
     await log_action(chat, "warn", f"⚠️ {update.effective_user.mention_html()} warned {name}. {text}")
 
@@ -5745,16 +5767,19 @@ async def _startup_sync(app):
             except TelegramError as e:
                 logging.warning("Couldn't re-apply the saved bot name: %s", e)
         await extra.refresh_identity(app.bot, force=True)
-        await app.bot.set_my_short_description(
-            get_setting(0, "bot_short_description")
-            or "Group moderation: warnings, mutes, filters, welcomes and join verification."
-        )
-        await app.bot.set_my_description(
-            get_setting(0, "bot_description")
-            or "I help admins keep groups tidy: warnings, mutes, blocklists, antiflood and "
-            "antispam, welcome messages, filters, notes and join verification. "
-            "Add me to your group as an admin and send /help."
-        )
+        # Same rule as the name: the saved text (Bot Edit > Bio / Description) is re-applied on every start, and the
+        # generic default is used only while Telegram has no text at all, so it never replaces one you set yourself.
+        short_default = "Group moderation: warnings, mutes, filters, welcomes and join verification."
+        long_default = ("I help admins keep groups tidy: warnings, mutes, blocklists, antiflood and "
+                        "antispam, welcome messages, filters, notes and join verification. "
+                        "Add me to your group as an admin and send /help.")
+        saved_short, saved_long = get_setting(0, "bot_short_description"), get_setting(0, "bot_description")
+        current = (await app.bot.get_my_short_description()).short_description
+        if (saved_short and current != saved_short) or (not saved_short and not current):
+            await app.bot.set_my_short_description(saved_short or short_default)
+        current = (await app.bot.get_my_description()).description
+        if (saved_long and current != saved_long) or (not saved_long and not current):
+            await app.bot.set_my_description(saved_long or long_default)
     except TelegramError as e:
         logging.warning("Couldn't update the bot profile: %s", e)
 
@@ -6582,7 +6607,7 @@ def main():
         group_only=group_only, get_setting=get_setting, set_setting=set_setting, is_paused=is_paused,
         default_perms=DEFAULT_PERMS, fun_names=fun_systems._fun_names, is_admin=is_admin,
         is_bot_owner=is_bot_owner, owner_ids=OWNER_IDS, is_super_admin=is_super_admin,
-        groups_source=_stats_refresh))  # /autoclose, /cleanservice, /cleancommand, /export /import /reset
+        groups_source=_stats_refresh, active_warns=active_warns))  # /autoclose, /night, /appeal, /cleanservice, /cleancommand, /export /import /reset, /lang
     msgcount.register(app, owner_ids=OWNER_IDS, groups_source=_stats_refresh)  # /rank /top /today /week /overall /me /radmin /resetrank + counter + 📊 menu
     app.add_handler(CallbackQueryHandler(wipe_callback, pattern=r"^wipe:"))  # /clearall and /stopall confirmation
     app.add_handler(CallbackQueryHandler(captcha_callback, pattern=r"^cap:"))

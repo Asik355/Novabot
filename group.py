@@ -3,6 +3,9 @@ group.py: all group-management logic in ONE file (merged from autoclose.py, clea
 
   AUTO CLOSE / OPEN   /autoclose 23:00 06:00   /autoclose off   /autoclose
                       (+ the 🕒 Auto Close and ⌨️ Command buttons on /help > Auto Close: hour, minute, AM/PM pickers)
+  NIGHT MODE          /night 11pm 6am   /night off   /night   (text-only at night; /help > Night Mode page)
+  APPEAL              /appeal [on|off|group|log|dm]   (📩 Appeal button on mute / warn notices; OFF by default)
+  LANGUAGE            /lang  (English / Hinglish; the texts live in the lang/ folder)
   CLEAN SERVICE       /cleanservice <type>  /keepservice <type>  /nocleanservice <type>  /cleanservicetypes
   CLEAN COMMANDS      /clean <type or /command>  /keep <type or /command>  /cleancommandtypes
                       (the old names /cleancommand and /keepcommand still work; + the ➕ Add Command and ➖ Remove
@@ -39,6 +42,8 @@ deps needs:
     is_bot_owner(user_id)
     owner_ids, is_super_admin(user_id)   who may broadcast (bot owner + bot staff)
     groups_source(bot)       async, [(chat_id, title, link)] of every group the bot is in
+    active_warns(chat_id, user_id)   a member's unexpired warnings as (id, reason, time), for Appeal
+nova.py also calls group.appeal_markup(chat_id, user_id, "mute"|"warn", kb) where it builds the Unmute / Remove warning button.
 """
 import asyncio
 import html
@@ -57,6 +62,7 @@ from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler, CommandHa
 
 import extra
 import migrate_to_mongo as store
+from lang import lang as L          # the language system (lang/ folder): L.t("key", chat_id, name=value)
 
 log = logging.getLogger("group")
 D = None            # helpers handed in by nova.py (see register)
@@ -78,6 +84,9 @@ _app = None
 AUTOCLOSE_KEY, STATE_KEY, SAVED_KEY = "autoclose", "autoclose_state", "autoclose_saved"
 PIN_KEY, MSG_CLOSE_KEY, MSG_OPEN_KEY = "autoclose_pin", "autoclose_msg_close", "autoclose_msg_open"
 MSG_MAX = 500
+# Night Mode (section 2b): night = "HH:MM-HH:MM" (start-end), night_state = "on" while the media permissions are off,
+# night_saved = JSON of the real permissions saved when it started.
+NIGHT_KEY, NIGHT_STATE_KEY, NIGHT_SAVED_KEY = "night", "night_state", "night_saved"
 CHECK_EVERY = 30         # seconds between checks
 RETRY_AFTER = 600        # seconds before a failed close/open is tried again
 NOTICE_EVERY = 6 * 3600  # at most one "I couldn't do it" notice per group per 6 hours
@@ -186,7 +195,8 @@ def _restore_perms(chat_id):
     return perms
 
 
-async def _fail(bot, chat_id, what, exc):
+async def _fail(bot, chat_id, what, exc, label=None):
+    """`what` keys the retry timer; `label` is the words in the notice (default: '<what> the group')."""
     _retry_at[(chat_id, what)] = time.monotonic() + RETRY_AFTER
     log.warning("autoclose: couldn't %s %s: %s: %s", what, chat_id, type(exc).__name__, exc)
     last = _notice_at.get(chat_id)
@@ -194,8 +204,8 @@ async def _fail(bot, chat_id, what, exc):
         return
     _notice_at[chat_id] = time.monotonic()
     try:
-        await bot.send_message(chat_id, f"⚠️ I couldn't {what} the group on schedule. Please make me an admin with the "
-                                        "'Ban users' (restrict members) right. I will try again in a few minutes.")
+        await bot.send_message(chat_id, f"⚠️ I couldn't {label or what + ' the group'} on schedule. Please make me an admin "
+                                        "with the 'Ban users' (restrict members) right. I will try again in a few minutes.")
     except TelegramError:
         pass
 
@@ -236,7 +246,10 @@ async def close_group(bot, chat_id, until_minutes=None):
     try:
         chat = await bot.get_chat(chat_id)
         current = _saved_perms(chat)
-        if getattr(getattr(chat, "permissions", None), "can_send_messages", True) is not False and current:
+        night_saved = D.get_setting(chat_id, NIGHT_STATE_KEY, "") == "on" and D.get_setting(chat_id, NIGHT_SAVED_KEY, "")
+        if night_saved:                                            # Night Mode is on: keep the REAL permissions it saved,
+            D.set_setting(chat_id, SAVED_KEY, night_saved)         # not the media-off ones the group has right now
+        elif getattr(getattr(chat, "permissions", None), "can_send_messages", True) is not False and current:
             D.set_setting(chat_id, SAVED_KEY, current)             # only save a real "open" state, never a closed one
         await bot.set_chat_permissions(chat_id, CLOSED_PERMS)
     except TelegramError as e:
@@ -271,7 +284,10 @@ async def _unpin_closed_message(bot, chat_id):
 
 async def open_group(bot, chat_id):
     try:
-        await bot.set_chat_permissions(chat_id, _restore_perms(chat_id))
+        perms = _restore_perms(chat_id)
+        if D.get_setting(chat_id, NIGHT_STATE_KEY, "") == "on":    # opening inside the night window: media stays off
+            perms = _night_variant(perms)
+        await bot.set_chat_permissions(chat_id, perms)
     except TelegramError as e:
         await _fail(bot, chat_id, "open", e)
         return False
@@ -287,14 +303,20 @@ async def open_group(bot, chat_id):
 
 
 # ------------------------------------------------------------------ the background loop
-def _scheduled_groups():
-    """[(chat_id, 'HH:MM-HH:MM')] for every group that has a schedule (one query, no per-group lookups)."""
-    rows = store.col("settings").find({"key": AUTOCLOSE_KEY}, {"chat_id": 1, "value": 1})
+def _scheduled_groups(key=AUTOCLOSE_KEY):
+    """[(chat_id, 'HH:MM-HH:MM')] for every group that has a schedule under `key` (Auto Close, or Night Mode's);
+    one query, no per-group lookups."""
+    rows = store.col("settings").find({"key": key}, {"chat_id": 1, "value": 1})
     return [(int(r["chat_id"]), r.get("value")) for r in rows]
 
 
 async def run_once(bot):
     now = _now_minutes()
+    await _auto_close_round(bot, now)
+    await _night_round(bot, now)                       # Night Mode (section 2b) uses the same loop
+
+
+async def _auto_close_round(bot, now):
     for chat_id, raw in await asyncio.to_thread(_scheduled_groups):
         sched = load_schedule(raw)
         if not sched or chat_id >= 0 or D.is_paused(chat_id):
@@ -480,34 +502,47 @@ def _ac_command_page():
     return text, InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data=AC_HOME)]])
 
 
-def _ac_head(which, carry):
-    head = f"<b>🕒 Auto Close: {'Close' if which == 'c' else 'Open'} time</b>"
+# The same three pickers serve Auto Close and Night Mode. `which` says which time is being chosen:
+#   "c" Auto Close closing time   "o" Auto Close opening time   "nc" Night Mode start   "no" Night Mode end
+# (the second time of a pair carries the first one in `carry`). The texts come from lang (keys "pick.*", "ac.*", "night.*").
+_AC_FIRST, _AC_SECOND = ("c", "nc"), ("o", "no")
+
+
+def _ac_head(which, carry, chat_id=None):
+    if which in ("nc", "no"):
+        head = L.t("night.head_start" if which == "nc" else "night.head_end", chat_id)
+        if which == "no":
+            head += "\n" + L.t("night.starts_at", chat_id, time=fmt_12h(int(carry)))
+        return head
+    head = L.t("ac.head_close" if which == "c" else "ac.head_open", chat_id)
     if which == "o":
-        head += f"\nThe group closes at <b>{fmt_12h(int(carry))}</b>."
+        head += "\n" + L.t("ac.closes_at", chat_id, time=fmt_12h(int(carry)))
     return head
 
 
-def _ac_hour(which, carry):
-    text = _ac_head(which, carry) + "\n\n<b>Step 1 of 3:</b> pick the hour."
+def _ac_hour(which, carry, chat_id=None):
+    text = _ac_head(which, carry, chat_id) + "\n\n" + L.t("pick.step1", chat_id)
     rows = [[InlineKeyboardButton(str(h), callback_data=f"acb:M:{which}:{carry}:{h}") for h in range(first, first + 4)]
             for first in (1, 5, 9)]
-    rows.append([InlineKeyboardButton("« Back", callback_data="acb:a" if which == "c" else "acb:H:c:-")])
+    back = {"c": "acb:a", "o": "acb:H:c:-", "nc": "nmb:a", "no": "acb:H:nc:-"}[which]
+    rows.append([InlineKeyboardButton(L.t("pick.back", chat_id), callback_data=back)])
     return text, InlineKeyboardMarkup(rows)
 
 
-def _ac_minute(which, carry, hour):
-    text = (_ac_head(which, carry) + f"\nHour: <b>{hour}</b>\n\n<b>Step 2 of 3:</b> pick the minute, or send a "
-            "number from 0 to 59 in this chat (for example <code>7</code> or <code>45</code>).")
+def _ac_minute(which, carry, hour, chat_id=None):
+    text = (_ac_head(which, carry, chat_id) + "\n" + L.t("pick.hour", chat_id, hour=hour) + "\n\n" +
+            L.t("pick.step2", chat_id))
     rows = [[InlineKeyboardButton(f"{m:02d}", callback_data=f"acb:A:{which}:{carry}:{hour}:{m}") for m in AC_MINUTES],
-            [InlineKeyboardButton("« Back", callback_data=f"acb:H:{which}:{carry}")]]
+            [InlineKeyboardButton(L.t("pick.back", chat_id), callback_data=f"acb:H:{which}:{carry}")]]
     return text, InlineKeyboardMarkup(rows)
 
 
-def _ac_ampm(which, carry, hour, minute):
-    text = _ac_head(which, carry) + f"\nTime: <b>{hour}:{minute:02d}</b>\n\n<b>Step 3 of 3:</b> pick AM or PM."
-    rows = [[InlineKeyboardButton("☀️ AM", callback_data=f"acb:S:{which}:{carry}:{hour}:{minute}:A"),
-             InlineKeyboardButton("🌙 PM", callback_data=f"acb:S:{which}:{carry}:{hour}:{minute}:P")],
-            [InlineKeyboardButton("« Back", callback_data=f"acb:M:{which}:{carry}:{hour}")]]
+def _ac_ampm(which, carry, hour, minute, chat_id=None):
+    text = (_ac_head(which, carry, chat_id) + "\n" + L.t("pick.time", chat_id, time=f"{hour}:{minute:02d}") + "\n\n" +
+            L.t("pick.step3", chat_id))
+    rows = [[InlineKeyboardButton(L.t("pick.am", chat_id), callback_data=f"acb:S:{which}:{carry}:{hour}:{minute}:A"),
+             InlineKeyboardButton(L.t("pick.pm", chat_id), callback_data=f"acb:S:{which}:{carry}:{hour}:{minute}:P")],
+            [InlineKeyboardButton(L.t("pick.back", chat_id), callback_data=f"acb:M:{which}:{carry}:{hour}")]]
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -638,7 +673,7 @@ async def ac_minute_message(update, context):
     if minute is None:
         return
     _ac_pending.pop((chat.id, user.id), None)
-    text, markup = _ac_ampm(pending["which"], pending["carry"], pending["hour"], minute)
+    text, markup = _ac_ampm(pending["which"], pending["carry"], pending["hour"], minute, chat.id)
     try:
         await context.bot.edit_message_text(text, chat_id=chat.id, message_id=pending["mid"], parse_mode="HTML",
                                             reply_markup=markup, disable_web_page_preview=True)
@@ -716,16 +751,18 @@ async def acb_callback(update, context):
 
     which = parts[2] if len(parts) > 2 else ""
     carry = parts[3] if len(parts) > 3 else ""
-    carry_mins = _ac_num(carry, 0, 1439) if which == "o" else None
-    if which not in ("c", "o") or (which == "o" and carry_mins is None) or (which == "c" and carry != "-"):
+    carry_mins = _ac_num(carry, 0, 1439) if which in _AC_SECOND else None
+    if which not in _AC_FIRST + _AC_SECOND or (which in _AC_SECOND and carry_mins is None) \
+            or (which in _AC_FIRST and carry != "-"):
         await q.answer(invalid, show_alert=True)
         return
+    night = which in ("nc", "no")
     hour = _ac_num(parts[4], 1, 12) if len(parts) > 4 else None
     minute = _ac_num(parts[5], 0, 59) if len(parts) > 5 else None
 
     if act == "H" and len(parts) == 4:
         await q.answer()
-        await _ac_edit(q, *_ac_hour(which, carry))
+        await _ac_edit(q, *_ac_hour(which, carry, chat.id))
     elif act == "M" and len(parts) == 5 and hour:
         await q.answer()
         now = time.monotonic()
@@ -733,35 +770,565 @@ async def acb_callback(update, context):
             _ac_pending.pop(key, None)                 # forget people who walked away
         _ac_pending[(chat.id, q.from_user.id)] = {"which": which, "carry": carry, "hour": hour,
                                                   "mid": q.message.message_id, "ts": now}
-        await _ac_edit(q, *_ac_minute(which, carry, hour))
+        await _ac_edit(q, *_ac_minute(which, carry, hour, chat.id))
     elif act == "A" and len(parts) == 6 and hour and minute is not None:
         await q.answer()
-        await _ac_edit(q, *_ac_ampm(which, carry, hour, minute))
+        await _ac_edit(q, *_ac_ampm(which, carry, hour, minute, chat.id))
     elif act == "S" and len(parts) == 7 and hour and minute is not None and parts[6] in ("A", "P"):
         mins = (hour % 12 + (12 if parts[6] == "P" else 0)) * 60 + minute
-        if which == "c":                               # closing time chosen: now ask for the opening time
-            await q.answer(f"Closes at {fmt_12h(mins)}")
-            await _ac_edit(q, *_ac_hour("o", str(mins)))
+        if which in _AC_FIRST:                         # the first time is chosen: now ask for the second one
+            await q.answer(L.t("night.starts_toast" if night else "ac.closes_toast", chat.id, time=fmt_12h(mins)))
+            await _ac_edit(q, *_ac_hour("no" if night else "o", str(mins), chat.id))
             return
         if mins == carry_mins:
-            await q.answer("The opening time must be different from the closing time.", show_alert=True)
+            await q.answer(L.t("night.same_time" if night else "ac.same_time", chat.id), show_alert=True)
             return
+        key = NIGHT_KEY if night else AUTOCLOSE_KEY
         try:
-            D.set_setting(chat.id, AUTOCLOSE_KEY, f"{fmt_minutes(carry_mins)}-{fmt_minutes(mins)}")
+            D.set_setting(chat.id, key, f"{fmt_minutes(carry_mins)}-{fmt_minutes(mins)}")
         except Exception:
             log.exception("autoclose: saving the schedule failed in %s", chat.id)
-            await q.answer("The database had a problem. Nothing was changed.", show_alert=True)
+            await q.answer(L.t("ac.db_problem", chat.id), show_alert=True)
             return
-        await q.answer("✅ Auto close is ON.")
-        note = (f"✅ Saved. Every day I close the group at <b>{fmt_12h(carry_mins)}</b> and open it at "
-                f"<b>{fmt_12h(mins)}</b>.\nGive me the \"Ban users\" admin right so I can do it.")
-        await _ac_edit(q, *_ac_panel(chat, note))
+        if night:
+            await q.answer(L.t("night.on_toast", chat.id))
+            note = L.t("night.saved", chat.id, start=fmt_12h(carry_mins), end=fmt_12h(mins))
+            await _ac_edit(q, *_nm_panel(chat, note))
+        else:
+            await q.answer(L.t("ac.on_toast", chat.id))
+            note = L.t("ac.saved", chat.id, close=fmt_12h(carry_mins), open=fmt_12h(mins))
+            await _ac_edit(q, *_ac_panel(chat, note))
         try:
-            await run_once(context.bot)                # apply it right away if the group is inside the closed window now
+            await run_once(context.bot)                # apply it right away if the group is inside the window now
         except Exception:
             log.exception("autoclose: applying the new schedule failed")
     else:
         await q.answer(invalid, show_alert=True)
+
+
+# ======================================================================================================
+# 2b. NIGHT MODE
+# ======================================================================================================
+# At night the group stays open but members can only send plain text: the media permissions are switched off (photos,
+# videos, audio, voice and video messages, files, stickers/GIFs, polls). Telegram has no permission for links, so links
+# are not blocked. Admins are never affected. It runs in the same 30-second loop as Auto Close (run_once).
+#   * AUTO CLOSE COMES FIRST: while Auto Close has the group closed, Night Mode does nothing; when Auto Close opens the
+#     group inside the night window the media stays off (open_group), and when Auto Close closes during Night Mode it
+#     saves the REAL permissions that Night Mode saved (close_group), so nothing is ever restored to a media-off state.
+#   * Settings per group: night = "HH:MM-HH:MM" (start-end), night_state = "on" while it is active, night_saved = JSON.
+#   * The bot needs the "Ban users" (restrict members) admin right.
+NIGHT_MEDIA_OFF = ("can_send_audios", "can_send_documents", "can_send_photos", "can_send_videos",
+                   "can_send_video_notes", "can_send_voice_notes", "can_send_polls", "can_send_other_messages")
+
+
+def _night_variant(perms):
+    """The given permissions with every media permission switched off; text (and everything else) stays as it was."""
+    to_dict = getattr(perms, "to_dict", None)
+    d = dict(to_dict()) if to_dict else {}
+    d.update({k: False for k in NIGHT_MEDIA_OFF})
+    d["can_send_messages"] = True
+    return ChatPermissions(**d)
+
+
+def _night_saved_perms(chat_id):
+    raw = D.get_setting(chat_id, NIGHT_SAVED_KEY, "") or ""
+    try:
+        perms = ChatPermissions(**json.loads(raw)) if raw else None
+    except (TypeError, ValueError):
+        perms = None
+    if perms is None or perms.can_send_messages is False:      # nothing usable saved: the group's defaults
+        return D.default_perms
+    return perms
+
+
+async def start_night(bot, chat_id, end_minutes):
+    """Saves the permissions, switches the media permissions off, tells the group. Returns True when it worked."""
+    try:
+        chat = await bot.get_chat(chat_id)
+        perms = getattr(chat, "permissions", None)
+        if perms is None or getattr(perms, "can_send_messages", True) is False:
+            _retry_at[(chat_id, "night")] = time.monotonic() + RETRY_AFTER   # closed by hand: look again later
+            return False
+        D.set_setting(chat_id, NIGHT_SAVED_KEY, _saved_perms(chat))
+        await bot.set_chat_permissions(chat_id, _night_variant(perms))
+    except TelegramError as e:
+        await _fail(bot, chat_id, "night", e, "start Night Mode in the group")
+        return False
+    D.set_setting(chat_id, NIGHT_STATE_KEY, "on")
+    try:
+        await bot.send_message(chat_id, L.t("night.start", chat_id, open_time=fmt_12h(end_minutes)), parse_mode="HTML")
+    except TelegramError:
+        pass
+    return True
+
+
+async def end_night(bot, chat_id):
+    """Gives the saved permissions back and tells the group. While Auto Close has the group closed only the state is
+    cleared (Auto Close keeps the real permissions and restores them when it opens)."""
+    closed = D.get_setting(chat_id, STATE_KEY, "open") == "closed"
+    if not closed:
+        try:
+            await bot.set_chat_permissions(chat_id, _night_saved_perms(chat_id))
+        except TelegramError as e:
+            await _fail(bot, chat_id, "night-end", e, "end Night Mode in the group")
+            return False
+    store.del_setting(chat_id, NIGHT_STATE_KEY)
+    store.del_setting(chat_id, NIGHT_SAVED_KEY)
+    if not closed:
+        try:
+            await bot.send_message(chat_id, L.t("night.end", chat_id), parse_mode="HTML")
+        except TelegramError:
+            pass
+    return True
+
+
+async def night_off(bot, chat_id):
+    """Stops Night Mode and gives the permissions back if it was active. Returns (ok, was_active)."""
+    was = D.get_setting(chat_id, NIGHT_STATE_KEY, "") == "on"
+    store.del_setting(chat_id, NIGHT_KEY)
+    if was and not await end_night(bot, chat_id):
+        return False, was
+    return True, was
+
+
+async def _night_round(bot, now):
+    for chat_id, raw in await asyncio.to_thread(_scheduled_groups, NIGHT_KEY):
+        sched = load_schedule(raw)
+        if not sched or chat_id >= 0 or D.is_paused(chat_id):
+            continue
+        start, end = sched
+        want = is_closed_at(now, start, end)             # "inside the window", same maths as Auto Close
+        active = D.get_setting(chat_id, NIGHT_STATE_KEY, "") == "on"
+        if want and not active:
+            if D.get_setting(chat_id, STATE_KEY, "open") == "closed":
+                continue                                 # Auto Close comes first
+            if time.monotonic() >= _retry_at.get((chat_id, "night"), 0):
+                await start_night(bot, chat_id, end)
+        elif not want and active:
+            if time.monotonic() >= _retry_at.get((chat_id, "night-end"), 0):
+                await end_night(bot, chat_id)
+
+
+# ------------------------------------------------------------------ the /help > Night Mode page and /night
+NIGHT_HOME = "help:night"
+
+
+def _nm_status(chat):
+    chat_id = getattr(chat, "id", None)
+    if chat is None or chat.type == "private":
+        return L.t("night.private", chat_id)
+    sched = load_schedule(D.get_setting(chat.id, NIGHT_KEY, "") or "")
+    if not sched:
+        return L.t("night.status_off", chat.id)
+    active = D.get_setting(chat.id, NIGHT_STATE_KEY, "") == "on"
+    return L.t("night.status_on", chat.id, tz=html.escape(BOT_TIMEZONE), start=fmt_12h(sched[0]), end=fmt_12h(sched[1]),
+               now=L.t("night.now_active" if active else "night.now_idle", chat.id))
+
+
+def _nm_panel(chat, note=""):
+    """The whole Night Mode page: what it does, the status, Set Time, Turn OFF (when on) and Back."""
+    chat_id = getattr(chat, "id", None)
+    sched = load_schedule(D.get_setting(chat.id, NIGHT_KEY, "") or "") if chat is not None and chat.type != "private" else None
+    text = (L.t("night.title", chat_id) + "\n\n" + (note + "\n\n" if note else "") + L.t("night.intro", chat_id) +
+            "\n\n" + _nm_status(chat) + "\n\n" + L.t("night.tap", chat_id) + "\n\n" + L.t("night.note", chat_id))
+    rows = [[InlineKeyboardButton(L.t("night.btn_set", chat_id), callback_data="acb:H:nc:-")]]
+    if sched:
+        rows.append([InlineKeyboardButton(L.t("night.btn_off", chat_id), callback_data="nmb:off")])
+    rows.append([InlineKeyboardButton(L.t("pick.back", chat_id), callback_data="help:main")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def help_night_callback(update, context):
+    """group=-20: /help > Night Mode (the menu entry comes from nova's help data; this page is built here)."""
+    q = update.callback_query
+    if q is None:
+        return
+    if await extra.menu_not_owner(q):
+        raise ApplicationHandlerStop
+    await q.answer()
+    await _ac_edit(q, *_nm_panel(q.message.chat if q.message else None))
+    raise ApplicationHandlerStop
+
+
+async def nmb_callback(update, context):
+    """"nmb:a" shows the page, "nmb:off" turns Night Mode off. Group admins only, checked on every tap. (The time
+    pickers are the Auto Close ones: "acb:" buttons with which = nc / no.)"""
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    if chat is None:
+        await q.answer()
+        return
+    if await extra.menu_not_owner(q):
+        return
+    if chat.type == "private":
+        await q.answer(L.t("night.private"), show_alert=True)
+        return
+    if not await _ac_allowed(chat, q.from_user.id):
+        await q.answer(L.t("night.admin_only", chat.id), show_alert=True)
+        return
+    _ac_pending.pop((chat.id, q.from_user.id), None)
+    act = (q.data or "").split(":")[1:2]
+    if act == ["a"]:
+        await q.answer()
+        await _ac_edit(q, *_nm_panel(chat))
+    elif act == ["off"]:
+        try:
+            ok, was = await night_off(context.bot, chat.id)
+        except Exception:
+            log.exception("night: turning off failed in %s", chat.id)
+            await q.answer(L.t("ac.db_problem", chat.id), show_alert=True)
+            return
+        if ok:
+            await q.answer(L.t("night.off_done", chat.id) + (L.t("night.off_restored", chat.id) if was else ""))
+        else:
+            await q.answer(L.t("night.off_failed", chat.id), show_alert=True)
+        await _ac_edit(q, *_nm_panel(chat))
+    else:
+        await q.answer("This button is no longer valid.", show_alert=True)
+
+
+async def night_cmd(update, context):
+    """/night 11pm 6am  |  /night off  |  /night"""
+    if not await D.group_only(update):                 # group only + admins only
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    usage = L.t("night.usage", chat.id)
+    args = [a.lower() for a in context.args]
+    sched = load_schedule(D.get_setting(chat.id, NIGHT_KEY, "") or "")
+    if not args:
+        if not sched:
+            await msg.reply_text(L.t("night.cmd_off", chat.id) + "\n\n" + usage)
+        else:
+            active = D.get_setting(chat.id, NIGHT_STATE_KEY, "") == "on"
+            await msg.reply_text(L.t("night.cmd_on", chat.id, tz=BOT_TIMEZONE, start=fmt_12h(sched[0]), end=fmt_12h(sched[1]),
+                                     now=L.t("night.now_active" if active else "night.now_idle", chat.id)))
+        return
+    if args[0] in ("off", "no", "stop", "disable", "0"):
+        ok, was = await night_off(context.bot, chat.id)
+        if not ok:
+            await msg.reply_text(L.t("night.off_failed", chat.id))
+            return
+        await msg.reply_text(L.t("night.off_done", chat.id) + (L.t("night.off_restored", chat.id) if was else ""))
+        return
+    start, end = parse_two_times(" ".join(args))
+    if start is None or end is None:
+        await msg.reply_text(L.t("night.cant_read", chat.id) + "\n\n" + usage)
+        return
+    if start == end:
+        await msg.reply_text(L.t("night.same_time", chat.id) + "\n\n" + usage)
+        return
+    D.set_setting(chat.id, NIGHT_KEY, f"{fmt_minutes(start)}-{fmt_minutes(end)}")
+    await msg.reply_text(L.t("night.cmd_saved", chat.id, tz=BOT_TIMEZONE, start=fmt_12h(start), end=fmt_12h(end)))
+    await run_once(context.bot)                        # apply it right away if the group is inside the window now
+
+
+# ======================================================================================================
+# 2c. APPEAL
+# ======================================================================================================
+# A muted or warned member can ask the admins to look at it again. OFF by default (setting mod_appeal = "on").
+#   * Whoever did it (any admin's /mute /tmute /dmute /warn /dwarn, or the bot's own mutes) the notice gets a
+#     "📩 Appeal" button (appeal_markup, called from nova.py). It opens the bot's private chat with a deep link:
+#     /start appeal_<chat>_<m|w>. Bans, and automatic spam/flood warnings, are not covered.
+#   * In the private chat the bot checks that the person is really muted / warned right now, asks for a reason
+#     (max 300 characters, /skip to send none) and posts a card with ✅ Unmute / ✅ Remove warning and ❌ Reject.
+#   * Where the card goes is a setting (mod_appeal_dest): group (default), the log channel (the one /setlog set; the
+#     group when none is set) or the bot's private chat with the group's admins (the group when no admin started the bot).
+#   * One open appeal per person and kind. After a rejection the same person can appeal again after 24 hours.
+# Appeals are saved in the "appeals" collection: _id, chat_id, user_id, kind ("mute"|"warn"), ref (warning id),
+# reason, status ("open"|"approved"|"rejected"), created_at, decided_at, decided_by.
+APPEAL_KEY, APPEAL_DEST_KEY = "mod_appeal", "mod_appeal_dest"
+APPEAL_DESTS = ("group", "log", "dm")
+APPEAL_REASON_MAX = 300
+APPEAL_COOLDOWN = 24 * 3600          # seconds before a rejected person can appeal the same thing again
+APPEAL_ASK_TTL = 10 * 60             # seconds the bot waits for the reason in the private chat
+APPEAL_HOME = "help:appeal"
+_apl_pending = {}                    # user_id -> (chat_id, kind, ref, expires at): waiting for the reason
+
+
+def appeal_on(chat_id):
+    return D.get_setting(chat_id, APPEAL_KEY, "off") == "on"
+
+
+def appeal_dest(chat_id):
+    dest = D.get_setting(chat_id, APPEAL_DEST_KEY, "group")
+    return dest if dest in APPEAL_DESTS else "group"
+
+
+def appeal_markup(chat_id, user_id, kind, kb=None):
+    """`kb` (nova's Unmute / Remove warning markup, or None) with a 📩 Appeal row added when Appeal is ON in this group.
+    kind is "mute" or "warn". Returns `kb` unchanged when Appeal is OFF, so it is safe to call everywhere."""
+    try:
+        if not appeal_on(chat_id):
+            return kb
+        username = _app.bot.username
+        if not username or chat_id >= 0:
+            return kb
+        url = f"https://t.me/{username}?start=appeal_{abs(chat_id)}_{'m' if kind == 'mute' else 'w'}"
+        rows = [list(r) for r in kb.inline_keyboard] if kb else []
+        rows.append([InlineKeyboardButton(L.t("apl.btn", chat_id), url=url)])
+        return InlineKeyboardMarkup(rows)
+    except Exception:
+        log.exception("appeal: couldn't add the Appeal button in %s", chat_id)
+        return kb
+
+
+async def _apl_state(bot, chat_id, user_id, kind):
+    """(active, ref, shown reason) for the person's mute or warning right now."""
+    if kind == "warn":
+        rows = await asyncio.to_thread(D.active_warns, chat_id, user_id)
+        return (True, rows[-1][0], rows[-1][1] or "") if rows else (False, None, "")
+    member = await bot.get_chat_member(chat_id, user_id)
+    muted = member.status == ChatMemberStatus.RESTRICTED and not getattr(member, "can_send_messages", True)
+    return muted, None, ""
+
+
+# ------------------------------------------------------------------ the /help > Appeal page and /appeal
+def _apl_panel(chat, note=""):
+    cid = getattr(chat, "id", None)
+    if chat is None or chat.type == "private":
+        return L.t("apl.private", cid), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]])
+    on, dest = appeal_on(chat.id), appeal_dest(chat.id)
+    text = (L.t("apl.title", cid) + "\n\n" + (note + "\n\n" if note else "") + L.t("apl.intro", cid) + "\n\n" +
+            L.t("apl.status_on" if on else "apl.status_off", cid, dest=L.t("apl.dest_" + dest, cid)) + "\n\n" +
+            L.t("apl.note", cid))
+    rows = [[InlineKeyboardButton(L.t("apl.btn_off" if on else "apl.btn_on", cid), callback_data="apb:t")],
+            [InlineKeyboardButton(("✅ " if d == dest else "") + L.t("apl.dest_" + d, cid), callback_data=f"apb:d:{d}")
+             for d in APPEAL_DESTS],
+            [InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]]
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def help_appeal_callback(update, context):
+    """group=-20: /help > Appeal (the menu entry comes from nova's help data; this page is built here)."""
+    q = update.callback_query
+    if q is None:
+        return
+    if await extra.menu_not_owner(q):
+        raise ApplicationHandlerStop
+    await q.answer()
+    await _ac_edit(q, *_apl_panel(q.message.chat if q.message else None))
+    raise ApplicationHandlerStop
+
+
+def _apl_set(chat_id, what, value):
+    """what = "t" (switch) or "d" (destination). Returns the note shown on the page."""
+    if what == "t":
+        D.set_setting(chat_id, APPEAL_KEY, "off" if appeal_on(chat_id) else "on")
+        return L.t("apl.toast_on" if appeal_on(chat_id) else "apl.toast_off", chat_id)
+    D.set_setting(chat_id, APPEAL_DEST_KEY, value)
+    return L.t("apl.toast_dest", chat_id, dest=L.t("apl.dest_" + value, chat_id))
+
+
+async def apb_callback(update, context):
+    """"apb:t" switches Appeal ON/OFF, "apb:d:<group|log|dm>" picks where the appeal cards go. Admins only, every tap."""
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    if chat is None:
+        await q.answer()
+        return
+    if await extra.menu_not_owner(q):
+        return
+    if chat.type == "private":
+        await q.answer(L.t("apl.private"), show_alert=True)
+        return
+    if not await _ac_allowed(chat, q.from_user.id):
+        await q.answer(L.t("apl.admin_only", chat.id), show_alert=True)
+        return
+    parts = (q.data or "").split(":")[1:]
+    if parts == ["t"] or (len(parts) == 2 and parts[0] == "d" and parts[1] in APPEAL_DESTS):
+        try:
+            note = _apl_set(chat.id, parts[0], parts[1] if len(parts) == 2 else None)
+        except Exception:
+            log.exception("appeal: saving a setting failed in %s", chat.id)
+            await q.answer(L.t("ac.db_problem", chat.id), show_alert=True)
+            return
+        await q.answer(note)
+        await _ac_edit(q, *_apl_panel(chat))
+    else:
+        await q.answer("This button is no longer valid.", show_alert=True)
+
+
+async def appeal_cmd(update, context):
+    """/appeal  |  /appeal on|off  |  /appeal group|log|dm"""
+    if not await D.group_only(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    arg = context.args[0].lower() if context.args else ""
+    if arg in ("on", "off") and appeal_on(chat.id) != (arg == "on"):
+        _apl_set(chat.id, "t", None)
+    elif arg in APPEAL_DESTS:
+        _apl_set(chat.id, "d", arg)
+    elif arg and arg not in ("on", "off"):
+        await msg.reply_html(L.t("apl.usage", chat.id))
+        return
+    text, markup = _apl_panel(chat)
+    await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+# ------------------------------------------------------------------ the member's side (private chat)
+async def appeal_start(update, context):
+    """group=-20: /start appeal_<chat>_<m|w>. Any other /start is left alone (nova.py answers it)."""
+    msg, user = update.effective_message, update.effective_user
+    arg = context.args[0] if context.args else ""
+    m = re.fullmatch(r"appeal_(\d+)_([mw])", arg)
+    if not m or update.effective_chat.type != "private":
+        return
+    chat_id, kind = -int(m.group(1)), "mute" if m.group(2) == "m" else "warn"
+    try:
+        gchat = await context.bot.get_chat(chat_id)
+        if not appeal_on(chat_id):
+            await msg.reply_html(L.t("apl.dm_off", chat_id))
+        else:
+            active, ref, _ = await _apl_state(context.bot, chat_id, user.id, kind)
+            col = store.col("appeals")
+            key = {"chat_id": chat_id, "user_id": user.id, "kind": kind}
+            if not active:
+                await msg.reply_html(L.t("apl.dm_none", chat_id, kind=L.t("apl.kind_" + kind, chat_id),
+                                         chat=html.escape(gchat.title or "")))
+            elif await asyncio.to_thread(col.find_one, {**key, "status": "open"}):
+                await msg.reply_html(L.t("apl.dm_open", chat_id))
+            elif await asyncio.to_thread(col.find_one, {**key, "status": "rejected",
+                                                        "decided_at": {"$gt": time.time() - APPEAL_COOLDOWN}}):
+                await msg.reply_html(L.t("apl.dm_cooldown", chat_id))
+            else:
+                _apl_pending[user.id] = (chat_id, kind, ref, time.monotonic() + APPEAL_ASK_TTL)
+                await msg.reply_html(L.t("apl.dm_ask", chat_id, chat=html.escape(gchat.title or ""),
+                                         kind=L.t("apl.kind_" + kind, chat_id), max=APPEAL_REASON_MAX))
+    except TelegramError:
+        await msg.reply_html(L.t("apl.dm_invalid", chat_id))
+    except Exception:
+        log.exception("appeal: start failed for %s in %s", user.id, chat_id)
+        await msg.reply_html(L.t("apl.dm_fail", chat_id))
+    raise ApplicationHandlerStop
+
+
+async def appeal_reason(update, context):
+    """group=-19, private chat: the reason the member sends (or /skip, /cancel). Does nothing when nothing is pending."""
+    msg, user = update.effective_message, update.effective_user
+    pend = _apl_pending.get(user.id)
+    if pend is None:
+        return
+    chat_id, kind, ref, until = pend
+    text = (msg.text or "").strip()
+    if time.monotonic() > until:
+        _apl_pending.pop(user.id, None)
+        return
+    if text.lower().split("@")[0] == "/cancel":
+        _apl_pending.pop(user.id, None)
+        await msg.reply_html(L.t("apl.dm_cancelled", chat_id))
+        raise ApplicationHandlerStop
+    if text.startswith("/") and text.lower().split("@")[0] != "/skip":
+        return                                             # another command: leave it alone, the wait stays
+    reason = "" if text.lower().split("@")[0] == "/skip" else text[:APPEAL_REASON_MAX]
+    _apl_pending.pop(user.id, None)
+    try:
+        ok = await _apl_submit(context.bot, chat_id, user, kind, ref, reason)
+    except Exception:
+        log.exception("appeal: sending the appeal of %s in %s failed", user.id, chat_id)
+        ok = False
+    await msg.reply_html(L.t("apl.dm_sent" if ok else "apl.dm_fail", chat_id))
+    raise ApplicationHandlerStop
+
+
+async def _apl_submit(bot, chat_id, user, kind, ref, reason):
+    """Saves the appeal and posts its card where the group wants it. True when someone can see it."""
+    active, _, _ = await _apl_state(bot, chat_id, user.id, kind)
+    if not active:
+        return False
+    appeal_id = os.urandom(5).hex()
+    await asyncio.to_thread(store.col("appeals").insert_one, {
+        "_id": appeal_id, "chat_id": chat_id, "user_id": user.id, "kind": kind, "ref": ref, "reason": reason,
+        "status": "open", "created_at": time.time()})
+    gchat = await bot.get_chat(chat_id)
+    text = L.t("apl.card", chat_id, chat=html.escape(gchat.title or ""), user=user.mention_html(),
+               kind=L.t("apl.kind_" + kind, chat_id),
+               reason=html.escape(reason) if reason else L.t("apl.no_reason", chat_id))
+    yes = L.t("apl.btn_unmute" if kind == "mute" else "apl.btn_rmwarn", chat_id)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(yes, callback_data=f"apl:a:{appeal_id}"),
+                                InlineKeyboardButton(L.t("apl.btn_reject", chat_id), callback_data=f"apl:r:{appeal_id}")]])
+    dest = appeal_dest(chat_id)
+    if dest == "log" and D.get_setting(chat_id, "log_channel"):
+        try:
+            await bot.send_message(int(D.get_setting(chat_id, "log_channel")), text, parse_mode="HTML", reply_markup=kb)
+            return True
+        except TelegramError:
+            log.warning("appeal: the log channel of %s didn't take the card", chat_id)
+    elif dest == "dm":
+        sent = 0
+        for adm in await bot.get_chat_administrators(chat_id):
+            if adm.user.is_bot:
+                continue
+            try:
+                await bot.send_message(adm.user.id, text, parse_mode="HTML", reply_markup=kb)
+                sent += 1
+            except TelegramError:
+                pass                                       # this admin never started the bot
+        if sent:
+            return True
+    try:
+        await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)   # the group, or the fallback
+        return True
+    except TelegramError:
+        log.warning("appeal: couldn't post the card in %s", chat_id)
+        return False
+
+
+# ------------------------------------------------------------------ the admin's side (the card)
+async def apl_callback(update, context):
+    """"apl:a:<id>" approves (unmute / remove the warning), "apl:r:<id>" rejects. Admins of the appeal's own group only."""
+    q = update.callback_query
+    try:
+        _, act, appeal_id = (q.data or "").split(":")
+        col = store.col("appeals")
+        row = await asyncio.to_thread(col.find_one, {"_id": appeal_id})
+        chat_id = row["chat_id"] if row else None
+        gchat = await context.bot.get_chat(chat_id) if row else None
+    except (ValueError, TelegramError):
+        row = gchat = None
+    if row is None or gchat is None or act not in ("a", "r"):
+        await q.answer("This button is no longer valid.", show_alert=True)
+        return
+    if not await _ac_allowed(gchat, q.from_user.id):
+        await q.answer(L.t("apl.card_admin_only", chat_id), show_alert=True)
+        return
+    new = "approved" if act == "a" else "rejected"
+    claim = await asyncio.to_thread(col.update_one, {"_id": appeal_id, "status": "open"},
+                                    {"$set": {"status": new, "decided_by": q.from_user.id, "decided_at": time.time()}})
+    if claim.modified_count != 1:
+        await q.answer(L.t("apl.already", chat_id), show_alert=True)
+        return
+    kind, user_id = row["kind"], row["user_id"]
+    if act == "a":
+        try:
+            if (await _apl_state(context.bot, chat_id, user_id, kind))[0]:
+                await _apl_undo(context.bot, row)         # already lifted by someone else: nothing to undo
+        except TelegramError as e:
+            log.warning("appeal: couldn't undo %s of %s in %s: %s", kind, user_id, chat_id, e)
+            await asyncio.to_thread(col.update_one, {"_id": appeal_id}, {"$set": {"status": "open"}})
+            await q.answer(L.t("apl.undo_failed", chat_id), show_alert=True)
+            return
+    verdict = L.t("apl.done_approved_" + kind if act == "a" else "apl.done_rejected", chat_id,
+                  admin=q.from_user.mention_html())
+    await q.answer()
+    try:
+        await q.edit_message_text(q.message.text_html + "\n\n" + verdict, parse_mode="HTML", reply_markup=None)
+    except TelegramError:
+        pass
+    try:
+        await context.bot.send_message(user_id, L.t("apl.approved_dm" if act == "a" else "apl.rejected_dm", chat_id,
+                                                    chat=html.escape(gchat.title or "")), parse_mode="HTML")
+    except TelegramError:
+        pass                                               # the member blocked the bot
+
+
+async def _apl_undo(bot, row):
+    """Takes the mute or the warning back, the same way nova's Unmute / Remove warning buttons do."""
+    chat_id, user_id = row["chat_id"], row["user_id"]
+    if row["kind"] == "mute":
+        perms = (await bot.get_chat(chat_id)).permissions or D.default_perms
+        await bot.restrict_chat_member(chat_id, user_id, perms)
+    elif any(w[0] == row["ref"] for w in await asyncio.to_thread(D.active_warns, chat_id, user_id)):
+        await asyncio.to_thread(store.warn_delete, row["ref"])
 
 
 # ======================================================================================================
@@ -2210,6 +2777,19 @@ def register(app, deps):
     app.add_handler(CallbackQueryHandler(acb_callback, pattern=r"^acb:"))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, ac_minute_message),
                     group=103)                         # a typed minute on the minute screen
+    # night mode: /night, the /help > Night Mode page (same -20 trick as Auto Close) and its Turn OFF button;
+    # its time pickers are the Auto Close ones above (acb: buttons with which = nc / no)
+    app.add_handler(CommandHandler("night", night_cmd))
+    app.add_handler(CallbackQueryHandler(help_night_callback, pattern=r"^help:night$"), group=-20)
+    app.add_handler(CallbackQueryHandler(nmb_callback, pattern=r"^nmb:"))
+    # appeal: /appeal, the /help > Appeal page, the Appeal deep link (/start appeal_...) and the reason in the private chat
+    app.add_handler(CommandHandler("appeal", appeal_cmd))
+    app.add_handler(CallbackQueryHandler(help_appeal_callback, pattern=r"^help:appeal$"), group=-20)
+    app.add_handler(CallbackQueryHandler(apb_callback, pattern=r"^apb:"))
+    app.add_handler(CallbackQueryHandler(apl_callback, pattern=r"^apl:"))
+    app.add_handler(CommandHandler("start", appeal_start, filters=filters.ChatType.PRIVATE), group=-20)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, appeal_reason), group=-19)
+    L.register(app, deps, _ac_allowed, extra.menu_not_owner)   # /lang and the 🌐 Language page (lang/ folder)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, ac_custom_message),
                     group=105)                         # a typed custom close / open message
 
