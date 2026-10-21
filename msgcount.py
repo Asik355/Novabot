@@ -6,7 +6,7 @@ Kept in its own file so none of the existing code had to be rewritten. Wired up 
     msgcount.register(app)      -> commands, callbacks and the message counter
     msgcount.outbox_sweeper(app)-> background retry loop for milestone notifications (started in post_init)
 
-    COMMANDS   /rank /top /overall /today /week /me /radmin /resetrank
+    COMMANDS   /rank /top /overall /today /week /me /radmin /resetrank /mtoday /mtotal
 
 DATA (MongoDB, the same connection/database as the rest of the bot; every record carries chat_id)
     mc_groups      one doc per group: chat_id (unique), name, total, enabled, initial, interval,
@@ -18,6 +18,12 @@ DATA (MongoDB, the same connection/database as the rest of the bot; every record
     mc_counts      one doc per (chat_id, user_id, p) (unique): p = "all" (all-time, scope "all", has the
                    display name) or p = "YYYY-MM-DD" (scope "day", IST calendar day, expires after 45 days)
     mc_milestones  durable notification outbox: (chat_id, milestone) unique, status pending/sending/sent/failed
+    mc_today_milestones  the same outbox for TODAY's messages: (chat_id, day, milestone) unique, expires after 7 days
+  TOTAL and TODAY milestones are two separate settings of a group, each with its own ON/OFF switch and interval
+  (optional fields of mc_groups, old docs work without them):
+    tm_on          total milestone message ON (default True)           interval / initial / last_milestone: as before
+    dm_on          today's message ON (default False)                  dm_interval: every N messages today (default 100)
+    day_p / day_count / day_last   the group's message count for the IST day day_p and the last Today milestone reached
 Nothing is ever stored globally: every query, update and reset is filtered by the chat_id of the group
 where the command/button was used.
 
@@ -61,6 +67,9 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 DEFAULT_INITIAL = 100
 DEFAULT_INTERVAL = 500
+DEFAULT_TODAY_INTERVAL = 100        # Today's message: every N messages counted today (restarts at midnight IST)
+TODAY_MS = "mc_today_milestones"
+TODAY_KEEP_DAYS = 7                 # delivered/undelivered Today rows are dropped after this long
 MIN_INTERVAL, MAX_INTERVAL = 100, 100000
 PAGE_SIZE, FULL_PAGE_SIZE = 10, 25
 DAILY_KEEP_DAYS = 45                # daily rows are only needed for /today and /week
@@ -159,6 +168,10 @@ def ensure_indexes():
         m = M.col(MILESTONES)
         m.create_index([("chat_id", 1), ("milestone", 1)], unique=True)
         m.create_index([("status", 1), ("next_try", 1)])
+        t = M.col(TODAY_MS)
+        t.create_index([("chat_id", 1), ("day", 1), ("milestone", 1)], unique=True)
+        t.create_index([("status", 1), ("next_try", 1)])
+        t.create_index("expire_at", expireAfterSeconds=0)
     except PyMongoError:
         log.exception("msgcount: couldn't create the indexes")
 
@@ -185,8 +198,56 @@ def _bulk_retry(coll, ops):
         coll.bulk_write([ops[i] for i in failed], ordered=False)
 
 
+def _bump_day_sync(g, chat_id, today):
+    """Adds one message to the group's count for the IST day `today`; a new day starts again at 1. Returns the group
+    doc right after the change, or None for a late message of an earlier day (never moves the counter backwards)."""
+    for _ in range(3):
+        d = g.find_one_and_update({"chat_id": chat_id, "day_p": today}, {"$inc": {"day_count": 1}},
+                                  return_document=ReturnDocument.AFTER)
+        if d is not None:
+            return d
+        d = g.find_one_and_update(
+            {"chat_id": chat_id, "$or": [{"day_p": {"$exists": False}}, {"day_p": {"$lt": today}}]},
+            {"$set": {"day_p": today, "day_count": 1, "day_last": 0}}, return_document=ReturnDocument.AFTER)
+        if d is not None:
+            return d
+    return None
+
+
+def _today_milestones_sync(g, chat_id, today, title, total, now):
+    """Looks at the group's Today count and queues one message per Today milestone reached (when Today's message is
+    ON; when it is OFF the milestone is only skipped, so turning it on later never sends old ones). Returns [(day, n)]."""
+    d = _bump_day_sync(g, chat_id, today)
+    created = []
+    if d is None:
+        return created
+    n = max(int(d.get("dm_interval", DEFAULT_TODAY_INTERVAL)), 1)
+    on = d.get("dm_on") is True
+    for _ in range(3):
+        last = int(d.get("day_last", 0))
+        nm = (last // n + 1) * n
+        if int(d.get("day_count", 0)) < nm:
+            break
+        if on:
+            try:
+                M.col(TODAY_MS).insert_one({
+                    "chat_id": chat_id, "day": today, "milestone": nm, "total": total,
+                    "group_name": d.get("name") or title, "reached_at": now, "status": "pending", "attempts": 0,
+                    "next_try": now, "lock_until": None, "expire_at": now + timedelta(days=TODAY_KEEP_DAYS)})
+                created.append((today, nm))
+            except DuplicateKeyError:
+                pass
+        upd = g.find_one_and_update({"chat_id": chat_id, "day_p": today, "day_last": last}, {"$set": {"day_last": nm}},
+                                    return_document=ReturnDocument.AFTER)
+        if upd is None:
+            break
+        d = upd
+    return created
+
+
 def _count_sync(chat_id, user_id, name, title, now, msg_id=None, supergroup=False, gap=False):
-    """Counts ONE message. Returns None when counting is OFF for this group, else (group_doc, [new milestones]).
+    """Counts ONE message. Returns None when counting is OFF for this group, else
+    (group_doc, [new total milestones], [(day, n) new Today milestones]).
     Supergroups: the group total follows Telegram's message number (it catches up after downtime and includes messages
     this bot never receives); `gap` / the resync flag mean counting was OFF or paused, so that gap is NOT counted."""
     g = M.col(GROUPS)
@@ -267,19 +328,23 @@ def _count_sync(chat_id, user_id, name, title, now, msg_id=None, supergroup=Fals
             break
         # 1) the durable outbox row first (unique per group+milestone), 2) then advance the pointer.
         #    A crash between the two is repaired by the next message (the insert is a harmless duplicate).
-        try:
-            M.col(MILESTONES).insert_one({
-                "chat_id": chat_id, "milestone": nm, "total": active, "group_name": doc.get("name") or title,
-                "reached_at": now, "status": "pending", "attempts": 0, "next_try": now, "lock_until": None})
-            created.append(nm)
-        except DuplicateKeyError:
-            pass
+        #    With the Total milestone message OFF the pointer still moves (nothing is queued), so switching it on
+        #    later never sends the milestones that passed meanwhile.
+        if doc.get("tm_on") is not False:
+            try:
+                M.col(MILESTONES).insert_one({
+                    "chat_id": chat_id, "milestone": nm, "total": active, "group_name": doc.get("name") or title,
+                    "reached_at": now, "status": "pending", "attempts": 0, "next_try": now, "lock_until": None})
+                created.append(nm)
+            except DuplicateKeyError:
+                pass
         upd = g.find_one_and_update({"chat_id": chat_id, "last_milestone": last}, {"$set": {"last_milestone": nm}},
                                     return_document=ReturnDocument.AFTER)
         if upd is None:
             break                      # a concurrent message already advanced it
         doc = upd
-    return doc, created
+    created_today = _today_milestones_sync(g, chat_id, periods(now)[0], title, active_count(doc), now)
+    return doc, created, created_today
 
 
 def _board_page_sync(chat_id, kind, page):
@@ -354,16 +419,42 @@ def _toggle_sync(chat_id, flag, now):
     return _group_sync(chat_id)
 
 
-def _save_interval_sync(chat_id, value, now):
+def _save_interval_sync(chat_id, value, now, turn_on=False):
     """Deterministic interval-change rule: the pointer moves to the last milestone of the NEW sequence that is
     <= the current total, so nothing already passed is announced and the next milestone is the first one of the
-    new sequence above the current total. Totals, rankings and history are untouched."""
+    new sequence above the current total. Totals, rankings and history are untouched.
+    turn_on: the /mtotal command also switches the Total milestone message ON."""
     cur = M.col(GROUPS).find_one({"chat_id": chat_id}) or {}
     last = prev_milestone(active_count(cur), int(cur.get("initial", DEFAULT_INITIAL)), value)
+    sets = {"interval": value, "last_milestone": last, "updated_at": now}
+    if turn_on:
+        sets["tm_on"] = True
     return M.col(GROUPS).find_one_and_update(
         {"chat_id": chat_id},
-        {"$set": {"interval": value, "last_milestone": last, "updated_at": now},
+        {"$set": sets,
          "$setOnInsert": {"total": 0, "enabled": True, "initial": DEFAULT_INITIAL, "created_at": now}},
+        upsert=True, return_document=ReturnDocument.AFTER)
+
+
+def _save_day_interval_sync(chat_id, value, now, turn_on=False):
+    """Today's interval: the pointer moves to the last multiple of the NEW interval already passed today, so nothing
+    that has already happened is announced. turn_on: the /mtoday command also switches Today's message ON."""
+    cur = M.col(GROUPS).find_one({"chat_id": chat_id}) or {}
+    count = int(cur.get("day_count", 0)) if cur.get("day_p") == periods(now)[0] else 0
+    sets = {"dm_interval": value, "day_last": (count // value) * value, "updated_at": now}
+    if turn_on:
+        sets["dm_on"] = True
+    return M.col(GROUPS).find_one_and_update(
+        {"chat_id": chat_id},
+        {"$set": sets, "$setOnInsert": _group_defaults(now)},
+        upsert=True, return_document=ReturnDocument.AFTER)
+
+
+def _set_flag_sync(chat_id, field, flag, now):
+    """The ON/OFF switch of one milestone message: field is 'tm_on' (Total) or 'dm_on' (Today)."""
+    return M.col(GROUPS).find_one_and_update(
+        {"chat_id": chat_id},
+        {"$set": {field: bool(flag), "updated_at": now}, "$setOnInsert": _group_defaults(now)},
         upsert=True, return_document=ReturnDocument.AFTER)
 
 
@@ -379,8 +470,9 @@ def _reset_sync(chat_id, ts, now):
         return False
     M.col(COUNTS).delete_many({"chat_id": chat_id})
     M.col(MILESTONES).delete_many({"chat_id": chat_id})
+    M.col(TODAY_MS).delete_many({"chat_id": chat_id})
     claimed = claimed or {}
-    upd = {"total": 0, "last_milestone": 0, "updated_at": now}
+    upd = {"total": 0, "last_milestone": 0, "updated_at": now, "day_count": 0, "day_last": 0}
     if claimed.get("last_msg_id") is not None:
         upd["msg_base"] = int(claimed["last_msg_id"])      # the normal count starts again from 0
     if claimed.get("custom_enabled") is True:              # the custom count is untouched: keep its milestone pointer
@@ -429,6 +521,77 @@ def _milestone_text(d):
             "Congratulations! 🎊\nKeep chatting! 💬")
 
 
+# ------------------------------------------------------------------ Today's message outbox (same rules as above)
+def _claim_today_sync(chat_id, day, milestone, now):
+    return M.col(TODAY_MS).find_one_and_update(
+        {"chat_id": chat_id, "day": day, "milestone": milestone, "next_try": {"$lte": now},
+         "$or": [{"status": "pending"}, {"status": "sending", "lock_until": {"$lt": now}}]},
+        {"$set": {"status": "sending", "lock_until": now + timedelta(seconds=60)}, "$inc": {"attempts": 1}},
+        return_document=ReturnDocument.AFTER)
+
+
+def _due_today_sync(now, limit=20):
+    return [(d["chat_id"], d["day"], d["milestone"]) for d in
+            M.col(TODAY_MS).find({"next_try": {"$lte": now}, "status": {"$in": ["pending", "sending"]}}).limit(limit)]
+
+
+def _finish_today_sync(chat_id, day, milestone, ok, now, delay=None, error=None, permanent=False):
+    m = M.col(TODAY_MS)
+    key = {"chat_id": chat_id, "day": day, "milestone": milestone}
+    if ok:
+        m.update_one(key, {"$set": {"status": "sent", "sent_at": now, "lock_until": None}})
+        return
+    doc = m.find_one(key) or {}
+    dead = permanent or int(doc.get("attempts", 0)) >= MAX_DELIVERY_ATTEMPTS
+    delay = delay if delay is not None else min(30 * 2 ** int(doc.get("attempts", 1)), 3600)
+    m.update_one(key, {"$set": {"status": "failed" if dead else "pending", "next_try": now + timedelta(seconds=delay),
+                                "lock_until": None, "last_error": (error or "")[:200]}})
+
+
+def _today_text(d):
+    when = _ist(d["reached_at"].replace(tzinfo=timezone.utc) if d["reached_at"].tzinfo is None else d["reached_at"])
+    return ("🎉 <b>TODAY'S MESSAGE</b>\n\n"
+            f"👥 <b>Group:</b> {_esc(d.get('group_name'), 64)}\n\n"
+            f"✅ <b>Today's Messages:</b> {int(d['milestone']):,} Reached!\n\n"
+            f"💬 <b>Total Group Messages:</b> {int(d['total']):,}\n\n"
+            f"📅 <b>Date:</b> {when.strftime('%d %B %Y')}\n\n"
+            f"🕒 <b>Time:</b> {when.strftime('%I:%M %p')} IST\n\n"
+            "Keep chatting! 💬")
+
+
+async def _finish_today(chat_id, day, milestone, ok, **kw):
+    try:
+        await asyncio.to_thread(_finish_today_sync, chat_id, day, milestone, ok, _utcnow(), **kw)
+    except PyMongoError:
+        log.exception("msgcount: couldn't update the state of today's message %s of %s", milestone, chat_id)
+    if not ok:
+        log.warning("msgcount: today's message %s for %s not delivered (%s); will retry", milestone, chat_id, kw.get("error"))
+
+
+async def _deliver_today(bot, chat_id, day, milestone):
+    """Sends one pending Today message. Marked 'sent' only AFTER Telegram accepted it."""
+    try:
+        doc = await asyncio.to_thread(_claim_today_sync, chat_id, day, milestone, _utcnow())
+    except PyMongoError:
+        log.exception("msgcount: couldn't claim today's message %s of %s", milestone, chat_id)
+        return
+    if not doc:
+        return
+    try:
+        await bot.send_message(chat_id, _today_text(doc), parse_mode="HTML")
+    except RetryAfter as e:
+        ra = e.retry_after.total_seconds() if hasattr(e.retry_after, "total_seconds") else float(e.retry_after)
+        await _finish_today(chat_id, day, milestone, False, delay=ra + 1, error="rate limited")
+    except Forbidden as e:
+        await _finish_today(chat_id, day, milestone, False, error=str(e), permanent=True)
+    except BadRequest as e:
+        await _finish_today(chat_id, day, milestone, False, error=str(e), permanent="chat not found" in str(e).lower())
+    except TelegramError as e:
+        await _finish_today(chat_id, day, milestone, False, error=f"{type(e).__name__}: {e}")
+    else:
+        await _finish_today(chat_id, day, milestone, True)
+
+
 async def _deliver(bot, chat_id, milestone):
     """Sends one pending milestone message. Marked 'sent' only AFTER Telegram accepted it."""
     try:
@@ -469,6 +632,8 @@ async def outbox_sweeper(app):
         try:
             for chat_id, milestone in await asyncio.to_thread(_due_sync, _utcnow()):
                 await _deliver(app.bot, chat_id, milestone)
+            for chat_id, day, milestone in await asyncio.to_thread(_due_today_sync, _utcnow()):
+                await _deliver_today(app.bot, chat_id, day, milestone)
         except Exception:
             log.exception("msgcount: outbox sweeper error")
         await asyncio.sleep(30)
@@ -534,9 +699,11 @@ async def count_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _off_until.clear()
         _off_until[chat.id] = time.monotonic() + 30
         return
-    _, created = res
+    _, created, created_today = res
     for milestone in created:
         await _deliver(context.bot, chat.id, milestone)
+    for day, milestone in created_today:
+        await _deliver_today(context.bot, chat.id, day, milestone)
 
 
 # ------------------------------------------------------------------ permissions
@@ -557,18 +724,50 @@ async def _is_group_admin(bot, chat_id, user_id):
 
 
 # ------------------------------------------------------------------ texts and keyboards
+def _tm_on(g):
+    return g.get("tm_on") is not False             # Total milestone message: ON unless switched off
+
+
+def _dm_on(g):
+    return g.get("dm_on") is True                  # Today's message: OFF unless switched on
+
+
+def _dm_interval(g):
+    return max(int(g.get("dm_interval", DEFAULT_TODAY_INTERVAL)), 1)
+
+
+def _today_count(g):
+    """The group's message count for the current IST day (0 when no message was counted yet today)."""
+    return int(g.get("day_count", 0)) if g.get("day_p") == periods()[0] else 0
+
+
+def _next_today(g):
+    n = _dm_interval(g)
+    last = int(g.get("day_last", 0)) if g.get("day_p") == periods()[0] else 0
+    return (last // n + 1) * n
+
+
+def _state(on):
+    return "✅ ON" if on else "❌ OFF"
+
+
 def _dash_text(title, g, commands=True):
     total, initial, interval = active_count(g), int(g.get("initial", DEFAULT_INITIAL)), int(g.get("interval", DEFAULT_INTERVAL))
     last = int(g.get("last_milestone", 0))
     nxt = next_milestone(last, initial, interval)
     on = g.get("enabled", True) is not False
+    today, nxt_day = _today_count(g), _next_today(g)
+    today_lines = (f"✅ <b>Today's Group Messages:</b> {today:,}\n\n"
+                   + (f"🎯 <b>Next Today Milestone:</b> {nxt_day:,} ({max(nxt_day - today, 0):,} to go)\n\n"
+                      if _dm_on(g) else "🎯 <b>Today's Message:</b> OFF\n\n"))
     return ("📊 <b>GROUP MESSAGE COUNT</b>\n\n"
             f"👥 <b>Group:</b> {_esc(title, 64)}\n\n"
             f"💬 <b>Total Group Messages:</b> {total:,}\n\n"
             f"⚙️ <b>Milestone Interval:</b> Every {interval:,} messages\n\n"
             f"🏆 <b>Last Milestone:</b> {f'{last:,}' if last else 'None yet'}\n\n"
-            f"🎯 <b>Next Milestone:</b> {nxt:,}\n\n"
+            f"🎯 <b>Next Milestone:</b> {nxt:,}{'' if _tm_on(g) else ' (message OFF)'}\n\n"
             f"📨 <b>Messages Until Next Milestone:</b> {max(nxt - total, 0):,}\n\n"
+            + today_lines +
             f"🔔 <b>Message Counting:</b> {'ON' if on else 'OFF'}"
             + ("\n\n📖 <b>Commands</b>\n"
                "/rank (or /top) — leaderboard\n"
@@ -577,6 +776,8 @@ def _dash_text(title, g, commands=True):
                "/overall — all-time leaderboard\n"
                "/me — your messages and rank\n"
                "/radmin — admins' message count today\n"
+               "/mtoday — today's message setting\n"
+               "/mtotal — total milestone setting\n"
                "/resetrank — reset this group's counts (admins only)" if commands else ""))
 
 
@@ -592,24 +793,71 @@ def _dash_kb(g):
     ])
 
 
-def _settings_text(title, g, draft):
-    saved = int(g.get("interval", DEFAULT_INTERVAL))
-    note = "" if draft == saved else "\n\n<i>Not saved yet. Tap 💾 Save Settings to apply it.</i>"
+def _menu_text(title, g):
+    """⚙️ Milestone Settings: the two separate messages, each with its own switch and interval."""
     return ("⚙️ <b>GROUP MILESTONE SETTINGS</b>\n\n"
             f"👥 <b>Group:</b> {_esc(title, 64)}\n\n"
-            f"📊 <b>Initial Milestone:</b> {int(g.get('initial', DEFAULT_INITIAL)):,} messages\n\n"
-            f"🔔 <b>Current Interval:</b> {draft:,} messages{note}\n\n"
+            f"📊 <b>Total milestone:</b> {_state(_tm_on(g))} · every {int(g.get('interval', DEFAULT_INTERVAL)):,} messages\n\n"
+            f"✅ <b>Today's message:</b> {_state(_dm_on(g))} · every {_dm_interval(g):,} messages\n\n"
+            "Tap a button to change that one. Each one sends its own message.\n\n"
             "📖 These settings are changed with the buttons below (group admins only). "
             "/resetrank resets this group's counts.")
 
 
-def _settings_kb(draft):
+def _menu_kb():
+    return KB([[B("📊 Total", callback_data="mc:st"), B("✅ Today", callback_data="mc:sd")],
+               [B("🔙 Back", callback_data="mc:d")]])
+
+
+def _settings_text(title, g, draft):
+    """📊 Total milestone screen."""
+    saved = int(g.get("interval", DEFAULT_INTERVAL))
+    note = "" if draft == saved else "\n\n<i>Not saved yet. Tap 💾 Save Settings to apply it.</i>"
+    return ("📊 <b>TOTAL MILESTONE</b>\n\n"
+            f"👥 <b>Group:</b> {_esc(title, 64)}\n\n"
+            "Sends 🎉 GROUP MESSAGE MILESTONE! when the group's total reaches a milestone.\n\n"
+            f"🔔 <b>Status:</b> {_state(_tm_on(g))}\n\n"
+            f"📊 <b>Initial Milestone:</b> {int(g.get('initial', DEFAULT_INITIAL)):,} messages\n\n"
+            f"⚙️ <b>Current Interval:</b> {draft:,} messages{note}\n\n"
+            "📖 These settings are changed with the buttons below (group admins only). "
+            "/resetrank resets this group's counts.")
+
+
+def _settings_kb(g, draft):
+    on = _tm_on(g)
     return KB([
+        [B(f"{_state(on)} · Total milestone", callback_data=f"mc:tt:{0 if on else 1}")],
         [B("➖ Decrease Interval", callback_data=f"mc:si:{max(draft - _step(draft, False), MIN_INTERVAL)}"),
          B("➕ Increase Interval", callback_data=f"mc:si:{min(draft + _step(draft), MAX_INTERVAL)}")],
         [B("✏️ Set Custom Interval", callback_data="mc:sc")],
         [B("💾 Save Settings", callback_data=f"mc:ss:{draft}")],
-        [B("🔙 Back", callback_data="mc:d")],
+        [B("🔙 Back", callback_data="mc:s")],
+    ])
+
+
+def _day_text(title, g, draft):
+    """✅ Today's message screen."""
+    saved = _dm_interval(g)
+    note = "" if draft == saved else "\n\n<i>Not saved yet. Tap 💾 Save Settings to apply it.</i>"
+    return ("✅ <b>TODAY'S MESSAGE</b>\n\n"
+            f"👥 <b>Group:</b> {_esc(title, 64)}\n\n"
+            f"Sends 🎉 TODAY'S MESSAGE every {draft:,} messages counted today (for example {draft:,}, {draft * 2:,}, "
+            f"{draft * 3:,}). The count starts again at midnight IST.\n\n"
+            f"🔔 <b>Status:</b> {_state(_dm_on(g))}\n\n"
+            f"✅ <b>Today's Group Messages so far:</b> {_today_count(g):,}\n\n"
+            f"⚙️ <b>Current Interval:</b> {draft:,} messages{note}\n\n"
+            "📖 These settings are changed with the buttons below (group admins only).")
+
+
+def _day_kb(g, draft):
+    on = _dm_on(g)
+    return KB([
+        [B(f"{_state(on)} · Today's message", callback_data=f"mc:dt:{0 if on else 1}")],
+        [B("➖ Decrease Interval", callback_data=f"mc:di:{max(draft - _step(draft, False), MIN_INTERVAL)}"),
+         B("➕ Increase Interval", callback_data=f"mc:di:{min(draft + _step(draft), MAX_INTERVAL)}")],
+        [B("✏️ Set Custom Interval", callback_data="mc:dc")],
+        [B("💾 Save Settings", callback_data=f"mc:ds:{draft}")],
+        [B("🔙 Back", callback_data="mc:s")],
     ])
 
 
@@ -686,6 +934,73 @@ async def _group_chat_or_reject(update):
 async def rank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/rank  /top  /overall: this group's all-time leaderboard."""
     await _send_board(update, "all")
+
+
+def _milestone_status(g, which):
+    if which == "day":
+        return (f"✅ <b>Today's message:</b> {_state(_dm_on(g))} · every {_dm_interval(g):,} messages\n"
+                f"Today so far: {_today_count(g):,} · next: {_next_today(g):,}")
+    interval = int(g.get("interval", DEFAULT_INTERVAL))
+    nxt = next_milestone(int(g.get("last_milestone", 0)), int(g.get("initial", DEFAULT_INITIAL)), interval)
+    return (f"📊 <b>Total milestone:</b> {_state(_tm_on(g))} · every {interval:,} messages\n"
+            f"Total: {active_count(g):,} · next: {nxt:,}")
+
+
+async def _milestone_cmd(update, context, which):
+    """/mtoday and /mtotal: no argument shows the setting; a number sets the interval and turns the message ON;
+    on / off switches it. Changing needs a group admin; anyone may look."""
+    chat = await _group_chat_or_reject(update)
+    if chat is None:
+        return
+    msg, user = update.effective_message, update.effective_user
+    name = "mtoday" if which == "day" else "mtotal"
+    args = [a.lower() for a in context.args]
+    usage = (f"1. /{name} 300: Send the {'today' if which == 'day' else 'total'} message every 300 messages.\n"
+             f"2. /{name} off: Turn it off (on turns it on).\n"
+             f"3. /{name}: Show the setting.\n"
+             f"Interval: {MIN_INTERVAL:,} to {MAX_INTERVAL:,}.")
+    value = None
+    if args:
+        if len(args) != 1 or (args[0] not in ("on", "off") and not (re.fullmatch(r"[0-9]{1,7}", args[0]) and
+                                                                      MIN_INTERVAL <= int(args[0]) <= MAX_INTERVAL)):
+            await msg.reply_text(("I couldn't read that.\n\n" if args[0:1] not in (["on"], ["off"]) else "") + usage)
+            return
+        value = args[0]
+        anonymous = user is None or user.id == ANON_ADMIN_ID or (msg.sender_chat is not None and msg.sender_chat.id == chat.id)
+        if anonymous:
+            if not (msg.sender_chat is not None and msg.sender_chat.id == chat.id):
+                await msg.reply_text(ADMIN_ONLY)
+                return
+        else:
+            ok = await _is_group_admin(context.bot, chat.id, user.id)
+            if ok is not True:
+                await msg.reply_text(ADMIN_ONLY if ok is False else "I couldn't verify your permissions right now. Nothing was changed.")
+                return
+    try:
+        if value in ("on", "off"):
+            g = await asyncio.to_thread(_set_flag_sync, chat.id, "dm_on" if which == "day" else "tm_on",
+                                        value == "on", _utcnow())
+        elif value is not None:
+            fn = _save_day_interval_sync if which == "day" else _save_interval_sync
+            g = await asyncio.to_thread(fn, chat.id, int(value), _utcnow(), True)
+        else:
+            g = await asyncio.to_thread(_group_sync, chat.id)
+    except PyMongoError:
+        log.exception("msgcount: /%s failed in %s", name, chat.id)
+        await msg.reply_text(NO_DB)
+        return
+    head = "✅ <b>Saved.</b>\n" if value is not None else ""
+    await msg.reply_html(head + _milestone_status(g, which) + ("" if value is not None else "\n\n" + usage))
+
+
+async def mtoday_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mtoday [number|on|off]: Today's message (every N messages counted today)."""
+    await _milestone_cmd(update, context, "day")
+
+
+async def mtotal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mtotal [number|on|off]: the Total milestone message (every N messages of the group total)."""
+    await _milestone_cmd(update, context, "total")
 
 
 async def count_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -824,56 +1139,73 @@ async def resetrank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ------------------------------------------------------------------ custom interval input (per user + group, expires)
-_pending = {}   # (chat_id, user_id) -> expiry (monotonic). Transient UI state only; no statistics live here.
+_pending = {}       # (chat_id, user_id) -> expiry (monotonic): waiting for the TOTAL milestone interval
+_pending_day = {}   # the same, waiting for TODAY's interval. Transient UI state only; no statistics live here.
 
 
-def _pending_put(chat_id, user_id):
+def _pending_put(chat_id, user_id, store=None):
+    store = _pending if store is None else store
     now = time.monotonic()
-    for k in [k for k, v in _pending.items() if v <= now]:
-        _pending.pop(k, None)
-    if len(_pending) > 500:
-        _pending.clear()
-    _pending[(chat_id, user_id)] = now + INPUT_SECS
+    for k in [k for k, v in store.items() if v <= now]:
+        store.pop(k, None)
+    if len(store) > 500:
+        store.clear()
+    store[(chat_id, user_id)] = now + INPUT_SECS
 
 
-def _pending_live(chat_id, user_id):
-    exp = _pending.get((chat_id, user_id))
+def _pending_live(chat_id, user_id, store=None):
+    store = _pending if store is None else store
+    exp = store.get((chat_id, user_id))
     if exp is None:
         return False
     if exp <= time.monotonic():
-        _pending.pop((chat_id, user_id), None)
+        store.pop((chat_id, user_id), None)
         return False
     return True
 
 
 async def pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """group=-29: only reacts to the user who tapped 'Set Custom Interval' in THIS group; never stops other handlers."""
+    """group=-29: only reacts to the user who tapped 'Set Custom Interval' (Total or Today) in THIS group; never stops
+    other handlers."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if msg is None or chat is None or user is None or not _pending:
+    if msg is None or chat is None or user is None or not (_pending or _pending_day):
         return
-    if not _pending_live(chat.id, user.id):
+    is_day = _pending_live(chat.id, user.id, _pending_day)
+    if not is_day and not _pending_live(chat.id, user.id):
         return
     text = (msg.text or "").strip()
     if not re.fullmatch(r"[0-9]{1,7}", text) or not (MIN_INTERVAL <= int(text) <= MAX_INTERVAL):
         await msg.reply_text(f"Please send a whole number from {MIN_INTERVAL:,} to {MAX_INTERVAL:,} (or tap Cancel on the prompt).")
         return
-    _pending.pop((chat.id, user.id), None)
+    (_pending_day if is_day else _pending).pop((chat.id, user.id), None)
     ok = await _is_group_admin(context.bot, chat.id, user.id)
     if ok is not True:
         await msg.reply_text(ADMIN_ONLY if ok is False else "I couldn't verify your permissions right now. Nothing was changed.")
         return
-    await _apply_interval(msg.reply_html, chat, int(text))
+    await (_apply_day_interval if is_day else _apply_interval)(msg.reply_html, chat, int(text))
 
 
-async def _apply_interval(reply, chat, value):
+async def _apply_interval(reply, chat, value, turn_on=False):
     try:
-        g = await asyncio.to_thread(_save_interval_sync, chat.id, value, _utcnow())
+        g = await asyncio.to_thread(_save_interval_sync, chat.id, value, _utcnow(), turn_on)
     except PyMongoError:
         log.exception("msgcount: saving the interval failed in %s", chat.id)
         await reply(NO_DB)
         return None
     nxt = next_milestone(int(g.get("last_milestone", 0)), int(g.get("initial", DEFAULT_INITIAL)), value)
     await reply(f"✅ <b>Settings saved.</b>\nMilestone interval: every {value:,} messages.\nNext milestone: {nxt:,}.")
+    return g
+
+
+async def _apply_day_interval(reply, chat, value, turn_on=False):
+    try:
+        g = await asyncio.to_thread(_save_day_interval_sync, chat.id, value, _utcnow(), turn_on)
+    except PyMongoError:
+        log.exception("msgcount: saving today's interval failed in %s", chat.id)
+        await reply(NO_DB)
+        return None
+    await reply(f"✅ <b>Settings saved.</b>\nToday's message: every {value:,} messages "
+                f"(next: {_next_today(g):,}).\nStatus: {_state(_dm_on(g))}.")
     return g
 
 
@@ -911,7 +1243,7 @@ async def mc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data = await asyncio.to_thread(_board_sync, chat.id, parts[2], int(parts[3]))
             await _decorate(context.bot, chat.id, data)
             await _edit(q, _board_text(_chat_title(chat), parts[2], data), _board_kb(parts[2], data))
-        elif action in ("s", "si", "ss", "sc", "sx", "t"):
+        elif action in ("s", "si", "ss", "sc", "sx", "t", "st", "tt", "sd", "di", "ds", "dc", "dt"):
             await _admin_action(q, context, chat, parts)
         else:
             await q.answer("This button is no longer valid.", show_alert=True)
@@ -944,17 +1276,67 @@ async def _admin_action(q, context, chat, parts):
         return
     action = parts[1]
     g = await asyncio.to_thread(_group_sync, chat.id)
-    if action == "s":
+    title = _chat_title(chat, g)
+
+    def valid_interval():
+        return len(parts) == 3 and parts[2].isdigit() and len(parts[2]) <= 7 and MIN_INTERVAL <= int(parts[2]) <= MAX_INTERVAL
+
+    if action == "s":                                      # ⚙️ Milestone Settings: the Total and Today buttons
+        await q.answer()
+        await _edit(q, _menu_text(title, g), _menu_kb())
+    elif action == "st":                                   # 📊 Total screen
         await q.answer()
         draft = int(g.get("interval", DEFAULT_INTERVAL))
-        await _edit(q, _settings_text(_chat_title(chat, g), g, draft), _settings_kb(draft))
+        await _edit(q, _settings_text(title, g, draft), _settings_kb(g, draft))
+    elif action == "sd":                                   # ✅ Today screen
+        await q.answer()
+        draft = _dm_interval(g)
+        await _edit(q, _day_text(title, g, draft), _day_kb(g, draft))
+    elif action in ("tt", "dt"):                           # the ON/OFF switch of Total / Today
+        if len(parts) != 3 or parts[2] not in ("0", "1"):
+            await q.answer("This button is no longer valid.", show_alert=True)
+            return
+        flag = parts[2] == "1"
+        field = "tm_on" if action == "tt" else "dm_on"
+        g2 = await asyncio.to_thread(_set_flag_sync, chat.id, field, flag, _utcnow())
+        label = "Total milestone" if action == "tt" else "Today's message"
+        await q.answer(f"{label} is now {'ON' if flag else 'OFF'}.")
+        if action == "tt":
+            draft = int(g2.get("interval", DEFAULT_INTERVAL))
+            await _edit(q, _settings_text(title, g2, draft), _settings_kb(g2, draft))
+        else:
+            draft = _dm_interval(g2)
+            await _edit(q, _day_text(title, g2, draft), _day_kb(g2, draft))
     elif action == "si":
-        if len(parts) != 3 or not parts[2].isdigit() or not (MIN_INTERVAL <= int(parts[2]) <= MAX_INTERVAL):
+        if not valid_interval():
             await q.answer("Invalid interval.", show_alert=True)
             return
         await q.answer()
         draft = int(parts[2])
-        await _edit(q, _settings_text(_chat_title(chat, g), g, draft), _settings_kb(draft))
+        await _edit(q, _settings_text(title, g, draft), _settings_kb(g, draft))
+    elif action == "di":
+        if not valid_interval():
+            await q.answer("Invalid interval.", show_alert=True)
+            return
+        await q.answer()
+        draft = int(parts[2])
+        await _edit(q, _day_text(title, g, draft), _day_kb(g, draft))
+    elif action == "ds":                                   # 💾 save Today's interval
+        if not valid_interval():
+            await q.answer("Invalid interval.", show_alert=True)
+            return
+        g2 = await asyncio.to_thread(_save_day_interval_sync, chat.id, int(parts[2]), _utcnow())
+        await q.answer("Settings saved.")
+        await _edit(q, _day_text(title, g2, _dm_interval(g2)), _day_kb(g2, _dm_interval(g2)))
+    elif action == "dc":                                   # ✏️ custom interval for Today
+        await q.answer()
+        _pending.pop((chat.id, q.from_user.id), None)
+        _pending_put(chat.id, q.from_user.id, _pending_day)
+        await q.message.reply_html(
+            f"✏️ <b>Custom interval for Today's message</b>\n\n{html.escape(q.from_user.first_name or 'Admin')}, send a whole "
+            f"number from {MIN_INTERVAL:,} to {MAX_INTERVAL:,} within {INPUT_SECS // 60} minutes.\n"
+            "Only your next message in this group is used.",
+            reply_markup=KB([[B("❌ Cancel", callback_data="mc:sx")]]))
     elif action == "ss":
         if len(parts) != 3 or not parts[2].isdigit() or not (MIN_INTERVAL <= int(parts[2]) <= MAX_INTERVAL):
             await q.answer("Invalid interval.", show_alert=True)
@@ -964,6 +1346,7 @@ async def _admin_action(q, context, chat, parts):
         await _edit(q, _dash_text(_chat_title(chat, g2), g2), _dash_kb(g2))
     elif action == "sc":
         await q.answer()
+        _pending_day.pop((chat.id, q.from_user.id), None)
         _pending_put(chat.id, q.from_user.id)
         await q.message.reply_html(
             f"✏️ <b>Custom interval</b>\n\n{html.escape(q.from_user.first_name or 'Admin')}, send a whole number from "
@@ -971,6 +1354,7 @@ async def _admin_action(q, context, chat, parts):
             reply_markup=KB([[B("❌ Cancel", callback_data="mc:sx")]]))
     elif action == "sx":
         _pending.pop((chat.id, q.from_user.id), None)
+        _pending_day.pop((chat.id, q.from_user.id), None)
         await q.answer("Cancelled.")
         await _edit(q, "Custom interval cancelled. Nothing was changed.", None)
     elif action == "t":
@@ -2057,6 +2441,8 @@ def register(app, owner_ids=None, groups_source=None):
     app.add_handler(CommandHandler("me", me_cmd))
     app.add_handler(CommandHandler("radmin", radmin_cmd))
     app.add_handler(CommandHandler("resetrank", resetrank_cmd))
+    app.add_handler(CommandHandler("mtoday", mtoday_cmd))
+    app.add_handler(CommandHandler("mtotal", mtotal_cmd))
     app.add_handler(CallbackQueryHandler(mc_callback, pattern=r"^mc:"))
     app.add_handler(CommandHandler("deleted", deleted_cmd))
     app.add_handler(CommandHandler("inactive", inactive_cmd))
