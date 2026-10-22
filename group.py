@@ -62,7 +62,10 @@ from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler, CommandHa
 
 import extra
 import migrate_to_mongo as store
-from lang import lang as L          # the language system (lang/ folder): L.t("key", chat_id, name=value)
+try:
+    from lang import lang as L      # the language system (lang/lang.py): L.t("key", chat_id, name=value)
+except ImportError:
+    import lang as L                # lang.py uploaded next to group.py instead of inside a lang/ folder
 
 log = logging.getLogger("group")
 D = None            # helpers handed in by nova.py (see register)
