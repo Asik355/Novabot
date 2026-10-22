@@ -198,8 +198,8 @@ def _restore_perms(chat_id):
     return perms
 
 
-async def _fail(bot, chat_id, what, exc, label=None):
-    """`what` keys the retry timer; `label` is the words in the notice (default: '<what> the group')."""
+async def _fail(bot, chat_id, what, exc):
+    """`what` keys the retry timer and the words in the notice: "close", "open", "night" or "night-end"."""
     _retry_at[(chat_id, what)] = time.monotonic() + RETRY_AFTER
     log.warning("autoclose: couldn't %s %s: %s: %s", what, chat_id, type(exc).__name__, exc)
     last = _notice_at.get(chat_id)
@@ -207,26 +207,26 @@ async def _fail(bot, chat_id, what, exc, label=None):
         return
     _notice_at[chat_id] = time.monotonic()
     try:
-        await bot.send_message(chat_id, f"⚠️ I couldn't {label or what + ' the group'} on schedule. Please make me an admin "
-                                        "with the 'Ban users' (restrict members) right. I will try again in a few minutes.")
+        await bot.send_message(chat_id, L.t("ac.fail", chat_id, label=L.t("ac.lbl_" + what.replace("-", "_"), chat_id)))
     except TelegramError:
         pass
 
 
 # ------------------------------------------------------------------ the messages (default or custom)
-def default_close_msg(has_open_time):
-    text = "🔒 <b>Group Closed</b>\nIt's time for a break! Only admins can send messages right now."
-    return text + ("\n🕒 We'll be back at <b>{open_time}</b>. Good night! 🌙" if has_open_time else "")
+def default_close_msg(has_open_time, chat_id=None):
+    text = L.t("ac.def_close", chat_id)
+    return text + (L.t("ac.def_close_back", chat_id) if has_open_time else "")
 
 
-def default_open_msg(has_close_time):
-    text = "🔓 <b>Group Open</b>\nGood morning! The chat is open again, and everyone can send messages. ☀️"
-    return text + ("\n🕒 Next close time: <b>{close_time}</b>" if has_close_time else "")
+def default_open_msg(has_close_time, chat_id=None):
+    text = L.t("ac.def_open", chat_id)
+    return text + (L.t("ac.def_open_next", chat_id) if has_close_time else "")
 
 
-def render_msg(template, open_time, close_time):
+def render_msg(template, open_time, close_time, chat_id=None):
     """Fills {open_time} and {close_time}. Plain str.replace, so other braces in a custom text are harmless."""
-    return (template.replace("{open_time}", open_time or "later").replace("{close_time}", close_time or "later"))
+    later = L.t("ac.later", chat_id)
+    return template.replace("{open_time}", open_time or later).replace("{close_time}", close_time or later)
 
 
 def build_msg(chat_id, kind, close=None, open_=None):
@@ -238,10 +238,10 @@ def build_msg(chat_id, kind, close=None, open_=None):
     if custom:
         template = html.escape(custom[:MSG_MAX])               # a custom text is plain text: never HTML from a user
     elif kind == "close":
-        template = default_close_msg(open_ is not None)
+        template = default_close_msg(open_ is not None, chat_id)
     else:
-        template = default_open_msg(close is not None)
-    return render_msg(template, ot, ct)
+        template = default_open_msg(close is not None, chat_id)
+    return render_msg(template, ot, ct, chat_id)
 
 
 async def close_group(bot, chat_id, until_minutes=None):
@@ -349,12 +349,10 @@ async def sweeper(app):
 
 
 # ------------------------------------------------------------------ the command
-AUTOCLOSE_USAGE = ("Usage:\n"
-                   "1. /autoclose 23:00 06:00: close every day at 11 PM and open at 6 AM (24-hour or 11pm style)\n"
-                   "2. /autoclose off: stop the schedule\n"
-                   "3. /autoclose: show the schedule\n"
-                   "4. /autoclose closemsg <text> and /autoclose openmsg <text>: your own messages "
-                   "({open_time} and {close_time} are filled in)")
+def _ac_usage(chat_id):
+    return L.t("ac.usage", chat_id)
+
+
 SAMPLE_CLOSE, SAMPLE_OPEN = 23 * 60, 6 * 60          # 11:00 PM and 6:00 AM, used in message previews
 
 
@@ -379,51 +377,45 @@ async def autoclose_cmd(update, context):
     sched = load_schedule(raw)
     if not args:
         if not sched:
-            await msg.reply_text("Auto close is OFF.\n\n" + AUTOCLOSE_USAGE)
+            await msg.reply_text(L.t("ac.cmd_off", chat.id) + "\n\n" + _ac_usage(chat.id))
             return
-        state = "closed" if D.get_setting(chat.id, STATE_KEY, "open") == "closed" else "open"
-        await msg.reply_text(f"🕒 Auto close is ON ({BOT_TIMEZONE}).\n"
-                             f"Closes at {fmt_12h(sched[0])} and opens at {fmt_12h(sched[1])}, every day.\n"
-                             f"The group is {state} right now.\n\nTurn it off with /autoclose off.")
+        state = L.t("ac.state_closed" if D.get_setting(chat.id, STATE_KEY, "open") == "closed" else "ac.state_open", chat.id)
+        await msg.reply_text(L.t("ac.cmd_on", chat.id, tz=BOT_TIMEZONE, close=fmt_12h(sched[0]), open=fmt_12h(sched[1]),
+                                 state=state))
         return
     if args[0] in ("closemsg", "openmsg"):             # /autoclose closemsg <text> | reset
         kind = "close" if args[0] == "closemsg" else "open"
         pieces = (msg.text or "").split(None, 2)        # keep the text exactly as typed (case, new lines)
         text = pieces[2].strip() if len(pieces) > 2 else ""
         if not text:
-            await msg.reply_text(f"Usage: /autoclose {args[0]} <your text>\n"
-                                 f"Placeholders: {{open_time}} and {{close_time}}. Up to {MSG_MAX} characters.\n"
-                                 f"/autoclose {args[0]} reset: go back to the default message.")
+            await msg.reply_text(L.t("ac.msg_usage", chat.id, cmd=args[0], max=MSG_MAX))
             return
         if text.lower() in ("reset", "default"):
             store.del_setting(chat.id, MSG_CLOSE_KEY if kind == "close" else MSG_OPEN_KEY)
-            await msg.reply_text(f"✅ The {kind} message is back to the default.")
+            await msg.reply_text(L.t("ac.msg_reset", chat.id, kind=kind))
             return
         if len(text) > MSG_MAX:
-            await msg.reply_text(f"❌ That is {len(text)} characters. The most I can use is {MSG_MAX}.")
+            await msg.reply_text(L.t("ac.msg_toolong", chat.id, n=len(text), max=MSG_MAX))
             return
         D.set_setting(chat.id, MSG_CLOSE_KEY if kind == "close" else MSG_OPEN_KEY, text)
-        await msg.reply_html("✅ Saved. Preview:\n\n" + build_msg(chat.id, kind, SAMPLE_CLOSE, SAMPLE_OPEN))
+        await msg.reply_html(L.t("ac.msg_saved", chat.id) + "\n\n" + build_msg(chat.id, kind, SAMPLE_CLOSE, SAMPLE_OPEN))
         return
     if args[0] in ("off", "no", "stop", "disable", "0"):
         ok, was_closed = await turn_off(context.bot, chat.id)
         if not ok:
-            await msg.reply_text("Auto close is OFF, but I couldn't open the group. Please make me an admin with the "
-                                 "'Ban users' right, or change the group permissions yourself.")
+            await msg.reply_text(L.t("ac.off_fail", chat.id))
             return
-        await msg.reply_text("✅ Auto close is OFF." + (" The group is open again." if was_closed else ""))
+        await msg.reply_text(L.t("ac.off_done", chat.id) + (L.t("ac.off_open", chat.id) if was_closed else ""))
         return
     close, open_ = parse_two_times(" ".join(args))
     if close is None or open_ is None:
-        await msg.reply_text("I couldn't read those times.\n\n" + AUTOCLOSE_USAGE)
+        await msg.reply_text(L.t("ac.cant_read", chat.id) + "\n\n" + _ac_usage(chat.id))
         return
     if close == open_:
-        await msg.reply_text("The closing and opening time must be different.\n\n" + AUTOCLOSE_USAGE)
+        await msg.reply_text(L.t("ac.cmd_same", chat.id) + "\n\n" + _ac_usage(chat.id))
         return
     D.set_setting(chat.id, AUTOCLOSE_KEY, f"{fmt_minutes(close)}-{fmt_minutes(open_)}")
-    await msg.reply_text(f"✅ Auto close is ON ({BOT_TIMEZONE}).\n"
-                         f"Every day I close the group at {fmt_12h(close)} (only admins can write) and open it at "
-                         f"{fmt_12h(open_)}.\nGive me the 'Ban users' admin right so I can do it.")
+    await msg.reply_text(L.t("ac.cmd_saved", chat.id, tz=BOT_TIMEZONE, close=fmt_12h(close), open=fmt_12h(open_)))
     await run_once(context.bot)                      # apply it right away if the group is inside the closed window now
 
 
@@ -447,62 +439,48 @@ AC_TYPE_TTL = 300                # seconds a typed minute is still accepted afte
 _ac_pending = {}
 
 
-def _tz_label():
-    return "India time (IST)" if BOT_TIMEZONE == "Asia/Kolkata" else html.escape(BOT_TIMEZONE)
+def _tz_label(chat_id=None):
+    return L.t("ac.tz_india", chat_id) if BOT_TIMEZONE == "Asia/Kolkata" else html.escape(BOT_TIMEZONE)
 
 
 def _ac_status(chat):
+    cid = getattr(chat, "id", None)
     if chat is None or chat.type == "private":
-        return "Open /help inside a group to set up auto close for that group."
+        return L.t("ac.st_private", cid)
     sched = load_schedule(D.get_setting(chat.id, AUTOCLOSE_KEY, "") or "")
     if not sched:
-        return "Status: <b>OFF ❌</b>"
-    state = "closed 🔒" if D.get_setting(chat.id, STATE_KEY, "open") == "closed" else "open 🔓"
-    return (f"Status: <b>ON ✅</b> ({html.escape(BOT_TIMEZONE)})\n"
-            f"Closes at <b>{fmt_12h(sched[0])}</b> and opens at <b>{fmt_12h(sched[1])}</b>, every day.\n"
-            f"The group is {state} right now.")
+        return L.t("ac.st_off", cid)
+    state = L.t("ac.stt_closed" if D.get_setting(chat.id, STATE_KEY, "open") == "closed" else "ac.stt_open", cid)
+    return L.t("ac.st_on", cid, tz=html.escape(BOT_TIMEZONE), close=fmt_12h(sched[0]), open=fmt_12h(sched[1]), state=state)
 
 
 def _ac_home(chat):
-    text = ("<b>🕒 Auto Close</b>\n\n"
-            "Close the group automatically at a set time every day and open it again later. While the group is "
-            "closed, only admins can write messages.\n\n"
-            "Choose how you want to set it up:\n"
-            "• <b>🕒 Auto Close</b>: pick the times with buttons\n"
-            "• <b>⌨️ Command</b>: set it by typing a command\n\n"
-            f"{_ac_status(chat)}\n\n"
-            "<b>Note:</b> The bot must be an admin with the \"Ban users\" right. Opening the group brings back the "
-            "exact permissions it had before closing.")
-    rows = [[InlineKeyboardButton("🕒 Auto Close", callback_data="acb:a"),
-             InlineKeyboardButton("⌨️ Command", callback_data="acb:c")],
-            [InlineKeyboardButton("📖 Usage Guide", callback_data="help:g_autoclose")],
-            [InlineKeyboardButton("« Back", callback_data="help:main")]]
+    cid = getattr(chat, "id", None)
+    text = (L.t("ac.title", cid) + "\n\n" + L.t("ac.home_intro", cid) + "\n\n" + _ac_status(chat) + "\n\n" +
+            L.t("ac.home_note", cid))
+    rows = [[InlineKeyboardButton(L.t("ac.btn_auto", cid), callback_data="acb:a"),
+             InlineKeyboardButton(L.t("ac.btn_cmd", cid), callback_data="acb:c")],
+            [InlineKeyboardButton(L.t("ac.btn_guide", cid), callback_data="help:g_autoclose")],
+            [InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]]
     return text, InlineKeyboardMarkup(rows)
 
 
 def _ac_panel(chat, note=""):
     sched = load_schedule(D.get_setting(chat.id, AUTOCLOSE_KEY, "") or "")
-    text = ("<b>🕒 Auto Close</b>\n\n" + (f"{note}\n\n" if note else "") + f"{_ac_status(chat)}\n\n"
-            "Tap <b>Set Time</b> to choose when the group closes and when it opens.")
-    rows = [[InlineKeyboardButton("⏰ Set Time", callback_data="acb:H:c:-"),
-             InlineKeyboardButton("✏️ Custom Message", callback_data="acb:m")]]
+    text = (L.t("ac.title", chat.id) + "\n\n" + (f"{note}\n\n" if note else "") + _ac_status(chat) + "\n\n" +
+            L.t("ac.panel_tap", chat.id))
+    rows = [[InlineKeyboardButton(L.t("ac.btn_set", chat.id), callback_data="acb:H:c:-"),
+             InlineKeyboardButton(L.t("ac.btn_custom", chat.id), callback_data="acb:m")]]
     if sched:
-        rows.append([InlineKeyboardButton("🔴 Turn OFF", callback_data="acb:off")])
-    rows.append([InlineKeyboardButton("« Back", callback_data=AC_HOME)])
+        rows.append([InlineKeyboardButton(L.t("ac.btn_off", chat.id), callback_data="acb:off")])
+    rows.append([InlineKeyboardButton(L.t("pick.back", chat.id), callback_data=AC_HOME)])
     return text, InlineKeyboardMarkup(rows)
 
 
-def _ac_command_page():
-    text = ("<b>⌨️ Auto Close: Command</b>\n\n"
-            "Prefer typing? Use these commands in the group (admins only):\n\n"
-            "1. /autoclose 11pm 6am: Close every day at 11:00 PM and open at 6:00 AM.\n"
-            "2. /autoclose 11:30pm 6:15am: The same, with minutes: closes at 11:30 PM and opens at 6:15 AM.\n"
-            "3. /autoclose off: Stop the schedule. A closed group is opened again.\n"
-            "4. /autoclose: Show the schedule and whether the group is closed right now.\n"
-            "5. /autoclose closemsg text: Set your own message for when the group closes.\n"
-            "6. /autoclose openmsg text: Set your own message for when the group opens.\n\n"
-            f"<b>Note:</b> The bot must be an admin with the \"Ban users\" right. Times use {_tz_label()}.")
-    return text, InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data=AC_HOME)]])
+def _ac_command_page(chat=None):
+    cid = getattr(chat, "id", None)
+    return (L.t("ac.cmd_page", cid, tz=_tz_label(cid)),
+            InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data=AC_HOME)]]))
 
 
 # The same three pickers serve Auto Close and Night Mode. `which` says which time is being chosen:
@@ -556,14 +534,11 @@ _AC_KIND = {"c": "close", "o": "open"}
 def _ac_msg_menu(chat):
     custom_c = bool((D.get_setting(chat.id, MSG_CLOSE_KEY, "") or "").strip())
     custom_o = bool((D.get_setting(chat.id, MSG_OPEN_KEY, "") or "").strip())
-    text = ("<b>✏️ Custom Message</b>\n\n"
-            "Write your own message for when the group closes and when it opens.\n"
-            f"🔒 Close message: <b>{'custom' if custom_c else 'default'}</b>\n"
-            f"🔓 Open message: <b>{'custom' if custom_o else 'default'}</b>\n\n"
-            "The closed message is pinned while the group is closed, and unpinned when it opens.")
-    rows = [[InlineKeyboardButton("🔒 Close message", callback_data="acb:e:c"),
-             InlineKeyboardButton("🔓 Open message", callback_data="acb:e:o")],
-            [InlineKeyboardButton("« Back", callback_data="acb:a")]]
+    word = lambda on: L.t("ac.custom" if on else "ac.default", chat.id)
+    text = L.t("ac.cm_menu", chat.id, close=word(custom_c), open=word(custom_o))
+    rows = [[InlineKeyboardButton(L.t("ac.btn_close_msg", chat.id), callback_data="acb:e:c"),
+             InlineKeyboardButton(L.t("ac.btn_open_msg", chat.id), callback_data="acb:e:o")],
+            [InlineKeyboardButton(L.t("pick.back", chat.id), callback_data="acb:a")]]
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -571,16 +546,14 @@ def _ac_msg_edit_screen(chat, which, note=""):
     kind = _AC_KIND[which]
     sample = build_msg(chat.id, kind, SAMPLE_CLOSE, SAMPLE_OPEN)
     custom = bool((D.get_setting(chat.id, MSG_CLOSE_KEY if kind == "close" else MSG_OPEN_KEY, "") or "").strip())
-    text = (f"<b>{'🔒 Close' if kind == 'close' else '🔓 Open'} message</b>\n\n" + (f"{note}\n\n" if note else "") +
-            f"Now using the <b>{'custom' if custom else 'default'}</b> message. Preview (with the times 11:00 PM and "
-            f"6:00 AM):\n\n{sample}\n\n"
-            "<b>Send your new text in this chat.</b> You can write <code>{open_time}</code> and "
-            f"<code>{{close_time}}</code>, and the bot fills in the times. Up to {MSG_MAX} characters, plain text "
-            "and emoji.\nI'll wait 5 minutes.")
+    text = (L.t("ac.em_head_close" if kind == "close" else "ac.em_head_open", chat.id) + "\n\n" +
+            (f"{note}\n\n" if note else "") +
+            L.t("ac.em_body", chat.id, state=L.t("ac.custom" if custom else "ac.default", chat.id), sample=sample,
+                max=MSG_MAX))
     rows = []
     if custom:
-        rows.append([InlineKeyboardButton("♻️ Reset to default", callback_data=f"acb:rs:{which}")])
-    rows.append([InlineKeyboardButton("« Back", callback_data="acb:m")])
+        rows.append([InlineKeyboardButton(L.t("ac.btn_reset", chat.id), callback_data=f"acb:rs:{which}")])
+    rows.append([InlineKeyboardButton(L.t("pick.back", chat.id), callback_data="acb:m")])
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -601,7 +574,7 @@ async def ac_custom_message(update, context):
         if not pending["warned"]:
             pending["warned"] = True
             try:
-                await msg.reply_text(f"That is {len(text)} characters. Send between 1 and {MSG_MAX}, or tap Back.")
+                await msg.reply_text(L.t("ac.cm_toolong", chat.id, n=len(text), max=MSG_MAX))
             except TelegramError:
                 pass
         return
@@ -612,11 +585,11 @@ async def ac_custom_message(update, context):
     except Exception:
         log.exception("autoclose: saving the custom message failed in %s", chat.id)
         try:
-            await msg.reply_text("The database had a problem. Nothing was changed.")
+            await msg.reply_text(L.t("ac.db_problem", chat.id))
         except TelegramError:
             pass
         return
-    page, markup = _ac_msg_edit_screen(chat, which, "✅ Saved.")
+    page, markup = _ac_msg_edit_screen(chat, which, L.t("ac.saved_short", chat.id))
     try:
         await context.bot.edit_message_text(page, chat_id=chat.id, message_id=pending["mid"], parse_mode="HTML",
                                             reply_markup=markup, disable_web_page_preview=True)
@@ -695,16 +668,16 @@ async def acb_callback(update, context):
         return
     parts = (q.data or "").split(":")
     act = parts[1] if len(parts) > 1 else ""
-    invalid = "This button is no longer valid."
+    invalid = L.t("ac.invalid", chat.id)
     if act == "c":                                     # the Command page is only information: anyone may read it
         await q.answer()
-        await _ac_edit(q, *_ac_command_page())
+        await _ac_edit(q, *_ac_command_page(chat))
         return
     if chat.type == "private":
-        await q.answer("Open /help inside a group to set up auto close for that group.", show_alert=True)
+        await q.answer(L.t("ac.st_private", chat.id), show_alert=True)
         return
     if not await _ac_allowed(chat, q.from_user.id):
-        await q.answer("Only group admins can change auto close.", show_alert=True)
+        await q.answer(L.t("ac.admin_only", chat.id), show_alert=True)
         return
     _ac_pending.pop((chat.id, q.from_user.id), None)   # any tap leaves the "type the minute" state; M sets it again
     _ac_msg_pending.pop((chat.id, q.from_user.id), None)   # ... and the "type the message" state; e sets it again
@@ -724,10 +697,10 @@ async def acb_callback(update, context):
                 store.del_setting(chat.id, MSG_CLOSE_KEY if which == "c" else MSG_OPEN_KEY)
             except Exception:
                 log.exception("autoclose: resetting the message failed in %s", chat.id)
-                await q.answer("The database had a problem. Nothing was changed.", show_alert=True)
+                await q.answer(L.t("ac.db_problem", chat.id), show_alert=True)
                 return
-            await q.answer("✅ Back to the default message.")
-            await _ac_edit(q, *_ac_msg_edit_screen(chat, which, "♻️ Reset to the default message."))
+            await q.answer(L.t("ac.toast_reset", chat.id))
+            await _ac_edit(q, *_ac_msg_edit_screen(chat, which, L.t("ac.note_reset", chat.id)))
             return
         await q.answer()
         now = time.monotonic()
@@ -742,13 +715,12 @@ async def acb_callback(update, context):
             ok, was_closed = await turn_off(context.bot, chat.id)
         except Exception:
             log.exception("autoclose: turning off failed in %s", chat.id)
-            await q.answer("The database had a problem. Nothing was changed.", show_alert=True)
+            await q.answer(L.t("ac.db_problem", chat.id), show_alert=True)
             return
         if not ok:
-            await q.answer("Auto close is OFF, but I couldn't open the group. Please make me an admin with the "
-                           "'Ban users' right.", show_alert=True)
+            await q.answer(L.t("ac.off_fail_short", chat.id), show_alert=True)
         else:
-            await q.answer("Auto close is OFF." + (" The group is open again." if was_closed else ""))
+            await q.answer(L.t("ac.toast_off", chat.id) + (L.t("ac.off_open", chat.id) if was_closed else ""))
         await _ac_edit(q, *_ac_panel(chat))
         return
 
@@ -855,7 +827,7 @@ async def start_night(bot, chat_id, end_minutes):
         D.set_setting(chat_id, NIGHT_SAVED_KEY, _saved_perms(chat))
         await bot.set_chat_permissions(chat_id, _night_variant(perms))
     except TelegramError as e:
-        await _fail(bot, chat_id, "night", e, "start Night Mode in the group")
+        await _fail(bot, chat_id, "night", e)
         return False
     D.set_setting(chat_id, NIGHT_STATE_KEY, "on")
     try:
@@ -873,7 +845,7 @@ async def end_night(bot, chat_id):
         try:
             await bot.set_chat_permissions(chat_id, _night_saved_perms(chat_id))
         except TelegramError as e:
-            await _fail(bot, chat_id, "night-end", e, "end Night Mode in the group")
+            await _fail(bot, chat_id, "night-end", e)
             return False
     store.del_setting(chat_id, NIGHT_STATE_KEY)
     store.del_setting(chat_id, NIGHT_SAVED_KEY)
@@ -1458,25 +1430,8 @@ SERVICE_ATTRS = {
 # Never touched on purpose: migrate_to_chat_id / migrate_from_chat_id (the bot needs them to follow a group that
 # turns into a supergroup).
 
-SERVICE_INFO = (
-    ("all", "All service messages."),
-    ("join", "When a new user joins, or is added. eg: 'X joined the chat'"),
-    ("leave", "When a user leaves, or is removed. eg: 'X left the chat'"),
-    ("other", "Miscellaneous items; such as chat boosts, successful telegram payments, proximity alerts, webapp "
-              "messages, message auto deletion changes, or checklist updates."),
-    ("photo", "When chat photos or chat backgrounds are changed."),
-    ("pin", "When a new message is pinned. eg: 'X pinned a message'"),
-    ("title", "When chat or topic titles are changed."),
-    ("videochat", "When a video chat action occurs - eg starting, ending, scheduling, or adding members to the call."),
-)
-COMMAND_INFO = (
-    ("all", "Delete ALL commands sent to the group."),
-    ("admin", "Delete any admin-only commands sent to the group (eg /ban, /mute, or any settings changes)."),
-    ("user", "Delete any user commands sent to the group (eg /id, /info, or /get). These commands will also be "
-             "cleaned when admins use them."),
-    ("other", "Delete any commands which aren't recognised as being valid commands of this bot (or that are meant "
-              "for other bots)."),
-)
+SERVICE_INFO = ("all",) + SERVICE_TYPES          # their descriptions are the lang keys "cl.si_<name>"
+COMMAND_INFO = ("all",) + COMMAND_TYPES          # ... and "cl.ci_<name>"
 
 # Commands that members may use. Every OTHER command this bot has registered counts as an admin command; a name the
 # bot doesn't know (or a command written for another bot, /cmd@otherbot) counts as "other". The Fun commands made
@@ -1515,11 +1470,11 @@ def is_service_cleaned(chat_id, category):
         return False
 
 
-def _describe(chosen, order):
+def _describe(chosen, order, chat_id=None):
     if not chosen:
-        return "nothing"
+        return L.t("cl.nothing", chat_id)
     if set(order) <= set(chosen):
-        return "all"
+        return L.t("cl.all", chat_id)
     return ", ".join(t for t in order if t in chosen)
 
 
@@ -1536,6 +1491,11 @@ def what_cmd(what):
     return "service" if what.startswith("service") else "command"
 
 
+def _what(what, chat_id=None):
+    """The words for "service messages" / "commands" in the group's language."""
+    return L.t("cl.w_service" if what.startswith("service") else "cl.w_cmd", chat_id)
+
+
 # ------------------------------------------------------------------ shared command logic
 async def _set_cmd(update, context, key, valid, order, what, types_cmd):
     """/cleanservice and /cleancommand: add types (or all / yes / no)."""
@@ -1545,10 +1505,8 @@ async def _set_cmd(update, context, key, valid, order, what, types_cmd):
     chosen = _load(chat.id, key, valid)
     words = _words(context.args)
     if not words:
-        await msg.reply_html(
-            f"Currently deleting <b>{_describe(chosen, order)}</b> {what}.\n\n"
-            f"Usage: <code>/clean{what_cmd(what)} &lt;type&gt;</code>. See /{types_cmd} for the types, "
-            f"<code>/keep{what_cmd(what)} &lt;type&gt;</code> to stop deleting a type.")
+        await msg.reply_html(L.t("cl.set_help", chat.id, desc=_describe(chosen, order, chat.id), what=_what(what, chat.id),
+                                 cmd=what_cmd(what), types=types_cmd))
         return
     if words[0] in YES_WORDS:
         new = set(order)
@@ -1557,15 +1515,15 @@ async def _set_cmd(update, context, key, valid, order, what, types_cmd):
     else:
         bad = [w for w in words if w != "all" and w not in valid]
         if bad:
-            await msg.reply_html(f"Unknown type: <code>{_esc(', '.join(bad))}</code>\n"
-                                 f"Available: all, {', '.join(order)}. See /{types_cmd}.")
+            await msg.reply_html(L.t("cl.unknown_type", chat.id, bad=_esc(", ".join(bad)), order=", ".join(order),
+                                     types=types_cmd))
             return
         new = chosen | (set(order) if "all" in words else set(words))
     _save(chat.id, key, new, order)
     if new:
-        await msg.reply_html(f"✅ I will now delete <b>{_describe(new, order)}</b> {what}.")
+        await msg.reply_html(L.t("cl.set_ok", chat.id, desc=_describe(new, order, chat.id), what=_what(what, chat.id)))
     else:
-        await msg.reply_html(f"✅ I will no longer delete any {what}.")
+        await msg.reply_html(L.t("cl.set_none", chat.id, what=_what(what, chat.id)))
 
 
 async def _keep_cmd(update, context, key, valid, order, what, types_cmd):
@@ -1575,18 +1533,19 @@ async def _keep_cmd(update, context, key, valid, order, what, types_cmd):
     chat, msg = update.effective_chat, update.effective_message
     words = _words(context.args)
     if not words:
-        await msg.reply_html(f"Usage: <code>/keep{what_cmd(what)} &lt;type&gt;</code>. See /{types_cmd} for the types.")
+        await msg.reply_html(L.t("cl.keep_usage", chat.id, cmd=what_cmd(what), types=types_cmd))
         return
     bad = [w for w in words if w != "all" and w not in valid]
     if bad:
-        await msg.reply_html(f"Unknown type: <code>{_esc(', '.join(bad))}</code>\n"
-                             f"Available: all, {', '.join(order)}. See /{types_cmd}.")
+        await msg.reply_html(L.t("cl.unknown_type", chat.id, bad=_esc(", ".join(bad)), order=", ".join(order),
+                                 types=types_cmd))
         return
     chosen = _load(chat.id, key, valid)
     new = set() if "all" in words else chosen - set(words)
     _save(chat.id, key, new, order)
-    left = f" Still deleting: <b>{_describe(new, order)}</b>." if new else ""
-    await msg.reply_html(f"✅ I will keep {'all' if 'all' in words else ', '.join(words)} {what}.{left}")
+    left = L.t("cl.still", chat.id, desc=_describe(new, order, chat.id)) if new else ""
+    kept = L.t("cl.all", chat.id) if "all" in words else ", ".join(words)
+    await msg.reply_html(L.t("cl.keep_ok", chat.id, kept=kept, what=_what(what, chat.id), left=left))
 
 
 # ------------------------------------------------------------------ the commands
@@ -1599,7 +1558,8 @@ async def keepservice_cmd(update, context):
 
 
 async def cleanservicetypes_cmd(update, context):
-    lines = ["<b>Service message types</b>", ""] + [f"- <code>{n}</code>: {_esc(d)}" for n, d in SERVICE_INFO]
+    cid = update.effective_chat.id
+    lines = [L.t("cl.svc_title", cid), ""] + [f"- <code>{n}</code>: {_esc(L.t('cl.si_' + n, cid))}" for n in SERVICE_INFO]
     await update.effective_message.reply_html("\n".join(lines))
 
 
@@ -1636,11 +1596,11 @@ def parse_command_names(tokens, bot_username):
 
 def _describe_clean(chat_id):
     """'user, other + /roast, /hug' | 'all' | 'nothing': what this group deletes now."""
-    types = _describe(_load(chat_id, COMMAND_KEY, COMMAND_TYPES), COMMAND_TYPES)
+    chosen = _load(chat_id, COMMAND_KEY, COMMAND_TYPES)
     names = _load_names(chat_id)
-    shown = ", ".join("/" + n for n in names[:10]) + (f" and {len(names) - 10} more" if len(names) > 10 else "")
-    parts = ([] if types == "nothing" else [types]) + ([shown] if names else [])
-    return " + ".join(parts) or "nothing"
+    shown = ", ".join("/" + n for n in names[:10]) + (L.t("cl.and_more", chat_id, n=len(names) - 10) if len(names) > 10 else "")
+    parts = ([_describe(chosen, COMMAND_TYPES, chat_id)] if chosen else []) + ([shown] if names else [])
+    return " + ".join(parts) or L.t("cl.nothing", chat_id)
 
 
 async def cleancommand_cmd(update, context):
@@ -1650,12 +1610,7 @@ async def cleancommand_cmd(update, context):
     chat, msg = update.effective_chat, update.effective_message
     words = _words(context.args)
     if not words:
-        await msg.reply_html(
-            f"Currently deleting <b>{_esc(_describe_clean(chat.id))}</b> commands.\n\n"
-            "Usage:\n"
-            "1. /clean user: Delete a type: all, admin, user or other (see /cleancommandtypes).\n"
-            "2. /clean /roast: Delete one command by name.\n"
-            "3. /keep user: Stop deleting a type (or /keep /roast, /keep all).")
+        await msg.reply_html(L.t("cl.cmd_help", chat.id, desc=_esc(_describe_clean(chat.id))))
         return
     types = _load(chat.id, COMMAND_KEY, COMMAND_TYPES)
     names = set(_load_names(chat.id))
@@ -1670,21 +1625,20 @@ async def cleancommand_cmd(update, context):
         new_names, bad_names = parse_command_names(slash, context.bot.username)
         if bad or bad_names:
             shown = _esc(", ".join(bad + bad_names))
-            hint = " To delete one command, write it with a slash, for example /clean /roast." if bad else ""
-            await msg.reply_html(f"Unknown: <code>{shown}</code>\nTypes: all, {', '.join(COMMAND_TYPES)}. "
-                                 f"See /cleancommandtypes.{hint}")
+            hint = L.t("cl.hint_clean", chat.id) if bad else ""
+            await msg.reply_html(L.t("cl.cmd_unknown", chat.id, shown=shown, types=", ".join(COMMAND_TYPES), hint=hint))
             return
         if len(names | set(new_names)) > MAX_COMMAND_NAMES:
-            await msg.reply_html(f"❌ You can delete at most {MAX_COMMAND_NAMES} specific commands.")
+            await msg.reply_html(L.t("cl.max", chat.id, max=MAX_COMMAND_NAMES))
             return
         types = types | (set(COMMAND_TYPES) if "all" in plain else set(plain))
         names |= set(new_names)
     _save(chat.id, COMMAND_KEY, types, COMMAND_TYPES)
     _save_names(chat.id, names)
     if types or names:
-        await msg.reply_html(f"✅ I will now delete <b>{_esc(_describe_clean(chat.id))}</b> commands.")
+        await msg.reply_html(L.t("cl.cmd_ok", chat.id, desc=_esc(_describe_clean(chat.id))))
     else:
-        await msg.reply_html("✅ I will no longer delete any commands.")
+        await msg.reply_html(L.t("cl.cmd_none", chat.id))
 
 
 async def keepcommand_cmd(update, context):
@@ -1694,9 +1648,7 @@ async def keepcommand_cmd(update, context):
     chat, msg = update.effective_chat, update.effective_message
     words = _words(context.args)
     if not words:
-        await msg.reply_html("Usage:\n1. /keep user: Stop deleting a type: all, admin, user or other.\n"
-                             "2. /keep /roast: Stop deleting one command.\n"
-                             "See /cleancommandtypes for the types.")
+        await msg.reply_html(L.t("cl.keepcmd_usage", chat.id))
         return
     slash = [w for w in words if w.startswith("/")]
     plain = [w for w in words if not w.startswith("/")]
@@ -1704,9 +1656,8 @@ async def keepcommand_cmd(update, context):
     drop_names, bad_names = parse_command_names(slash, context.bot.username)
     if bad or bad_names:
         shown = _esc(", ".join(bad + bad_names))
-        hint = " To stop one command, write it with a slash, for example /keep /roast." if bad else ""
-        await msg.reply_html(f"Unknown: <code>{shown}</code>\nTypes: all, {', '.join(COMMAND_TYPES)}. "
-                             f"See /cleancommandtypes.{hint}")
+        hint = L.t("cl.hint_keep", chat.id) if bad else ""
+        await msg.reply_html(L.t("cl.cmd_unknown", chat.id, shown=shown, types=", ".join(COMMAND_TYPES), hint=hint))
         return
     types = _load(chat.id, COMMAND_KEY, COMMAND_TYPES)
     names = set(_load_names(chat.id))
@@ -1717,15 +1668,15 @@ async def keepcommand_cmd(update, context):
         names -= set(drop_names)
     _save(chat.id, COMMAND_KEY, types, COMMAND_TYPES)
     _save_names(chat.id, names)
-    kept = "all" if "all" in plain else ", ".join(plain + ["/" + n for n in drop_names])
-    left = f" Still deleting: <b>{_esc(_describe_clean(chat.id))}</b>." if (types or names) else ""
-    await msg.reply_html(f"✅ I will keep {_esc(kept)} commands.{left}")
+    kept = L.t("cl.all", chat.id) if "all" in plain else ", ".join(plain + ["/" + n for n in drop_names])
+    left = L.t("cl.still", chat.id, desc=_esc(_describe_clean(chat.id))) if (types or names) else ""
+    await msg.reply_html(L.t("cl.keepcmd_ok", chat.id, kept=_esc(kept), left=left))
 
 
 async def cleancommandtypes_cmd(update, context):
-    lines = ["<b>Command types</b>", ""] + [f"- <code>{n}</code>: {_esc(d)}" for n, d in COMMAND_INFO]
-    lines += ["- <code>/name</code>: Delete one specific command whatever its type, eg /clean /roast. "
-              "Stop it with /keep /roast."]
+    cid = update.effective_chat.id
+    lines = [L.t("cl.cmd_types_title", cid), ""] + [f"- <code>{n}</code>: {_esc(L.t('cl.ci_' + n, cid))}" for n in COMMAND_INFO]
+    lines += [L.t("cl.ci_name", cid)]
     await update.effective_message.reply_html("\n".join(lines))
 
 
@@ -1826,74 +1777,59 @@ async def clean_service_handler(update, context):
 # Button data: "ccb:<step>:<arg>":  add / rem (the two screens)   t:<type> / r:<type> (start / stop a type)
 #                                   sp (ask for a specific command)   rn:<name> (stop one specific command)
 CC_HOME = "help:cleancommand"
-CC_TYPE_LABELS = (("admin", "Admin"), ("user", "User"), ("other", "Other"))
+CC_TYPE_LABELS = ("admin", "user", "other")   # the button words are the lang keys "cl.t_<type>"
 CC_NAMES_SHOWN = 24          # saved specific commands shown as buttons on the Remove screen
 CC_TYPE_TTL = 300            # seconds the bot waits for the specific command to be typed
 _cc_pending = {}             # (chat id, user id) -> {"mid": panel message id, "ts": time, "warned": bool}
-_CC_TYPES_TEXT = ("• <b>Admin</b>: /ban, /mute, settings changes\n"
-                  "• <b>User</b>: /id, /info, /get\n"
-                  "• <b>Other</b>: unknown commands, or commands for other bots\n"
-                  "• <b>All</b>: every command")
 
 
 def _cc_status(chat):
     if chat is None or chat.type == "private":
-        return "Open /help inside a group to set up clean commands for that group."
-    return f"Now deleting: <b>{_esc(_describe_clean(chat.id))}</b>"
+        return L.t("cl.st_private", getattr(chat, "id", None))
+    return L.t("cl.st_now", chat.id, desc=_esc(_describe_clean(chat.id)))
 
 
 def _cc_home(chat):
-    text = ("<b>🧽 Clean Commands</b>\n\n"
-            "Keep your chat tidy: the bot deletes command messages after it has answered them.\n\n"
-            "• <b>➕ Add Command</b>: choose what to delete\n"
-            "• <b>➖ Remove</b>: stop deleting something\n\n"
-            f"{_cc_status(chat)}\n\n"
-            "Prefer typing? Use these commands (admins only):\n"
-            "1. /clean user: Delete user commands (or admin, other, all).\n"
-            "2. /clean /roast: Delete one specific command.\n"
-            "3. /keep user: Stop deleting user commands (or /keep /roast, /keep all).\n"
-            "4. /clean: Show what is being deleted now.\n\n"
-            "<b>Note:</b> The bot must be an admin with the \"Delete messages\" right.")
-    rows = [[InlineKeyboardButton("➕ Add Command", callback_data="ccb:add"),
-             InlineKeyboardButton("➖ Remove", callback_data="ccb:rem")],
-            [InlineKeyboardButton("📖 Usage Guide", callback_data="help:g_cleancommand")],
-            [InlineKeyboardButton("« Back", callback_data="help:main")]]
+    cid = getattr(chat, "id", None)
+    text = (L.t("cl.title", cid) + "\n\n" + L.t("cl.home_intro", cid) + "\n\n" + _cc_status(chat) + "\n\n" +
+            L.t("cl.home_type", cid))
+    rows = [[InlineKeyboardButton(L.t("cl.btn_add", cid), callback_data="ccb:add"),
+             InlineKeyboardButton(L.t("cl.btn_remove", cid), callback_data="ccb:rem")],
+            [InlineKeyboardButton(L.t("ac.btn_guide", cid), callback_data="help:g_cleancommand")],
+            [InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]]
     return text, InlineKeyboardMarkup(rows)
 
 
 def _cc_add_screen(chat, note=""):
     types = _load(chat.id, COMMAND_KEY, COMMAND_TYPES)
-    text = ("<b>➕ Add Command</b>\n\n" + (f"{note}\n\n" if note else "") + "Tap a type to start deleting it.\n\n"
-            f"{_CC_TYPES_TEXT}\n\n{_cc_status(chat)}")
-    rows = [[InlineKeyboardButton(("✅ " if t in types else "") + label, callback_data=f"ccb:t:{t}")
-             for t, label in CC_TYPE_LABELS],
-            [InlineKeyboardButton(("✅ " if set(COMMAND_TYPES) <= types else "") + "All", callback_data="ccb:t:all")],
-            [InlineKeyboardButton("🎯 Specific command", callback_data="ccb:sp")],
-            [InlineKeyboardButton("« Back", callback_data=CC_HOME)]]
+    text = (L.t("cl.add_title", chat.id) + "\n\n" + (f"{note}\n\n" if note else "") + L.t("cl.add_tap", chat.id) + "\n\n" +
+            L.t("cl.types_text", chat.id) + "\n\n" + _cc_status(chat))
+    rows = [[InlineKeyboardButton(("✅ " if t in types else "") + L.t("cl.t_" + t, chat.id), callback_data=f"ccb:t:{t}")
+             for t in CC_TYPE_LABELS],
+            [InlineKeyboardButton(("✅ " if set(COMMAND_TYPES) <= types else "") + L.t("cl.t_all", chat.id),
+                                  callback_data="ccb:t:all")],
+            [InlineKeyboardButton(L.t("cl.btn_specific", chat.id), callback_data="ccb:sp")],
+            [InlineKeyboardButton(L.t("pick.back", chat.id), callback_data=CC_HOME)]]
     return text, InlineKeyboardMarkup(rows)
 
 
 def _cc_remove_screen(chat, note=""):
     names = _load_names(chat.id)
-    more = (f"\n…and {len(names) - CC_NAMES_SHOWN} more: remove them with /keep /name."
-            if len(names) > CC_NAMES_SHOWN else "")
-    text = ("<b>➖ Remove</b>\n\n" + (f"{note}\n\n" if note else "") +
-            "Tap a type to stop deleting it. <b>All</b> stops everything." +
-            ("\nTap a saved command to stop deleting just that one." if names else "") + f"\n\n{_cc_status(chat)}{more}")
-    rows = [[InlineKeyboardButton("🚫 " + label, callback_data=f"ccb:r:{t}") for t, label in CC_TYPE_LABELS],
-            [InlineKeyboardButton("🚫 All", callback_data="ccb:r:all")]]
+    more = L.t("cl.rm_more", chat.id, n=len(names) - CC_NAMES_SHOWN) if len(names) > CC_NAMES_SHOWN else ""
+    text = (L.t("cl.rm_title", chat.id) + "\n\n" + (f"{note}\n\n" if note else "") + L.t("cl.rm_tap", chat.id) +
+            (L.t("cl.rm_tap_saved", chat.id) if names else "") + f"\n\n{_cc_status(chat)}{more}")
+    rows = [[InlineKeyboardButton("🚫 " + L.t("cl.t_" + t, chat.id), callback_data=f"ccb:r:{t}") for t in CC_TYPE_LABELS],
+            [InlineKeyboardButton("🚫 " + L.t("cl.t_all", chat.id), callback_data="ccb:r:all")]]
     shown = [InlineKeyboardButton(f"❌ /{n}", callback_data=f"ccb:rn:{n}") for n in names[:CC_NAMES_SHOWN]]
     rows += [shown[i:i + 3] for i in range(0, len(shown), 3)]
-    rows.append([InlineKeyboardButton("« Back", callback_data=CC_HOME)])
+    rows.append([InlineKeyboardButton(L.t("pick.back", chat.id), callback_data=CC_HOME)])
     return text, InlineKeyboardMarkup(rows)
 
 
-def _cc_ask_screen():
-    text = ("<b>🎯 Specific command</b>\n\n"
-            "Send the command you want to delete in this chat, for example <code>roast</code>, or several at once: "
-            "<code>roast hug</code>.\nWrite it without the slash so it doesn't run now (a slash works too).\n\n"
-            "I'll wait 5 minutes. Tap Back to cancel.")
-    return text, InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="ccb:add")]])
+def _cc_ask_screen(chat=None):
+    cid = getattr(chat, "id", None)
+    return (L.t("cl.ask_text", cid),
+            InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="ccb:add")]]))
 
 
 async def help_cleancommand_callback(update, context):
@@ -1921,10 +1857,10 @@ async def ccb_callback(update, context):
     act = parts[1] if len(parts) > 1 else ""
     arg = parts[2] if len(parts) > 2 else ""
     if chat.type == "private":
-        await q.answer("Open /help inside a group to set up clean commands for that group.", show_alert=True)
+        await q.answer(L.t("cl.st_private", chat.id), show_alert=True)
         return
     if not await _ac_allowed(chat, q.from_user.id):
-        await q.answer("Only group admins can change this.", show_alert=True)
+        await q.answer(L.t("cl.admin_only", chat.id), show_alert=True)
         return
     key = (chat.id, q.from_user.id)
     _cc_pending.pop(key, None)                         # any tap leaves the "type the command" state; sp sets it again
@@ -1941,49 +1877,49 @@ async def ccb_callback(update, context):
             for k in [k for k, v in _cc_pending.items() if now - v["ts"] > CC_TYPE_TTL]:
                 _cc_pending.pop(k, None)               # forget people who walked away
             _cc_pending[key] = {"mid": q.message.message_id, "ts": now, "warned": False}
-            await _ac_edit(q, *_cc_ask_screen())
+            await _ac_edit(q, *_cc_ask_screen(chat))
         elif act == "t" and len(parts) == 3 and arg in COMMAND_TYPES + ("all",):
             types = _load(chat.id, COMMAND_KEY, COMMAND_TYPES)
             new = set(COMMAND_TYPES) if arg == "all" else types | {arg}
             if new == types:
-                await q.answer("Already on.")
+                await q.answer(L.t("cl.t_already", chat.id))
                 return
             _save(chat.id, COMMAND_KEY, new, COMMAND_TYPES)
-            await q.answer("✅ Now deleting " + ("all" if arg == "all" else arg) + " commands.")
+            await q.answer(L.t("cl.t_done", chat.id, what=L.t("cl.all", chat.id) if arg == "all" else arg))
             await _ac_edit(q, *_cc_add_screen(chat))
         elif act == "r" and len(parts) == 3 and arg in COMMAND_TYPES + ("all",):
             types = _load(chat.id, COMMAND_KEY, COMMAND_TYPES)
             names = set(_load_names(chat.id))
             if arg == "all":
                 if not types and not names:
-                    await q.answer("Nothing is being deleted.")
+                    await q.answer(L.t("cl.r_nothing", chat.id))
                     return
                 _save(chat.id, COMMAND_KEY, set(), COMMAND_TYPES)
                 _save_names(chat.id, set())
-                await q.answer("✅ I will keep all commands.")
+                await q.answer(L.t("cl.r_all", chat.id))
             else:
                 if arg not in types:
-                    await q.answer("That type is not being deleted.")
+                    await q.answer(L.t("cl.r_not", chat.id))
                     return
                 _save(chat.id, COMMAND_KEY, types - {arg}, COMMAND_TYPES)
-                await q.answer(f"✅ I will keep {arg} commands.")
+                await q.answer(L.t("cl.r_type", chat.id, arg=arg))
             await _ac_edit(q, *_cc_remove_screen(chat))
         elif act == "rn" and len(parts) == 3 and _NAME_RE.fullmatch(arg):
             names = set(_load_names(chat.id))
             if arg not in names:
-                await q.answer("That command is no longer on the list.")
+                await q.answer(L.t("cl.rn_gone", chat.id))
             else:
                 _save_names(chat.id, names - {arg})
-                await q.answer(f"✅ I will keep /{arg}.")
+                await q.answer(L.t("cl.rn_ok", chat.id, arg=arg))
             await _ac_edit(q, *_cc_remove_screen(chat))
         else:
-            await q.answer("This button is no longer valid.", show_alert=True)
+            await q.answer(L.t("ac.invalid", chat.id), show_alert=True)
     except TelegramError:
         raise
     except Exception:
         log.exception("clean commands: button failed in %s", chat.id)
         try:
-            await q.answer("The database had a problem. Nothing was changed.", show_alert=True)
+            await q.answer(L.t("ac.db_problem", chat.id), show_alert=True)
         except TelegramError:
             pass
 
@@ -2005,9 +1941,9 @@ async def cc_message(update, context):
     current = set(_load_names(chat.id))
     problem = None
     if bad or not names:
-        problem = "I couldn't read that. Send a command name like roast, or several like roast hug."
+        problem = L.t("cl.msg_bad", chat.id)
     elif len(current | set(names)) > MAX_COMMAND_NAMES:
-        problem = f"You can delete at most {MAX_COMMAND_NAMES} specific commands. Tap Back to cancel."
+        problem = L.t("cl.msg_max", chat.id, max=MAX_COMMAND_NAMES)
     if problem:
         if not pending["warned"]:
             pending["warned"] = True
@@ -2022,11 +1958,11 @@ async def cc_message(update, context):
     except Exception:
         log.exception("clean commands: saving specific commands failed in %s", chat.id)
         try:
-            await msg.reply_text("The database had a problem. Nothing was changed.")
+            await msg.reply_text(L.t("ac.db_problem", chat.id))
         except TelegramError:
             pass
         return
-    text, markup = _cc_add_screen(chat, "✅ Added: " + ", ".join("/" + n for n in names))
+    text, markup = _cc_add_screen(chat, L.t("cl.added", chat.id, names=", ".join("/" + n for n in names)))
     try:
         await context.bot.edit_message_text(text, chat_id=chat.id, message_id=pending["mid"], parse_mode="HTML",
                                             reply_markup=markup, disable_web_page_preview=True)
@@ -2092,14 +2028,14 @@ def _module_of(key):
     return None
 
 
-def _parse_modules(args):
+def _parse_modules(args, chat_id=None):
     """(modules or None, error text or None). None = every module."""
     if not args:
         return None, None
     names = [a.lower().strip(",") for a in args if a.strip(",")]
     bad = [n for n in names if n not in MODULES]
     if bad:
-        return None, ("Unknown module: " + ", ".join(bad) + "\nAvailable: " + ", ".join(ORDER))
+        return None, L.t("ie.unknown_module", chat_id, bad=", ".join(bad), order=", ".join(ORDER))
     return list(dict.fromkeys(names)), None
 
 
@@ -2176,9 +2112,9 @@ async def _send_export(chat, msg, bot, modules, reply_to=None):
     buf.name = f"{safe}_settings.json"
     chosen = modules or ORDER
     empty = [m for m in chosen if m not in data]
-    caption = ("📤 Exported: " + (", ".join(data) or "nothing") + "."
-               + (f"\nNothing saved / not used here: {', '.join(empty)}." if empty and not modules else "")
-               + "\nImport it in another group: reply to this file with /import (group creator only).")
+    caption = (L.t("ie.cap_exported", chat.id, done=", ".join(data) or L.t("cl.nothing", chat.id))
+               + (L.t("ie.cap_empty", chat.id, empty=", ".join(empty)) if empty and not modules else "")
+               + L.t("ie.cap_import", chat.id))
     await bot.send_document(chat.id, buf, filename=buf.name, caption=caption[:1000],
                             reply_to_message_id=reply_to, allow_sending_without_reply=True)
 
@@ -2187,24 +2123,24 @@ async def export_cmd(update, context):
     chat, msg, user = update.effective_chat, update.effective_message, update.effective_user
     if not msg or chat.type == "private":
         if msg:
-            await msg.reply_text("Use /export inside the group you want to export.")
+            await msg.reply_text(L.t("ie.use_export"))
         return
     if not await _is_admin(chat, user):
-        await msg.reply_text("Only admins can export the settings.")
+        await msg.reply_text(L.t("ie.admin_export", chat.id))
         return
-    modules, err = _parse_modules(context.args)
+    modules, err = _parse_modules(context.args, chat.id)
     if err:
         await msg.reply_text(err)
         return
     wait = _cooldown(chat.id)
     if wait:
-        await msg.reply_text(f"⏳ Slow down: try again in {wait}s.")
+        await msg.reply_text(L.t("ie.slow", chat.id, wait=wait))
         return
     try:
         await _send_export(chat, msg, context.bot, modules, reply_to=msg.message_id)
     except Exception:
         log.exception("export failed")
-        await msg.reply_text("⚠️ The export failed. Please try again later.")
+        await msg.reply_text(L.t("ie.export_fail", chat.id))
 
 
 # ------------------------------------------------------------------ import
@@ -2262,50 +2198,49 @@ async def import_cmd(update, context):
     if not msg:
         return
     if chat.type == "private":
-        await msg.reply_text("Use /import inside the group you want to import into.")
+        await msg.reply_text(L.t("ie.use_import"))
         return
     if not await _is_creator(chat, user):
-        await msg.reply_text("For security, only the group creator can import settings "
-                             "(and not while posting anonymously).")
+        await msg.reply_text(L.t("ie.creator_import", chat.id))
         return
     doc = msg.reply_to_message.document if msg.reply_to_message else None
     if doc is None:
-        await msg.reply_text("Reply to an exported settings file with /import.\n"
-                             "To import only some modules: /import rules greetings")
+        await msg.reply_text(L.t("ie.reply_import", chat.id))
         return
     if (doc.file_size or 0) > MAX_FILE_BYTES:
-        await msg.reply_text("⚠️ That file is too big to be a settings export.")
+        await msg.reply_text(L.t("ie.too_big", chat.id))
         return
-    wanted, err = _parse_modules(context.args)
+    wanted, err = _parse_modules(context.args, chat.id)
     if err:
         await msg.reply_text(err)
         return
     wait = _cooldown(chat.id)
     if wait:
-        await msg.reply_text(f"⏳ Slow down: try again in {wait}s.")
+        await msg.reply_text(L.t("ie.slow", chat.id, wait=wait))
         return
     try:
         raw = bytes(await (await context.bot.get_file(doc.file_id)).download_as_bytearray())
         payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict) or payload.get("format") != FORMAT:
-            raise ValueError("This is not a settings file exported by this bot.")
+            raise ValueError(L.t("ie.not_file", chat.id))
         done, notes = await asyncio.to_thread(_apply, chat.id, wanted, payload)
     except (ValueError, UnicodeDecodeError) as e:
-        await msg.reply_text(f"⚠️ I couldn't read that file: {e}")
+        await msg.reply_text(L.t("ie.read_fail", chat.id, e=e))
         return
     except TelegramError:
-        await msg.reply_text("⚠️ I couldn't download that file.")
+        await msg.reply_text(L.t("ie.dl_fail", chat.id))
         return
     except Exception:
         log.exception("import failed")
-        await msg.reply_text("⚠️ The import failed. Nothing more was changed.")
+        await msg.reply_text(L.t("ie.import_fail", chat.id))
         return
     if not done:
-        await msg.reply_text("Nothing to import: the file has no data for " + (", ".join(wanted) if wanted else "any module") + ".")
+        await msg.reply_text(L.t("ie.nothing", chat.id, what=", ".join(wanted) if wanted else L.t("ie.any_module", chat.id)))
         return
-    lines = ["✅ <b>Imported</b>"] + [f"• {html.escape(m)}: {n} item{'s' if n != 1 else ''}" for m, n in done.items()]
+    lines = [L.t("ie.imported", chat.id)] + [L.t("ie.item_one" if n == 1 else "ie.item_many", chat.id, m=html.escape(m), n=n)
+                                             for m, n in done.items()]
     if notes:
-        lines.append("\nSkipped: " + html.escape("; ".join(notes[:5])))
+        lines.append(L.t("ie.skipped", chat.id, notes=html.escape("; ".join(notes[:5]))))
     await msg.reply_html("\n".join(lines))
 
 
@@ -2330,17 +2265,14 @@ async def reset_cmd(update, context):
     if not msg:
         return
     if chat.type == "private":
-        await msg.reply_text("Use /reset inside a group.")
+        await msg.reply_text(L.t("ie.use_reset"))
         return
     if not await _is_creator(chat, user):
-        await msg.reply_text("Only the group creator can reset the settings (and not while posting anonymously).")
+        await msg.reply_text(L.t("ie.creator_reset", chat.id))
         return
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, reset", callback_data=f"ie:rst:y:{user.id}"),
-                                InlineKeyboardButton("❌ Cancel", callback_data=f"ie:rst:n:{user.id}")]])
-    await msg.reply_html("⚠️ <b>Reset all settings of this group?</b>\n\nThis removes the saved configuration: rules, "
-                         "greetings, locks, filters, notes, blocklist, warn settings, antiflood and the other modules "
-                         "listed in /help > Import & Export. Members' data (warnings, approvals, message counts) is kept. "
-                         "This can't be undone. Tip: /export first.", reply_markup=kb)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(L.t("ie.yes_reset", chat.id), callback_data=f"ie:rst:y:{user.id}"),
+                                InlineKeyboardButton(L.t("ie.cancel", chat.id), callback_data=f"ie:rst:n:{user.id}")]])
+    await msg.reply_html(L.t("ie.reset_ask", chat.id), reply_markup=kb)
 
 
 # ------------------------------------------------------------------ the buttons on /help page 2
@@ -2354,46 +2286,45 @@ async def ie_callback(update, context):
         return
     if act == "rst":                                           # reset confirmation (only the person who asked)
         if len(parts) < 4 or not parts[3].isdigit() or int(parts[3]) != user.id:
-            await q.answer("Only the person who started the reset can answer.", show_alert=True)
+            await q.answer(L.t("ie.reset_only_asker", chat.id), show_alert=True)
             return
         if parts[2] != "y":
-            await q.answer("Cancelled.")
-            await q.edit_message_text("Reset cancelled. Nothing was changed.")
+            await q.answer(L.t("ie.cancelled", chat.id))
+            await q.edit_message_text(L.t("ie.reset_cancelled", chat.id))
             return
         if not await _is_creator(chat, user):
-            await q.answer("Only the group creator can do this.", show_alert=True)
+            await q.answer(L.t("ie.creator_only", chat.id), show_alert=True)
             return
         await q.answer()
         try:
             await asyncio.to_thread(_wipe, chat.id)
-            await q.edit_message_text("✅ This group's settings were reset.")
+            await q.edit_message_text(L.t("ie.reset_done", chat.id))
         except Exception:
             log.exception("reset failed")
-            await q.edit_message_text("⚠️ The reset failed part-way. Please run /reset again.")
+            await q.edit_message_text(L.t("ie.reset_fail", chat.id))
         return
     if await extra.menu_not_owner(q):                           # help buttons belong to who opened /help
         return
     if act == "imp":
-        await q.answer("To import: reply to an exported .json file with /import (group creator only). "
-                       "To import only some modules: /import rules greetings", show_alert=True)
+        await q.answer(L.t("ie.imp_help", chat.id), show_alert=True)
         return
     if act == "exp":
         if chat.type == "private":
-            await q.answer("Open /help inside the group you want to export.", show_alert=True)
+            await q.answer(L.t("ie.open_help_export"), show_alert=True)
             return
         if not await _is_admin(chat, user):
-            await q.answer("Only admins can export the settings.", show_alert=True)
+            await q.answer(L.t("ie.admin_export", chat.id), show_alert=True)
             return
         wait = _cooldown(chat.id)
         if wait:
-            await q.answer(f"Slow down: try again in {wait}s.", show_alert=True)
+            await q.answer(L.t("ie.slow_short", chat.id, wait=wait), show_alert=True)
             return
-        await q.answer("Exporting...")
+        await q.answer(L.t("ie.exporting", chat.id))
         try:
             await _send_export(chat, q.message, context.bot, None)
         except Exception:
             log.exception("export (button) failed")
-            await context.bot.send_message(chat.id, "⚠️ The export failed. Please try again later.")
+            await context.bot.send_message(chat.id, L.t("ie.export_fail", chat.id))
         return
     await q.answer()
 

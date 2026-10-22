@@ -56,6 +56,10 @@ from telegram.ext import (
 
 import extra  # reused: menu ownership lock (remember_menu_owner / menu_not_owner)
 import migrate_to_mongo as M  # the one MongoDB connection of the bot
+try:
+    from lang import lang as L   # the language system (lang/lang.py): English and Hinglish texts
+except ImportError:
+    import lang as L             # lang.py uploaded next to this file instead of inside a lang/ folder
 
 log = logging.getLogger("msgcount")
 
@@ -79,9 +83,14 @@ MAX_DELIVERY_ATTEMPTS = 10
 MAX_CUSTOM = 9_999_999_999          # largest custom count the Bot Owner can set
 CC_PAGE = 8                         # groups per page in the owner's group list
 _OWNERS = frozenset()               # Bot Owner IDs (OWNER_IDS of nova.py), set by register(); empty = nobody
-NO_DB = "⚠️ Message count data is temporarily unavailable. Please try again in a moment."
-GROUP_ONLY = "This command only works in groups."
+NO_DB = "⚠️ Message count data is temporarily unavailable. Please try again in a moment."   # owner (private chat) screens
 ADMIN_ONLY = "Only this group's owner or administrators can do this."
+
+
+def _t(key, chat=None, **values):
+    """The text for `key` in the group's language. `chat` is a chat object, a chat id or a group document."""
+    cid = chat.get("chat_id") if isinstance(chat, dict) else getattr(chat, "id", chat)
+    return L.t(key, cid, **values)
 
 
 # ------------------------------------------------------------------ pure helpers
@@ -512,13 +521,8 @@ def _finish_sync(chat_id, milestone, ok, now, delay=None, error=None, permanent=
 
 def _milestone_text(d):
     when = _ist(d["reached_at"].replace(tzinfo=timezone.utc) if d["reached_at"].tzinfo is None else d["reached_at"])
-    return ("🎉 <b>GROUP MESSAGE MILESTONE!</b>\n\n"
-            f"👥 <b>Group:</b> {_esc(d.get('group_name'), 64)}\n\n"
-            f"💬 <b>Total Group Messages:</b> {int(d['total']):,}\n\n"
-            f"🏆 <b>Milestone:</b> {int(d['milestone']):,} Messages Reached!\n\n"
-            f"📅 <b>Date:</b> {when.strftime('%d %B %Y')}\n\n"
-            f"🕒 <b>Time:</b> {when.strftime('%I:%M %p')} IST\n\n"
-            "Congratulations! 🎊\nKeep chatting! 💬")
+    return _t("mc.ms_total", d.get("chat_id"), group=_esc(d.get('group_name'), 64), total=f"{int(d['total']):,}",
+              milestone=f"{int(d['milestone']):,}", date=when.strftime('%d %B %Y'), time=when.strftime('%I:%M %p'))
 
 
 # ------------------------------------------------------------------ Today's message outbox (same rules as above)
@@ -550,13 +554,8 @@ def _finish_today_sync(chat_id, day, milestone, ok, now, delay=None, error=None,
 
 def _today_text(d):
     when = _ist(d["reached_at"].replace(tzinfo=timezone.utc) if d["reached_at"].tzinfo is None else d["reached_at"])
-    return ("🎉 <b>TODAY'S MESSAGE</b>\n\n"
-            f"👥 <b>Group:</b> {_esc(d.get('group_name'), 64)}\n\n"
-            f"✅ <b>Today's Messages:</b> {int(d['milestone']):,} Reached!\n\n"
-            f"💬 <b>Total Group Messages:</b> {int(d['total']):,}\n\n"
-            f"📅 <b>Date:</b> {when.strftime('%d %B %Y')}\n\n"
-            f"🕒 <b>Time:</b> {when.strftime('%I:%M %p')} IST\n\n"
-            "Keep chatting! 💬")
+    return _t("mc.ms_today", d.get("chat_id"), group=_esc(d.get('group_name'), 64), total=f"{int(d['total']):,}",
+              milestone=f"{int(d['milestone']):,}", date=when.strftime('%d %B %Y'), time=when.strftime('%I:%M %p'))
 
 
 async def _finish_today(chat_id, day, milestone, ok, **kw):
@@ -747,8 +746,8 @@ def _next_today(g):
     return (last // n + 1) * n
 
 
-def _state(on):
-    return "✅ ON" if on else "❌ OFF"
+def _state(on, chat=None):
+    return _t("mc.state_on" if on else "mc.state_off", chat)
 
 
 def _dash_text(title, g, commands=True):
@@ -757,107 +756,76 @@ def _dash_text(title, g, commands=True):
     nxt = next_milestone(last, initial, interval)
     on = g.get("enabled", True) is not False
     today, nxt_day = _today_count(g), _next_today(g)
-    today_lines = (f"✅ <b>Today's Group Messages:</b> {today:,}\n\n"
-                   + (f"🎯 <b>Next Today Milestone:</b> {nxt_day:,} ({max(nxt_day - today, 0):,} to go)\n\n"
-                      if _dm_on(g) else "🎯 <b>Today's Message:</b> OFF\n\n"))
-    return ("📊 <b>GROUP MESSAGE COUNT</b>\n\n"
-            f"👥 <b>Group:</b> {_esc(title, 64)}\n\n"
-            f"💬 <b>Total Group Messages:</b> {total:,}\n\n"
-            f"⚙️ <b>Milestone Interval:</b> Every {interval:,} messages\n\n"
-            f"🏆 <b>Last Milestone:</b> {f'{last:,}' if last else 'None yet'}\n\n"
-            f"🎯 <b>Next Milestone:</b> {nxt:,}{'' if _tm_on(g) else ' (message OFF)'}\n\n"
-            f"📨 <b>Messages Until Next Milestone:</b> {max(nxt - total, 0):,}\n\n"
-            + today_lines +
-            f"🔔 <b>Message Counting:</b> {'ON' if on else 'OFF'}"
-            + ("\n\n📖 <b>Commands</b>\n"
-               "/rank (or /top) — leaderboard\n"
-               "/today — today's leaderboard\n"
-               "/week — this week's leaderboard\n"
-               "/overall — all-time leaderboard\n"
-               "/me — your messages and rank\n"
-               "/radmin — admins' message count today\n"
-               "/mtoday — today's message setting\n"
-               "/mtotal — total milestone setting\n"
-               "/resetrank — reset this group's counts (admins only)" if commands else ""))
+    today_lines = (_t("mc.dash_today_on", g, today=f"{today:,}", next=f"{nxt_day:,}", left=f"{max(nxt_day - today, 0):,}")
+                   if _dm_on(g) else _t("mc.dash_today_off", g, today=f"{today:,}"))
+    return (_t("mc.dash", g, group=_esc(title, 64), total=f"{total:,}", interval=f"{interval:,}",
+               last=f"{last:,}" if last else _t("mc.none_yet", g), next=f"{nxt:,}",
+               next_note="" if _tm_on(g) else _t("mc.next_off", g), until=f"{max(nxt - total, 0):,}",
+               today_lines=today_lines, counting=_t("mc.on" if on else "mc.off", g))
+            + (_t("mc.dash_cmds", g) if commands else ""))
 
 
 def _dash_kb(g):
     on = g.get("enabled", True) is not False
     return KB([
-        [B("🏆 Overall Leaderboard", callback_data="mc:b:all:0")],
-        [B("✅ Today", callback_data="mc:b:today:0"), B("📅 Week", callback_data="mc:b:week:0")],
-        [B("📊 View Complete Leaderboard", callback_data="mc:b:full:0")],
-        [B("⚙️ Milestone Settings", callback_data="mc:s")],
-        [B("✅ Message Count: ON" if on else "❌ Message Count: OFF", callback_data=f"mc:t:{0 if on else 1}")],
-        [B("🔙 Back", callback_data="help:main")],
+        [B(_t("mc.b_overall_long", g), callback_data="mc:b:all:0")],
+        [B(_t("mc.b_today", g), callback_data="mc:b:today:0"), B(_t("mc.b_week", g), callback_data="mc:b:week:0")],
+        [B(_t("mc.b_full", g), callback_data="mc:b:full:0")],
+        [B(_t("mc.b_settings", g), callback_data="mc:s")],
+        [B(_t("mc.b_count_on" if on else "mc.b_count_off", g), callback_data=f"mc:t:{0 if on else 1}")],
+        [B(_t("mc.b_back", g), callback_data="help:main")],
     ])
 
 
 def _menu_text(title, g):
     """⚙️ Milestone Settings: the two separate messages, each with its own switch and interval."""
-    return ("⚙️ <b>GROUP MILESTONE SETTINGS</b>\n\n"
-            f"👥 <b>Group:</b> {_esc(title, 64)}\n\n"
-            f"📊 <b>Total milestone:</b> {_state(_tm_on(g))} · every {int(g.get('interval', DEFAULT_INTERVAL)):,} messages\n\n"
-            f"✅ <b>Today's message:</b> {_state(_dm_on(g))} · every {_dm_interval(g):,} messages\n\n"
-            "Tap a button to change that one. Each one sends its own message.\n\n"
-            "📖 These settings are changed with the buttons below (group admins only). "
-            "/resetrank resets this group's counts.")
+    return _t("mc.menu", g, group=_esc(title, 64), total_state=_state(_tm_on(g), g),
+              total_n=f"{int(g.get('interval', DEFAULT_INTERVAL)):,}", today_state=_state(_dm_on(g), g),
+              today_n=f"{_dm_interval(g):,}")
 
 
-def _menu_kb():
-    return KB([[B("📊 Total", callback_data="mc:st"), B("✅ Today", callback_data="mc:sd")],
-               [B("🔙 Back", callback_data="mc:d")]])
+def _menu_kb(g=None):
+    return KB([[B(_t("mc.b_total", g), callback_data="mc:st"), B(_t("mc.b_today", g), callback_data="mc:sd")],
+               [B(_t("mc.b_back", g), callback_data="mc:d")]])
 
 
 def _settings_text(title, g, draft):
     """📊 Total milestone screen."""
     saved = int(g.get("interval", DEFAULT_INTERVAL))
-    note = "" if draft == saved else "\n\n<i>Not saved yet. Tap 💾 Save Settings to apply it.</i>"
-    return ("📊 <b>TOTAL MILESTONE</b>\n\n"
-            f"👥 <b>Group:</b> {_esc(title, 64)}\n\n"
-            "Sends 🎉 GROUP MESSAGE MILESTONE! when the group's total reaches a milestone.\n\n"
-            f"🔔 <b>Status:</b> {_state(_tm_on(g))}\n\n"
-            f"📊 <b>Initial Milestone:</b> {int(g.get('initial', DEFAULT_INITIAL)):,} messages\n\n"
-            f"⚙️ <b>Current Interval:</b> {draft:,} messages{note}\n\n"
-            "📖 These settings are changed with the buttons below (group admins only). "
-            "/resetrank resets this group's counts.")
+    note = "" if draft == saved else _t("mc.not_saved", g)
+    return _t("mc.total_screen", g, group=_esc(title, 64), status=_state(_tm_on(g), g),
+              initial=f"{int(g.get('initial', DEFAULT_INITIAL)):,}", draft=f"{draft:,}", note=note)
 
 
 def _settings_kb(g, draft):
     on = _tm_on(g)
     return KB([
-        [B(f"{_state(on)} · Total milestone", callback_data=f"mc:tt:{0 if on else 1}")],
-        [B("➖ Decrease Interval", callback_data=f"mc:si:{max(draft - _step(draft, False), MIN_INTERVAL)}"),
-         B("➕ Increase Interval", callback_data=f"mc:si:{min(draft + _step(draft), MAX_INTERVAL)}")],
-        [B("✏️ Set Custom Interval", callback_data="mc:sc")],
-        [B("💾 Save Settings", callback_data=f"mc:ss:{draft}")],
-        [B("🔙 Back", callback_data="mc:s")],
+        [B(_t("mc.b_sw_total", g, state=_state(on, g)), callback_data=f"mc:tt:{0 if on else 1}")],
+        [B(_t("mc.b_dec", g), callback_data=f"mc:si:{max(draft - _step(draft, False), MIN_INTERVAL)}"),
+         B(_t("mc.b_inc", g), callback_data=f"mc:si:{min(draft + _step(draft), MAX_INTERVAL)}")],
+        [B(_t("mc.b_custom", g), callback_data="mc:sc")],
+        [B(_t("mc.b_save", g), callback_data=f"mc:ss:{draft}")],
+        [B(_t("mc.b_back", g), callback_data="mc:s")],
     ])
 
 
 def _day_text(title, g, draft):
     """✅ Today's message screen."""
     saved = _dm_interval(g)
-    note = "" if draft == saved else "\n\n<i>Not saved yet. Tap 💾 Save Settings to apply it.</i>"
-    return ("✅ <b>TODAY'S MESSAGE</b>\n\n"
-            f"👥 <b>Group:</b> {_esc(title, 64)}\n\n"
-            f"Sends 🎉 TODAY'S MESSAGE every {draft:,} messages counted today (for example {draft:,}, {draft * 2:,}, "
-            f"{draft * 3:,}). The count starts again at midnight IST.\n\n"
-            f"🔔 <b>Status:</b> {_state(_dm_on(g))}\n\n"
-            f"✅ <b>Today's Group Messages so far:</b> {_today_count(g):,}\n\n"
-            f"⚙️ <b>Current Interval:</b> {draft:,} messages{note}\n\n"
-            "📖 These settings are changed with the buttons below (group admins only).")
+    note = "" if draft == saved else _t("mc.not_saved", g)
+    return _t("mc.day_screen", g, group=_esc(title, 64), draft=f"{draft:,}", d1=f"{draft:,}", d2=f"{draft * 2:,}",
+              d3=f"{draft * 3:,}", status=_state(_dm_on(g), g), today=f"{_today_count(g):,}", note=note)
 
 
 def _day_kb(g, draft):
     on = _dm_on(g)
     return KB([
-        [B(f"{_state(on)} · Today's message", callback_data=f"mc:dt:{0 if on else 1}")],
-        [B("➖ Decrease Interval", callback_data=f"mc:di:{max(draft - _step(draft, False), MIN_INTERVAL)}"),
-         B("➕ Increase Interval", callback_data=f"mc:di:{min(draft + _step(draft), MAX_INTERVAL)}")],
-        [B("✏️ Set Custom Interval", callback_data="mc:dc")],
-        [B("💾 Save Settings", callback_data=f"mc:ds:{draft}")],
-        [B("🔙 Back", callback_data="mc:s")],
+        [B(_t("mc.b_sw_today", g, state=_state(on, g)), callback_data=f"mc:dt:{0 if on else 1}")],
+        [B(_t("mc.b_dec", g), callback_data=f"mc:di:{max(draft - _step(draft, False), MIN_INTERVAL)}"),
+         B(_t("mc.b_inc", g), callback_data=f"mc:di:{min(draft + _step(draft), MAX_INTERVAL)}")],
+        [B(_t("mc.b_custom", g), callback_data="mc:dc")],
+        [B(_t("mc.b_save", g), callback_data=f"mc:ds:{draft}")],
+        [B(_t("mc.b_back", g), callback_data="mc:s")],
     ])
 
 
@@ -866,48 +834,49 @@ _KIND_TITLE = {"all": "🏆 Overall", "full": "📊 Complete Leaderboard", "toda
 
 
 def _chat_title_of(title, data):
-    return title or data["group"].get("name") or "this group"
+    return title or data["group"].get("name") or _t("mc.this_group", data["group"])
 
 
 def _board_text(title, kind, data):
     today, wk0, wk1 = periods()
-    sub = _KIND_TITLE[kind]
+    g = data["group"]
+    sub = _t("mc.k_" + kind, g)
     if kind == "today":
         sub += f" ({today} IST)"
     elif kind == "week":
-        sub += f" ({wk0} to {wk1}, IST)"
-    lines = [_dash_text(_chat_title_of(title, data), data["group"], commands=False), "", "📈 <b>LEADERBOARD</b>", "", sub, ""]
+        sub += _t("mc.week_range", g, start=wk0, end=wk1)
+    lines = [_dash_text(_chat_title_of(title, data), g, commands=False), "", _t("mc.board_head", g), "", sub, ""]
     if not data["rows"]:
-        lines.append("No messages recorded yet for this period.")
+        lines.append(_t("mc.board_none", g))
     base = data["page"] * data["size"]
     for i, (uid, name, n) in enumerate(data["rows"], start=base + 1):
-        shown = (data.get("marks") or {}).get(uid) or _esc(name or f"User {uid}")
+        shown = (data.get("marks") or {}).get(uid) or _esc(name or _t("mc.user_n", g, uid=uid))
         lines.append(f"{_MEDALS.get(i, f'{i}.')} {shown} — {n:,}")
     if data["pages"] > 1:
-        lines += ["", f"Page {data['page'] + 1}/{data['pages']}"]
-    lines += ["", "📖 <b>Commands</b>", "/rank (or /top): all-time leaderboard", "/today: today's leaderboard",
-              "/week: this week's leaderboard", "/me: your messages and rank"]
+        lines += ["", _t("mc.page", g, page=data["page"] + 1, pages=data["pages"])]
+    lines += ["", _t("mc.board_cmds", g)]
     return "\n".join(lines)
 
 
 def _board_kb(kind, data):
+    g = data["group"]
     rows = []
     if data["pages"] > 1:
         nav = []
         if data["page"] > 0:
-            nav.append(B("⬅️ Prev", callback_data=f"mc:b:{kind}:{data['page'] - 1}"))
+            nav.append(B(_t("mc.b_prev", g), callback_data=f"mc:b:{kind}:{data['page'] - 1}"))
         if data["page"] < data["pages"] - 1:
-            nav.append(B("Next ➡️", callback_data=f"mc:b:{kind}:{data['page'] + 1}"))
+            nav.append(B(_t("mc.b_next", g), callback_data=f"mc:b:{kind}:{data['page'] + 1}"))
         rows.append(nav)
-    rows += [[B("🏆 Overall", callback_data="mc:b:all:0")],
-             [B("✅ Today", callback_data="mc:b:today:0"), B("📅 Week", callback_data="mc:b:week:0")],
-             [B("📊 View Complete Leaderboard", callback_data="mc:b:full:0")],
-             [B("🔙 Back", callback_data="mc:d")]]
+    rows += [[B(_t("mc.b_overall", g), callback_data="mc:b:all:0")],
+             [B(_t("mc.b_today", g), callback_data="mc:b:today:0"), B(_t("mc.b_week", g), callback_data="mc:b:week:0")],
+             [B(_t("mc.b_full", g), callback_data="mc:b:full:0")],
+             [B(_t("mc.b_back", g), callback_data="mc:d")]]
     return KB(rows)
 
 
 def _chat_title(chat, g=None):
-    return (chat.title or (g or {}).get("name") or "this group")
+    return (chat.title or (g or {}).get("name") or _t("mc.this_group", g or chat))
 
 
 async def _edit(q, text, markup):
@@ -926,7 +895,7 @@ async def _group_chat_or_reject(update):
     if chat is None or msg is None:
         return None
     if chat.type not in GROUP_TYPES:
-        await msg.reply_text(GROUP_ONLY)
+        await msg.reply_text(_t("mc.group_only", chat))
         return None
     return chat
 
@@ -938,12 +907,11 @@ async def rank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _milestone_status(g, which):
     if which == "day":
-        return (f"✅ <b>Today's message:</b> {_state(_dm_on(g))} · every {_dm_interval(g):,} messages\n"
-                f"Today so far: {_today_count(g):,} · next: {_next_today(g):,}")
+        return _t("mc.st_day", g, state=_state(_dm_on(g), g), n=f"{_dm_interval(g):,}", today=f"{_today_count(g):,}",
+                  next=f"{_next_today(g):,}")
     interval = int(g.get("interval", DEFAULT_INTERVAL))
     nxt = next_milestone(int(g.get("last_milestone", 0)), int(g.get("initial", DEFAULT_INITIAL)), interval)
-    return (f"📊 <b>Total milestone:</b> {_state(_tm_on(g))} · every {interval:,} messages\n"
-            f"Total: {active_count(g):,} · next: {nxt:,}")
+    return _t("mc.st_total", g, state=_state(_tm_on(g), g), n=f"{interval:,}", total=f"{active_count(g):,}", next=f"{nxt:,}")
 
 
 async def _milestone_cmd(update, context, which):
@@ -955,26 +923,24 @@ async def _milestone_cmd(update, context, which):
     msg, user = update.effective_message, update.effective_user
     name = "mtoday" if which == "day" else "mtotal"
     args = [a.lower() for a in context.args]
-    usage = (f"1. /{name} 300: Send the {'today' if which == 'day' else 'total'} message every 300 messages.\n"
-             f"2. /{name} off: Turn it off (on turns it on).\n"
-             f"3. /{name}: Show the setting.\n"
-             f"Interval: {MIN_INTERVAL:,} to {MAX_INTERVAL:,}.")
+    usage = _t("mc.ms_usage", chat, name=name, kind=_t("mc.kind_today" if which == "day" else "mc.kind_total", chat),
+               min=f"{MIN_INTERVAL:,}", max=f"{MAX_INTERVAL:,}")
     value = None
     if args:
         if len(args) != 1 or (args[0] not in ("on", "off") and not (re.fullmatch(r"[0-9]{1,7}", args[0]) and
                                                                       MIN_INTERVAL <= int(args[0]) <= MAX_INTERVAL)):
-            await msg.reply_text(("I couldn't read that.\n\n" if args[0:1] not in (["on"], ["off"]) else "") + usage)
+            await msg.reply_text((_t("mc.cant_read", chat) if args[0:1] not in (["on"], ["off"]) else "") + usage)
             return
         value = args[0]
         anonymous = user is None or user.id == ANON_ADMIN_ID or (msg.sender_chat is not None and msg.sender_chat.id == chat.id)
         if anonymous:
             if not (msg.sender_chat is not None and msg.sender_chat.id == chat.id):
-                await msg.reply_text(ADMIN_ONLY)
+                await msg.reply_text(_t("mc.admin_only", chat))
                 return
         else:
             ok = await _is_group_admin(context.bot, chat.id, user.id)
             if ok is not True:
-                await msg.reply_text(ADMIN_ONLY if ok is False else "I couldn't verify your permissions right now. Nothing was changed.")
+                await msg.reply_text(_t("mc.admin_only", chat) if ok is False else _t("mc.cant_verify", chat))
                 return
     try:
         if value in ("on", "off"):
@@ -987,9 +953,9 @@ async def _milestone_cmd(update, context, which):
             g = await asyncio.to_thread(_group_sync, chat.id)
     except PyMongoError:
         log.exception("msgcount: /%s failed in %s", name, chat.id)
-        await msg.reply_text(NO_DB)
+        await msg.reply_text(_t("mc.no_db", chat))
         return
-    head = "✅ <b>Saved.</b>\n" if value is not None else ""
+    head = _t("mc.saved_head", chat) if value is not None else ""
     await msg.reply_html(head + _milestone_status(g, which) + ("" if value is not None else "\n\n" + usage))
 
 
@@ -1014,14 +980,13 @@ async def count_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_html(text, reply_markup=kb)
         return
     if chat.type not in GROUP_TYPES:
-        await msg.reply_html("📊 <b>Message Count</b>\n\nMessage statistics are tracked separately for every group, so they "
-                             "can only be viewed inside a group. Send /count in a group to see its message count.")
+        await msg.reply_html(_t("mc.private_cmd", chat))
         return
     try:
         g = await asyncio.to_thread(_group_sync, chat.id)
     except PyMongoError:
         log.exception("msgcount: /count failed in %s", chat.id)
-        await msg.reply_text(NO_DB)
+        await msg.reply_text(_t("mc.no_db", chat))
         return
     sent = await msg.reply_html(_dash_text(_chat_title(chat, g), g), reply_markup=_dash_kb(g),
                                 disable_web_page_preview=True)
@@ -1045,7 +1010,7 @@ async def _send_board(update, kind):
         data = await asyncio.to_thread(_board_sync, chat.id, kind, 0)
     except PyMongoError:
         log.exception("msgcount: leaderboard failed in %s", chat.id)
-        await msg.reply_text(NO_DB)
+        await msg.reply_text(_t("mc.no_db", chat))
         return
     await _decorate(msg.get_bot(), chat.id, data)
     sent = await msg.reply_html(_board_text(_chat_title(chat), kind, data), reply_markup=_board_kb(kind, data),
@@ -1059,25 +1024,23 @@ async def me_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg, user = update.effective_message, update.effective_user
     if user is None or user.id == ANON_ADMIN_ID or msg.sender_chat is not None:
-        await msg.reply_text("I can't tell who you are while you post anonymously. Please post as yourself.")
+        await msg.reply_text(_t("mc.anon", chat))
         return
     try:
         d = await asyncio.to_thread(_me_sync, chat.id, user.id)
     except PyMongoError:
         log.exception("msgcount: /me failed in %s", chat.id)
-        await msg.reply_text(NO_DB)
+        await msg.reply_text(_t("mc.no_db", chat))
         return
-    lines = ["👤 <b>YOUR MESSAGE STATISTICS</b>", "",
-             f"👥 <b>Group:</b> {_esc(_chat_title(chat, d['group']), 64)}", "",
-             f"💬 <b>All-Time Messages:</b> {d['total']:,}", "",
-             f"✅ <b>Today's Messages:</b> {d['today']:,}", "",
-             f"📅 <b>This Week:</b> {d['week']:,}", "",
-             f"🏆 <b>Current Group Rank:</b> {('#%d of %d' % (d['rank'], d['members'])) if d['rank'] else 'Not ranked yet'}"]
+    g = d["group"]
+    rank = _t("mc.rank_of", g, rank=d["rank"], members=d["members"]) if d["rank"] else _t("mc.not_ranked", g)
+    text = _t("mc.me", g, group=_esc(_chat_title(chat, g), 64), total=f"{d['total']:,}", today=f"{d['today']:,}",
+              week=f"{d['week']:,}", rank=rank)
     if not d["total"]:
-        lines += ["", "You haven't sent any counted messages in this group yet, so you are not ranked yet."]
-    if d["group"].get("enabled") is False:
-        lines += ["", "<i>Message counting is currently OFF in this group.</i>"]
-    await msg.reply_html("\n".join(lines))
+        text += "\n\n" + _t("mc.me_none", g)
+    if g.get("enabled") is False:
+        text += "\n\n" + _t("mc.me_off", g)
+    await msg.reply_html(text)
 
 
 async def radmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1089,24 +1052,24 @@ async def radmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         admins = [a for a in await context.bot.get_chat_administrators(chat.id) if not a.user.is_bot]
     except TelegramError:
         log.exception("msgcount: get_chat_administrators failed in %s", chat.id)
-        await msg.reply_text("I couldn't read this group's administrator list right now. Please try again.")
+        await msg.reply_text(_t("mc.adm_fail", chat))
         return
     try:
         counts = await asyncio.to_thread(_admins_today_sync, chat.id, [a.user.id for a in admins])
     except PyMongoError:
         log.exception("msgcount: /radmin failed in %s", chat.id)
-        await msg.reply_text(NO_DB)
+        await msg.reply_text(_t("mc.no_db", chat))
         return
     today = periods()[0]
     rows = sorted(((counts.get(a.user.id, 0), a.user.full_name or f"User {a.user.id}") for a in admins), key=lambda r: (-r[0], r[1].lower()))
     if not any(n for n, _ in rows):
-        await msg.reply_html(f"👮 <b>ADMIN MESSAGES TODAY</b> ({today} IST)\n\nNo admin has sent a counted message in this group today yet.")
+        await msg.reply_html(_t("mc.adm_head", chat, today=today) + "\n\n" + _t("mc.adm_none", chat))
         return
-    lines = [f"👮 <b>ADMIN MESSAGES TODAY</b> ({today} IST)", f"👥 {_esc(_chat_title(chat), 64)}", ""]
+    lines = [_t("mc.adm_head", chat, today=today), f"👥 {_esc(_chat_title(chat), 64)}", ""]
     for i, (n, name) in enumerate(rows[:40], start=1):
         lines.append(f"{_MEDALS.get(i, f'{i}.')} {_esc(name)} — {n:,}")
     if len(rows) > 40:
-        lines.append(f"…and {len(rows) - 40} more admins")
+        lines.append(_t("mc.adm_more", chat, n=len(rows) - 40))
     await msg.reply_html("\n".join(lines))
 
 
@@ -1118,23 +1081,19 @@ async def resetrank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     anonymous = user is None or user.id == ANON_ADMIN_ID or (msg.sender_chat is not None and msg.sender_chat.id == chat.id)
     if anonymous:
         if not (msg.sender_chat is not None and msg.sender_chat.id == chat.id):
-            await msg.reply_text(ADMIN_ONLY)
+            await msg.reply_text(_t("mc.admin_only", chat))
             return
         req = 0                       # Telegram only sends sender_chat == this chat for its real admins
     else:
         ok = await _is_group_admin(context.bot, chat.id, user.id)
         if ok is not True:
-            await msg.reply_text(ADMIN_ONLY if ok is False else "I couldn't verify your permissions right now. Please try again.")
+            await msg.reply_text(_t("mc.admin_only", chat) if ok is False else _t("mc.cant_verify_retry", chat))
             return
         req = user.id
     ts = int(time.time())
-    kb = KB([[B("✅ Confirm Reset", callback_data=f"mc:rr:y:{req}:{ts}:{_sign(chat.id, req, ts)}"),
-              B("❌ Cancel", callback_data=f"mc:rr:n:{req}:{ts}:{_sign(chat.id, req, ts)}")]])
-    sent = await msg.reply_html(
-        "⚠️ <b>RESET GROUP MESSAGE STATISTICS?</b>\n\n"
-        f"👥 <b>Group:</b> {_esc(_chat_title(chat), 64)}\n\n"
-        "This will reset the current group's message totals and leaderboard statistics.\n\n"
-        "Other groups will not be affected.", reply_markup=kb)
+    kb = KB([[B(_t("mc.b_confirm", chat), callback_data=f"mc:rr:y:{req}:{ts}:{_sign(chat.id, req, ts)}"),
+              B(_t("mc.b_cancel", chat), callback_data=f"mc:rr:n:{req}:{ts}:{_sign(chat.id, req, ts)}")]])
+    sent = await msg.reply_html(_t("mc.reset_ask", chat, group=_esc(_chat_title(chat), 64)), reply_markup=kb)
     extra.remember_menu_owner(sent, user.id if user else None)
 
 
@@ -1175,12 +1134,12 @@ async def pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = (msg.text or "").strip()
     if not re.fullmatch(r"[0-9]{1,7}", text) or not (MIN_INTERVAL <= int(text) <= MAX_INTERVAL):
-        await msg.reply_text(f"Please send a whole number from {MIN_INTERVAL:,} to {MAX_INTERVAL:,} (or tap Cancel on the prompt).")
+        await msg.reply_text(_t("mc.num_prompt", chat, min=f"{MIN_INTERVAL:,}", max=f"{MAX_INTERVAL:,}"))
         return
     (_pending_day if is_day else _pending).pop((chat.id, user.id), None)
     ok = await _is_group_admin(context.bot, chat.id, user.id)
     if ok is not True:
-        await msg.reply_text(ADMIN_ONLY if ok is False else "I couldn't verify your permissions right now. Nothing was changed.")
+        await msg.reply_text(_t("mc.admin_only", chat) if ok is False else _t("mc.cant_verify", chat))
         return
     await (_apply_day_interval if is_day else _apply_interval)(msg.reply_html, chat, int(text))
 
@@ -1190,10 +1149,10 @@ async def _apply_interval(reply, chat, value, turn_on=False):
         g = await asyncio.to_thread(_save_interval_sync, chat.id, value, _utcnow(), turn_on)
     except PyMongoError:
         log.exception("msgcount: saving the interval failed in %s", chat.id)
-        await reply(NO_DB)
+        await reply(_t("mc.no_db", chat))
         return None
     nxt = next_milestone(int(g.get("last_milestone", 0)), int(g.get("initial", DEFAULT_INITIAL)), value)
-    await reply(f"✅ <b>Settings saved.</b>\nMilestone interval: every {value:,} messages.\nNext milestone: {nxt:,}.")
+    await reply(_t("mc.saved_total", g, value=f"{value:,}", next=f"{nxt:,}"))
     return g
 
 
@@ -1202,10 +1161,9 @@ async def _apply_day_interval(reply, chat, value, turn_on=False):
         g = await asyncio.to_thread(_save_day_interval_sync, chat.id, value, _utcnow(), turn_on)
     except PyMongoError:
         log.exception("msgcount: saving today's interval failed in %s", chat.id)
-        await reply(NO_DB)
+        await reply(_t("mc.no_db", chat))
         return None
-    await reply(f"✅ <b>Settings saved.</b>\nToday's message: every {value:,} messages "
-                f"(next: {_next_today(g):,}).\nStatus: {_state(_dm_on(g))}.")
+    await reply(_t("mc.saved_day", g, value=f"{value:,}", next=f"{_next_today(g):,}", state=_state(_dm_on(g), g)))
     return g
 
 
@@ -1230,9 +1188,7 @@ async def mc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if chat.type not in GROUP_TYPES:
             await q.answer()
-            await _edit(q, "📊 <b>Message Count</b>\n\nMessage statistics are tracked separately for every group, so they "
-                           "can only be viewed inside a group. Open /help in a group and tap 📊 Message Count there.",
-                        KB([[B("🔙 Back", callback_data="help:main")]]))
+            await _edit(q, _t("mc.private_btn", chat), KB([[B(_t("mc.b_back", chat), callback_data="help:main")]]))
             return
         action = parts[1] if len(parts) > 1 else ""
         if action == "d":
@@ -1246,11 +1202,11 @@ async def mc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action in ("s", "si", "ss", "sc", "sx", "t", "st", "tt", "sd", "di", "ds", "dc", "dt"):
             await _admin_action(q, context, chat, parts)
         else:
-            await q.answer("This button is no longer valid.", show_alert=True)
+            await q.answer(_t("mc.invalid", chat), show_alert=True)
     except PyMongoError:
         log.exception("msgcount: database error in callback %r", q.data)
         try:
-            await q.answer(NO_DB, show_alert=True)
+            await q.answer(_t("mc.no_db", getattr(q.message, "chat", None)), show_alert=True)
         except TelegramError:
             pass
     except TelegramError as e:
@@ -1258,7 +1214,7 @@ async def mc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         log.exception("msgcount: callback %r failed", q.data)
         try:
-            await q.answer("Something went wrong. Please try again.", show_alert=True)
+            await q.answer(_t("mc.went_wrong", getattr(q.message, "chat", None)), show_alert=True)
         except TelegramError:
             pass
 
@@ -1272,7 +1228,7 @@ async def _admin_action(q, context, chat, parts):
     """Settings / toggle: permissions are re-checked against Telegram on EVERY click."""
     ok = await _is_group_admin(context.bot, chat.id, q.from_user.id)
     if ok is not True:
-        await q.answer(ADMIN_ONLY if ok is False else "I couldn't verify your permissions right now. Nothing was changed.", show_alert=True)
+        await q.answer(_t("mc.admin_only", chat) if ok is False else _t("mc.cant_verify", chat), show_alert=True)
         return
     action = parts[1]
     g = await asyncio.to_thread(_group_sync, chat.id)
@@ -1283,7 +1239,7 @@ async def _admin_action(q, context, chat, parts):
 
     if action == "s":                                      # ⚙️ Milestone Settings: the Total and Today buttons
         await q.answer()
-        await _edit(q, _menu_text(title, g), _menu_kb())
+        await _edit(q, _menu_text(title, g), _menu_kb(g))
     elif action == "st":                                   # 📊 Total screen
         await q.answer()
         draft = int(g.get("interval", DEFAULT_INTERVAL))
@@ -1294,13 +1250,13 @@ async def _admin_action(q, context, chat, parts):
         await _edit(q, _day_text(title, g, draft), _day_kb(g, draft))
     elif action in ("tt", "dt"):                           # the ON/OFF switch of Total / Today
         if len(parts) != 3 or parts[2] not in ("0", "1"):
-            await q.answer("This button is no longer valid.", show_alert=True)
+            await q.answer(_t("mc.invalid", chat), show_alert=True)
             return
         flag = parts[2] == "1"
         field = "tm_on" if action == "tt" else "dm_on"
         g2 = await asyncio.to_thread(_set_flag_sync, chat.id, field, flag, _utcnow())
-        label = "Total milestone" if action == "tt" else "Today's message"
-        await q.answer(f"{label} is now {'ON' if flag else 'OFF'}.")
+        await q.answer(_t("mc.sw_total" if action == "tt" else "mc.sw_today", chat,
+                          state=_t("mc.on" if flag else "mc.off", chat)))
         if action == "tt":
             draft = int(g2.get("interval", DEFAULT_INTERVAL))
             await _edit(q, _settings_text(title, g2, draft), _settings_kb(g2, draft))
@@ -1309,57 +1265,56 @@ async def _admin_action(q, context, chat, parts):
             await _edit(q, _day_text(title, g2, draft), _day_kb(g2, draft))
     elif action == "si":
         if not valid_interval():
-            await q.answer("Invalid interval.", show_alert=True)
+            await q.answer(_t("mc.bad_interval", chat), show_alert=True)
             return
         await q.answer()
         draft = int(parts[2])
         await _edit(q, _settings_text(title, g, draft), _settings_kb(g, draft))
     elif action == "di":
         if not valid_interval():
-            await q.answer("Invalid interval.", show_alert=True)
+            await q.answer(_t("mc.bad_interval", chat), show_alert=True)
             return
         await q.answer()
         draft = int(parts[2])
         await _edit(q, _day_text(title, g, draft), _day_kb(g, draft))
     elif action == "ds":                                   # 💾 save Today's interval
         if not valid_interval():
-            await q.answer("Invalid interval.", show_alert=True)
+            await q.answer(_t("mc.bad_interval", chat), show_alert=True)
             return
         g2 = await asyncio.to_thread(_save_day_interval_sync, chat.id, int(parts[2]), _utcnow())
-        await q.answer("Settings saved.")
+        await q.answer(_t("mc.settings_saved", chat))
         await _edit(q, _day_text(title, g2, _dm_interval(g2)), _day_kb(g2, _dm_interval(g2)))
     elif action == "dc":                                   # ✏️ custom interval for Today
         await q.answer()
         _pending.pop((chat.id, q.from_user.id), None)
         _pending_put(chat.id, q.from_user.id, _pending_day)
         await q.message.reply_html(
-            f"✏️ <b>Custom interval for Today's message</b>\n\n{html.escape(q.from_user.first_name or 'Admin')}, send a whole "
-            f"number from {MIN_INTERVAL:,} to {MAX_INTERVAL:,} within {INPUT_SECS // 60} minutes.\n"
-            "Only your next message in this group is used.",
-            reply_markup=KB([[B("❌ Cancel", callback_data="mc:sx")]]))
+            _t("mc.custom_day", chat, name=html.escape(q.from_user.first_name or _t("mc.admin_name", chat)),
+               min=f"{MIN_INTERVAL:,}", max=f"{MAX_INTERVAL:,}", mins=INPUT_SECS // 60),
+            reply_markup=KB([[B(_t("mc.b_cancel", chat), callback_data="mc:sx")]]))
     elif action == "ss":
         if len(parts) != 3 or not parts[2].isdigit() or not (MIN_INTERVAL <= int(parts[2]) <= MAX_INTERVAL):
-            await q.answer("Invalid interval.", show_alert=True)
+            await q.answer(_t("mc.bad_interval", chat), show_alert=True)
             return
         g2 = await asyncio.to_thread(_save_interval_sync, chat.id, int(parts[2]), _utcnow())
-        await q.answer("Settings saved.")
+        await q.answer(_t("mc.settings_saved", chat))
         await _edit(q, _dash_text(_chat_title(chat, g2), g2), _dash_kb(g2))
     elif action == "sc":
         await q.answer()
         _pending_day.pop((chat.id, q.from_user.id), None)
         _pending_put(chat.id, q.from_user.id)
         await q.message.reply_html(
-            f"✏️ <b>Custom interval</b>\n\n{html.escape(q.from_user.first_name or 'Admin')}, send a whole number from "
-            f"{MIN_INTERVAL:,} to {MAX_INTERVAL:,} within {INPUT_SECS // 60} minutes.\nOnly your next message in this group is used.",
-            reply_markup=KB([[B("❌ Cancel", callback_data="mc:sx")]]))
+            _t("mc.custom_total", chat, name=html.escape(q.from_user.first_name or _t("mc.admin_name", chat)),
+               min=f"{MIN_INTERVAL:,}", max=f"{MAX_INTERVAL:,}", mins=INPUT_SECS // 60),
+            reply_markup=KB([[B(_t("mc.b_cancel", chat), callback_data="mc:sx")]]))
     elif action == "sx":
         _pending.pop((chat.id, q.from_user.id), None)
         _pending_day.pop((chat.id, q.from_user.id), None)
-        await q.answer("Cancelled.")
-        await _edit(q, "Custom interval cancelled. Nothing was changed.", None)
+        await q.answer(_t("mc.cancelled", chat))
+        await _edit(q, _t("mc.custom_cancelled", chat), None)
     elif action == "t":
         if len(parts) != 3 or parts[2] not in ("0", "1"):
-            await q.answer("This button is no longer valid.", show_alert=True)
+            await q.answer(_t("mc.invalid", chat), show_alert=True)
             return
         flag = parts[2] == "1"
         g2 = await asyncio.to_thread(_toggle_sync, chat.id, flag, _utcnow())
@@ -1367,7 +1322,7 @@ async def _admin_action(q, context, chat, parts):
             _off_until.pop(chat.id, None)
         else:
             _off_until[chat.id] = time.monotonic() + 30
-        await q.answer("Message counting is now ON." if flag else "Message counting is now OFF.")
+        await q.answer(_t("mc.count_on" if flag else "mc.count_off", chat))
         await _edit(q, _dash_text(_chat_title(chat, g2), g2), _dash_kb(g2))
 
 
@@ -1377,45 +1332,42 @@ async def _reset_callback(update, context, parts):
     chat = getattr(msg, "chat", None)
     try:
         if chat is None or chat.type not in GROUP_TYPES or len(parts) != 6 or parts[2] not in ("y", "n"):
-            await q.answer("This button is no longer valid.", show_alert=True)
+            await q.answer(_t("mc.invalid", chat), show_alert=True)
             return
         req, ts = int(parts[3]), int(parts[4])
     except ValueError:
-        await q.answer("This button is no longer valid.", show_alert=True)
+        await q.answer(_t("mc.invalid", chat), show_alert=True)
         return
     if not hmac.compare_digest(parts[5], _sign(chat.id, req, ts)):     # forged, or taken from another group
-        await q.answer("This button is not valid for this group.", show_alert=True)
+        await q.answer(_t("mc.rr_not_group", chat), show_alert=True)
         return
     if time.time() - ts > CONFIRM_SECS or ts > time.time() + 5:
-        await q.answer("This confirmation has expired. Send /resetrank again.", show_alert=True)
-        await _edit(q, "⌛ This reset request expired. Nothing was changed.", None)
+        await q.answer(_t("mc.rr_expired_toast", chat), show_alert=True)
+        await _edit(q, _t("mc.rr_expired", chat), None)
         return
     if req != 0 and q.from_user.id != req:
-        await q.answer("Only the admin who sent /resetrank can answer this.", show_alert=True)
+        await q.answer(_t("mc.rr_only_asker", chat), show_alert=True)
         return
     ok = await _is_group_admin(context.bot, chat.id, q.from_user.id)   # permissions may have changed since
     if ok is not True:
-        await q.answer(ADMIN_ONLY if ok is False else "I couldn't verify your permissions right now. Nothing was changed.", show_alert=True)
+        await q.answer(_t("mc.admin_only", chat) if ok is False else _t("mc.cant_verify", chat), show_alert=True)
         return
     if parts[2] == "n":
-        await q.answer("Cancelled.")
-        await _edit(q, "❌ Reset cancelled. Nothing was changed.", None)
+        await q.answer(_t("mc.cancelled", chat))
+        await _edit(q, _t("mc.rr_cancelled", chat), None)
         return
-    await q.answer("Resetting…")
+    await q.answer(_t("mc.resetting", chat))
     try:
         done = await asyncio.to_thread(_reset_sync, chat.id, ts, _utcnow())
     except PyMongoError:
         log.exception("msgcount: reset failed in %s", chat.id)
-        await _edit(q, "⚠️ The reset could not be completed because the database had a problem. "
-                       "Some statistics may be unchanged. Please send /resetrank again.", None)
+        await _edit(q, _t("mc.rr_db", chat), None)
         return
     if not done:
-        await _edit(q, "This reset request was already used. Nothing more was changed.", None)
+        await _edit(q, _t("mc.rr_used", chat), None)
         return
     _off_until.pop(chat.id, None)
-    await _edit(q, f"✅ <b>Message statistics reset</b> for {_esc(_chat_title(chat), 64)}.\n\n"
-                   "Only this group's statistics were reset. Other groups were not affected. The counting ON/OFF "
-                   "setting and the milestone interval were kept; milestones start again from 100.", None)
+    await _edit(q, _t("mc.rr_done", chat, group=_esc(_chat_title(chat), 64)), None)
 
 
 # ------------------------------------------------------------------ Delete: deleted accounts and inactive members
@@ -1438,24 +1390,22 @@ _delall_running = set()
 _scanning = set()
 _last_force = {}
 _bg = set()       # strong references to background tasks
-DEL_DENIED = "Only group admins can use this. Kicking also needs the Ban Users right."
-DEL_NEED_BAN = "You need the Ban Users right to kick members."
 
 
 def _naive(dt):
     return dt.replace(tzinfo=None) if getattr(dt, "tzinfo", None) else dt
 
 
-def _ago(dt):
+def _ago(dt, chat=None):
     if dt is None:
-        return "unknown"
+        return _t("mc.ago_unknown", chat)
     s = max(int((_naive(_utcnow()) - _naive(dt)).total_seconds()), 0)
     d = s // 86400
     if d >= 1:
-        return f"{d} day{'s' if d != 1 else ''} ago"
+        return _t("mc.ago_day" if d == 1 else "mc.ago_days", chat, n=d)
     if s >= 3600:
-        return f"{s // 3600} hour{'s' if s // 3600 != 1 else ''} ago"
-    return "just now" if s < 120 else f"{s // 60} min ago"
+        return _t("mc.ago_hour" if s // 3600 == 1 else "mc.ago_hours", chat, n=s // 3600)
+    return _t("mc.ago_now", chat) if s < 120 else _t("mc.ago_min", chat, n=s // 60)
 
 
 def _retry_secs(e):
@@ -1650,11 +1600,11 @@ async def _kick_dead(bot, chat_id, uid):
     res = await _check_users(bot, chat_id, [uid], force=True)
     st = res.get(uid)
     if st is None:
-        return "skip", "Telegram could not confirm this account"
+        return "skip", _t("mc.kd_unconfirmed", chat_id)
     if not st[0]:
-        return "skip", "it is not a deleted account"
+        return "skip", _t("mc.kd_not_deleted", chat_id)
     if not st[1]:
-        return "skip", "it already left the group"
+        return "skip", _t("mc.kd_left", chat_id)
     for attempt in range(2):
         try:
             await bot.ban_chat_member(chat_id, uid)
@@ -1664,7 +1614,7 @@ async def _kick_dead(bot, chat_id, uid):
         except TelegramError as e:
             return "fail", str(e)[:80]
     else:
-        return "fail", "Telegram is busy, try again"
+        return "fail", _t("mc.kd_busy", chat_id)
     note = ""
     for attempt in range(3):
         try:
@@ -1675,7 +1625,7 @@ async def _kick_dead(bot, chat_id, uid):
         except TelegramError:
             await asyncio.sleep(0.5)
     else:
-        note = " (kicked, but the unban failed: unban it manually)"
+        note = _t("mc.kd_unban_fail", chat_id)
     _dead.setdefault(chat_id, {})[uid] = (time.monotonic(), False)
     snap = _dlist.get(chat_id)
     if snap:
@@ -1694,50 +1644,35 @@ def _entry(chat_id, uid=None, n=None):
 
 
 # ----- screens
-def _del_card_view():
-    text = ("🗑 <b>DELETE</b>\n\n"
-            "👻 <b>Deleted Accounts</b>\nFind deleted accounts and kick them one by one.\n\n"
-            "💤 <b>Inactive Members</b>\nSee members with no message for N days.")
-    return text, KB([[B("👻 Deleted List", callback_data="mcd:l"), B(f"💤 Inactive {INACTIVE_DEFAULT}", callback_data=f"mcd:i:{INACTIVE_DEFAULT}:0")],
-                     [B("ℹ️ How it works", callback_data="mcd:h")],
-                     [B("« Back", callback_data="help:more")]])
-
-
-_DEL_HELP = ("ℹ️ <b>HOW IT WORKS</b>\n\n"
-             "👻 <b>Deleted accounts</b>\nTelegram does not give bots the member list, so the bot checks the members it has "
-             "already counted (the most active first). Members who never wrote a message can't be found.\n\n"
-             "🔢 <b>Serial numbers</b>\nThe list is numbered #1, #2, … by messages. The numbers can change when the list "
-             "changes, so always check the latest list.\n\n"
-             "🗑 <b>Kick one</b>\nSend its number (or <code>/deleted 3</code>), then confirm. The account is checked again, "
-             "then kicked (no ban is left).\n\n"
-             "🔒 <b>Delete All</b>\nLocked by default. Turn it on, it stays open for 2 minutes, then confirm.\n\n"
-             "💤 <b>Inactive</b>\n<code>/inactive 30</code> lists members with no message for 30 days. Members who left "
-             "may still appear.\n\n"
-             "🔐 Only group admins can use this; kicking needs the Ban Users right.")
+def _del_card_view(chat=None):
+    return _t("mc.del_card", chat), KB([[B(_t("mc.b_deleted", chat), callback_data="mcd:l"),
+                                         B(_t("mc.b_inactive", chat, days=INACTIVE_DEFAULT), callback_data=f"mcd:i:{INACTIVE_DEFAULT}:0")],
+                                        [B(_t("mc.b_how", chat), callback_data="mcd:h")],
+                                        [B(_t("mc.b_back2", chat), callback_data="help:more")]])
 
 
 def _dlist_view(chat_id, ents, capped, note=""):
     on = _lock_on(chat_id)
-    lines = [f"{note}👻 <b>DELETED ACCOUNTS ({len(ents)})</b>", ""]
+    lines = [_t("mc.dl_title", chat_id, note=note, n=len(ents)), ""]
     if not ents:
-        lines.append("No deleted accounts found among the members counted so far.")
+        lines.append(_t("mc.dl_none", chat_id))
     for e in ents[:LIST_SHOW]:
-        lines.append(f"<b>#{e['n']}</b> · {e['count']:,} msgs · last seen {_ago(e['last'])}")
+        lines.append(_t("mc.dl_line", chat_id, n=e["n"], count=f"{e['count']:,}", ago=_ago(e["last"], chat_id)))
     if len(ents) > LIST_SHOW:
-        lines.append(f"… and {len(ents) - LIST_SHOW} more (kick some, then refresh)")
+        lines.append(_t("mc.dl_more", chat_id, n=len(ents) - LIST_SHOW))
     if ents:
-        lines += ["", "Send a serial number to kick that account."]
+        lines += ["", _t("mc.dl_send", chat_id)]
         if on:
-            lines.append("🔓 Delete All is ON for 2 minutes.")
+            lines.append(_t("mc.dl_all_on", chat_id))
     if capped:
-        lines += ["", f"<i>Only the {SCAN_CAP} members with the most messages were checked.</i>"]
+        lines += ["", _t("mc.dl_capped", chat_id, cap=SCAN_CAP)]
     kb = []
     if ents:
-        kb.append([B("🗑 Delete #", callback_data="mcd:s")])
-        kb.append([B("🔓 Delete All: ON" if on else "🔒 Delete All: OFF", callback_data="mcd:t")])
+        kb.append([B(_t("mc.b_delnum", chat_id), callback_data="mcd:s")])
+        kb.append([B(_t("mc.b_delall_on" if on else "mc.b_delall_off", chat_id), callback_data="mcd:t")])
         if on:
-            kb.append([B(f"🗑 Delete All ({len(ents)})", callback_data="mcd:da")])
-    kb.append([B("🔄 Refresh", callback_data="mcd:lr"), B("« Back", callback_data="mcd:m")])
+            kb.append([B(_t("mc.b_delall", chat_id, n=len(ents)), callback_data="mcd:da")])
+    kb.append([B(_t("mc.b_refresh", chat_id), callback_data="mcd:lr"), B(_t("mc.b_back2", chat_id), callback_data="mcd:m")])
     return "\n".join(lines), KB(kb)
 
 
@@ -1763,38 +1698,37 @@ async def _inactive_view(bot, chat_id, days, page):
                 marks[u] = "👻 Deleted Account" + (f" #{n}" if n else "")
     except Exception:
         log.warning("msgcount: inactive list marks skipped", exc_info=True)
-    lines = [f"💤 <b>INACTIVE {days}+ DAYS ({total})</b>", ""]
+    lines = [_t("mc.in_title", chat_id, days=days, total=total), ""]
     if not rows:
-        lines.append("Nobody has been quiet that long among the members counted so far.")
+        lines.append(_t("mc.in_none", chat_id))
     base = pg * INACTIVE_PAGE
     for i, r in enumerate(rows, base + 1):
-        who = marks.get(r["user_id"]) or _esc(r.get("name") or f"User {r['user_id']}")
-        lines.append(f"{i}. {who} — {int(r['count']):,} msgs · {_ago(r.get('updated_at'))}")
+        who = marks.get(r["user_id"]) or _esc(r.get("name") or _t("mc.user_n", chat_id, uid=r["user_id"]))
+        lines.append(_t("mc.in_line", chat_id, i=i, who=who, count=f"{int(r['count']):,}", ago=_ago(r.get("updated_at"), chat_id)))
     if pages > 1:
-        lines += ["", f"Page {pg + 1}/{pages}"]
-    lines += ["", "<i>Only members who wrote at least one counted message appear. Members who left may still be listed.</i>"]
+        lines += ["", _t("mc.page", chat_id, page=pg + 1, pages=pages)]
+    lines += ["", _t("mc.in_note", chat_id)]
     kb = []
     nav = []
     if pg > 0:
-        nav.append(B("⬅️ Prev", callback_data=f"mcd:i:{days}:{pg - 1}"))
+        nav.append(B(_t("mc.b_prev", chat_id), callback_data=f"mcd:i:{days}:{pg - 1}"))
     if pg < pages - 1:
-        nav.append(B("Next ➡️", callback_data=f"mcd:i:{days}:{pg + 1}"))
+        nav.append(B(_t("mc.b_next", chat_id), callback_data=f"mcd:i:{days}:{pg + 1}"))
     if nav:
         kb.append(nav)
-    kb.append([B(f"{d} days", callback_data=f"mcd:i:{d}:0") for d in (7, 30, 90)])
-    kb.append([B("« Back", callback_data="mcd:m")])
+    kb.append([B(_t("mc.b_days", chat_id, d=d), callback_data=f"mcd:i:{d}:0") for d in (7, 30, 90)])
+    kb.append([B(_t("mc.b_back2", chat_id), callback_data="mcd:m")])
     return "\n".join(lines), KB(kb)
 
 
-def _kick_confirm_view(e):
-    return (f"🗑 <b>KICK DELETED ACCOUNT #{e['n']}?</b>\n\n{e['count']:,} msgs · last seen {_ago(e['last'])}\n"
-            "It is checked again before it is kicked.",
-            KB([[B("✅ Confirm", callback_data=f"mcd:ky:{e['uid']}"), B("❌ Cancel", callback_data="mcd:l")]]))
+def _kick_confirm_view(e, chat=None):
+    return (_t("mc.kc_title", chat, n=e["n"], count=f"{e['count']:,}", ago=_ago(e["last"], chat)),
+            KB([[B(_t("mc.b_confirm_short", chat), callback_data=f"mcd:ky:{e['uid']}"), B(_t("mc.b_cancel", chat), callback_data="mcd:l")]]))
 
 
-def _delall_confirm_view(n):
-    return (f"⚠️ <b>KICK ALL {n} DELETED ACCOUNTS?</b>\n\nEach account is checked again before it is kicked.\nThis cannot be undone.",
-            KB([[B("✅ Confirm", callback_data="mcd:day"), B("❌ Cancel", callback_data="mcd:l")]]))
+def _delall_confirm_view(n, chat=None):
+    return (_t("mc.kall_title", chat, n=n),
+            KB([[B(_t("mc.b_confirm_short", chat), callback_data="mcd:day"), B(_t("mc.b_cancel", chat), callback_data="mcd:l")]]))
 
 
 async def _run_delall(bot, q, chat_id):
@@ -1815,19 +1749,18 @@ async def _run_delall(bot, q, chat_id):
                 failed += 1
                 notes.append(f"#{e['n']}: {note}")
             if i % 10 == 0 and i < len(ents):
-                await _edit(q, f"⏳ <b>Kicking deleted accounts…</b> {i}/{len(ents)}", None)
+                await _edit(q, _t("mc.kicking", chat_id, i=i, n=len(ents)), None)
             await asyncio.sleep(0.3)
-        text = f"✅ <b>DELETE ALL DONE</b>\n\nKicked: {kicked}\nSkipped: {skipped}"
+        text = _t("mc.delall_done", chat_id, kicked=kicked, skipped=skipped)
         if failed:
-            text += f"\nFailed: {failed}"
+            text += _t("mc.delall_failed", chat_id, failed=failed)
         if notes:
             text += "\n\n" + "\n".join(_esc(n, 90) for n in notes[:10])
-        text += "\n\n🔒 Delete All is OFF again."
-        await _edit(q, text, KB([[B("👻 Deleted List", callback_data="mcd:l"), B("« Back", callback_data="mcd:m")]]))
+        text += _t("mc.delall_off", chat_id)
+        await _edit(q, text, KB([[B(_t("mc.b_deleted", chat_id), callback_data="mcd:l"), B(_t("mc.b_back2", chat_id), callback_data="mcd:m")]]))
     except Exception:
         log.exception("msgcount: Delete All failed in %s", chat_id)
-        await _edit(q, "⚠️ Delete All stopped because of an error. Some accounts may already be kicked. Open the list to see what is left.",
-                    KB([[B("👻 Deleted List", callback_data="mcd:l")]]))
+        await _edit(q, _t("mc.delall_err", chat_id), KB([[B(_t("mc.b_deleted", chat_id), callback_data="mcd:l")]]))
     finally:
         _delall_running.discard(chat_id)
         _delall.pop(chat_id, None)
@@ -1837,10 +1770,10 @@ async def _guard(q, bot, chat_id, need):
     """Strict permission check on every tap. need: 1 = admin, 2 = may kick. True when allowed (else the user was told)."""
     r = await _rights(bot, chat_id, q.from_user.id)
     if r is None:
-        await q.answer("I couldn't verify your permissions right now. Nothing was changed.", show_alert=True)
+        await q.answer(_t("mc.cant_verify", chat_id), show_alert=True)
         return False
     if r < need:
-        await q.answer(DEL_DENIED if r == 0 else DEL_NEED_BAN, show_alert=True)
+        await q.answer(_t("mc.dl_denied" if r == 0 else "mc.dl_need_ban", chat_id), show_alert=True)
         return False
     return True
 
@@ -1854,7 +1787,7 @@ async def del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = getattr(q.message, "chat", None)
         act = parts[1] if len(parts) > 1 else ""
         if chat is None or chat.type not in GROUP_TYPES:
-            await q.answer("Open /help inside a group to use this.", show_alert=True)
+            await q.answer(_t("mc.dl_open_in_group", chat), show_alert=True)
             return
         bot = context.bot
         cid = chat.id
@@ -1864,16 +1797,16 @@ async def del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if act == "m":
             _dpend.pop((cid, q.from_user.id), None)
             await q.answer()
-            await _edit(q, *_del_card_view())
+            await _edit(q, *_del_card_view(chat))
         elif act == "h":
             await q.answer()
-            await _edit(q, _DEL_HELP, KB([[B("« Back", callback_data="mcd:m")]]))
+            await _edit(q, _t("mc.del_help", chat), KB([[B(_t("mc.b_back2", chat), callback_data="mcd:m")]]))
         elif act in ("l", "lr"):
             _dpend.pop((cid, q.from_user.id), None)
             force = act == "lr"
             if force:
                 if time.monotonic() - _last_force.get(cid, -1e9) < 60:
-                    await q.answer("Please wait a minute before refreshing again.", show_alert=True)
+                    await q.answer(_t("mc.dl_wait", chat), show_alert=True)
                     return
                 if len(_last_force) > 500:
                     _last_force.clear()
@@ -1883,101 +1816,100 @@ async def del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if act == "l" and snap and time.monotonic() - snap[0] < 600:
                 ents, capped = snap[1], snap[2]
             else:
-                await _edit(q, "👻 <b>Checking members…</b>\n\nThis can take a little while.", None)
+                await _edit(q, _t("mc.dl_checking", chat), None)
                 ents, capped = await _scan_deleted(bot, cid, force=force)
             await _edit(q, *_dlist_view(cid, ents, capped))
         elif act == "s":
             if not _entry(cid, n=1) and not (_dlist.get(cid) and _dlist[cid][1]):
-                await q.answer("Open the list first.", show_alert=True)
+                await q.answer(_t("mc.dl_open_first", chat), show_alert=True)
                 return
             if len(_dpend) > 500:
                 _dpend.clear()
             _dpend[(cid, q.from_user.id)] = time.monotonic() + INPUT_SECS
             await q.answer()
-            await _edit(q, "🗑 <b>KICK A DELETED ACCOUNT</b>\n\nSend the serial number from the list (for example <code>3</code>) "
-                           f"within {INPUT_SECS // 60} minutes.", KB([[B("❌ Cancel", callback_data="mcd:l")]]))
+            await _edit(q, _t("mc.dl_kick_prompt", chat, mins=INPUT_SECS // 60), KB([[B(_t("mc.b_cancel", chat), callback_data="mcd:l")]]))
         elif act == "t":
             ents = (_dlist.get(cid) or (0, [], False))[1]
             if not ents:
-                await q.answer("There is nothing to delete. Open the list first.", show_alert=True)
+                await q.answer(_t("mc.dl_nothing_open", chat), show_alert=True)
                 return
             if _lock_on(cid):
                 _delall.pop(cid, None)
-                await q.answer("Delete All is locked again.")
+                await q.answer(_t("mc.dl_locked_again", chat))
             else:
                 if len(_delall) > 500:
                     _delall.clear()
                 _delall[cid] = time.monotonic() + DELALL_SECS
-                await q.answer("Delete All is ON for 2 minutes.")
+                await q.answer(_t("mc.dl_on_toast", chat))
             snap = _dlist[cid]
             await _edit(q, *_dlist_view(cid, snap[1], snap[2]))
         elif act == "da":
             snap = _dlist.get(cid)
             if not _lock_on(cid):
-                await q.answer("Delete All is locked. Turn it on first.", show_alert=True)
+                await q.answer(_t("mc.dl_locked_first", chat), show_alert=True)
                 return
             if not snap or not snap[1]:
-                await q.answer("There is nothing to delete.", show_alert=True)
+                await q.answer(_t("mc.dl_nothing", chat), show_alert=True)
                 return
             await q.answer()
-            await _edit(q, *_delall_confirm_view(len(snap[1])))
+            await _edit(q, *_delall_confirm_view(len(snap[1]), chat))
         elif act == "day":
             if not _lock_on(cid):
-                await q.answer("Delete All was locked again. Turn it on first.", show_alert=True)
+                await q.answer(_t("mc.dl_locked_again2", chat), show_alert=True)
                 return
             if cid in _delall_running:
-                await q.answer("Delete All is already running.", show_alert=True)
+                await q.answer(_t("mc.dl_running", chat), show_alert=True)
                 return
             snap = _dlist.get(cid)
             if not snap or not snap[1]:
-                await q.answer("There is nothing to delete.", show_alert=True)
+                await q.answer(_t("mc.dl_nothing", chat), show_alert=True)
                 return
             ok = await _bot_can_kick(bot, cid)
             if ok is not True:
-                await q.answer("I need the Ban Users admin right to kick members." if ok is False else "I couldn't check my own rights. Nothing was changed.", show_alert=True)
+                await q.answer(_t("mc.dl_need_ban_bot" if ok is False else "mc.dl_cant_check", chat), show_alert=True)
                 return
             _delall.pop(cid, None)             # the lock closes the moment it is used
             _delall_running.add(cid)
-            await q.answer("Started.")
-            await _edit(q, f"⏳ <b>Kicking deleted accounts…</b> 0/{len(snap[1])}", None)
+            await q.answer(_t("mc.dl_started", chat))
+            await _edit(q, _t("mc.kicking", chat, i=0, n=len(snap[1])), None)
             task = asyncio.get_running_loop().create_task(_run_delall(bot, q, cid))
             _bg.add(task)
             task.add_done_callback(_bg.discard)
         elif act == "k" and len(parts) == 3 and parts[2].isdigit():
             e = _entry(cid, uid=int(parts[2]))
             if e is None:
-                await q.answer("That list is out of date. Open the list again.", show_alert=True)
+                await q.answer(_t("mc.dl_stale", chat), show_alert=True)
                 return
             await q.answer()
-            await _edit(q, *_kick_confirm_view(e))
+            await _edit(q, *_kick_confirm_view(e, chat))
         elif act == "ky" and len(parts) == 3 and parts[2].isdigit():
             uid = int(parts[2])
             e = _entry(cid, uid=uid)
             ok = await _bot_can_kick(bot, cid)
             if ok is not True:
-                await q.answer("I need the Ban Users admin right to kick members." if ok is False else "I couldn't check my own rights. Nothing was changed.", show_alert=True)
+                await q.answer(_t("mc.dl_need_ban_bot" if ok is False else "mc.dl_cant_check", chat), show_alert=True)
                 return
             kind, note = await _kick_dead(bot, cid, uid)
             await q.answer()
             snap = _dlist.get(cid) or (0, [], False)
             if kind == "ok":
-                text = f"✅ <b>Deleted Account{(' #%d' % e['n']) if e else ''} was removed.</b>{_esc(note, 90)}\n\n{len(snap[1])} deleted account(s) remain in the last list."
+                text = _t("mc.dl_removed", chat, num=(' #%d' % e['n']) if e else '', note=_esc(note, 90), left=len(snap[1]))
             else:
-                text = f"⚠️ <b>Nothing was kicked.</b> {_esc(note, 90)}"
-            await _edit(q, text, KB([[B("👻 Deleted List", callback_data="mcd:l"), B("« Back", callback_data="mcd:m")]]))
+                text = _t("mc.dl_nothing_kicked", chat, note=_esc(note, 90))
+            await _edit(q, text, KB([[B(_t("mc.b_deleted", chat), callback_data="mcd:l"), B(_t("mc.b_back2", chat), callback_data="mcd:m")]]))
         elif act == "i" and len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit() and len(parts[3]) <= 6:
             days = int(parts[2])
             if not 1 <= days <= INACTIVE_MAX:
-                await q.answer("This button is no longer valid.", show_alert=True)
+                await q.answer(_t("mc.invalid", chat), show_alert=True)
                 return
             await q.answer()
             await _edit(q, *await _inactive_view(bot, cid, days, int(parts[3])))
         else:
-            await q.answer("This button is no longer valid.", show_alert=True)
+            await q.answer(_t("mc.invalid", chat), show_alert=True)
     except PyMongoError:
         log.exception("msgcount: database error in delete callback %r", q.data)
         try:
-            await q.answer(NO_DB, show_alert=True)
+            await q.answer(_t("mc.no_db", getattr(q.message, "chat", None)), show_alert=True)
         except TelegramError:
             pass
     except TelegramError as e:
@@ -1985,7 +1917,7 @@ async def del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         log.exception("msgcount: delete callback %r failed", q.data)
         try:
-            await q.answer("Something went wrong. Please try again.", show_alert=True)
+            await q.answer(_t("mc.went_wrong", getattr(q.message, "chat", None)), show_alert=True)
         except TelegramError:
             pass
 
@@ -1993,13 +1925,13 @@ async def del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _confirm_serial(msg, bot, chat, user, n):
     """Shared by the typed serial number and /deleted <n>: shows the confirmation for ONE account."""
     if not await _bot_can_kick(bot, chat.id) is True:
-        await msg.reply_text("I need the Ban Users admin right to kick members, so nothing was changed.")
+        await msg.reply_text(_t("mc.dl_need_ban_nochange", chat))
         return
     e = _entry(chat.id, n=n)
     if e is None:
-        await msg.reply_text("There is no deleted account with that number in the latest list. Open /deleted and check the numbers.")
+        await msg.reply_text(_t("mc.dl_no_such", chat))
         return
-    text, kb = _kick_confirm_view(e)
+    text, kb = _kick_confirm_view(e, chat)
     sent = await msg.reply_html(text, reply_markup=kb)
     extra.remember_menu_owner(sent, user.id)
 
@@ -2022,7 +1954,7 @@ async def del_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _dpend.pop((chat.id, user.id), None)
     r = await _rights(context.bot, chat.id, user.id)
     if r != 2:
-        await msg.reply_text(DEL_DENIED if r == 0 else DEL_NEED_BAN if r == 1 else "I couldn't verify your permissions right now. Nothing was changed.")
+        await msg.reply_text(_t("mc.dl_denied" if r == 0 else "mc.dl_need_ban" if r == 1 else "mc.cant_verify", chat))
         return
     await _confirm_serial(msg, context.bot, chat, user, int(text))
 
@@ -2033,35 +1965,35 @@ async def deleted_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg, user = update.effective_message, update.effective_user
     if user is None or user.id == ANON_ADMIN_ID or msg.sender_chat is not None:
-        await msg.reply_text("I can't tell who you are while you post anonymously. Please post as yourself.")
+        await msg.reply_text(_t("mc.anon", chat))
         return
     arg = (context.args[0].lower() if getattr(context, "args", None) else "")
     r = await _rights(context.bot, chat.id, user.id)
     if r is None:
-        await msg.reply_text("I couldn't verify your permissions right now. Nothing was changed.")
+        await msg.reply_text(_t("mc.cant_verify", chat))
         return
     if r < (2 if arg else 1):
-        await msg.reply_text(DEL_DENIED if r == 0 else DEL_NEED_BAN)
+        await msg.reply_text(_t("mc.dl_denied" if r == 0 else "mc.dl_need_ban", chat))
         return
     try:
         if arg == "all":
             if not _lock_on(chat.id):
-                await msg.reply_html("🔒 <b>Delete All is locked.</b>\nTurn it on in 🗑 Delete → Deleted List.")
+                await msg.reply_html(_t("mc.dl_locked_msg", chat))
                 return
             snap = _dlist.get(chat.id)
             if not snap or not snap[1]:
-                await msg.reply_text("There is nothing to delete. Open /deleted first.")
+                await msg.reply_text(_t("mc.dl_nothing_cmd", chat))
                 return
-            text, kb = _delall_confirm_view(len(snap[1]))
+            text, kb = _delall_confirm_view(len(snap[1]), chat)
             sent = await msg.reply_html(text, reply_markup=kb)
             extra.remember_menu_owner(sent, user.id)
         elif arg:
             if not re.fullmatch(r"[0-9]{1,5}", arg):
-                await msg.reply_text("Use /deleted to see the list, /deleted 3 to kick #3, or /deleted all.")
+                await msg.reply_text(_t("mc.dl_usage", chat))
                 return
             await _confirm_serial(msg, context.bot, chat, user, int(arg))
         else:
-            wait = await msg.reply_html("👻 <b>Checking members…</b>\n\nThis can take a little while.")
+            wait = await msg.reply_html(_t("mc.dl_checking", chat))
             ents, capped = await _scan_deleted(context.bot, chat.id)
             text, kb = _dlist_view(chat.id, ents, capped)
             try:
@@ -2071,7 +2003,7 @@ async def deleted_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             extra.remember_menu_owner(wait, user.id)
     except PyMongoError:
         log.exception("msgcount: /deleted failed in %s", chat.id)
-        await msg.reply_text(NO_DB)
+        await msg.reply_text(_t("mc.no_db", chat))
 
 
 async def inactive_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2080,27 +2012,27 @@ async def inactive_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg, user = update.effective_message, update.effective_user
     if user is None or user.id == ANON_ADMIN_ID or msg.sender_chat is not None:
-        await msg.reply_text("I can't tell who you are while you post anonymously. Please post as yourself.")
+        await msg.reply_text(_t("mc.anon", chat))
         return
     days = INACTIVE_DEFAULT
     args = getattr(context, "args", None) or []
     if args:
         if not re.fullmatch(r"[0-9]{1,4}", args[0]) or not 1 <= int(args[0]) <= INACTIVE_MAX:
-            await msg.reply_text(f"Use /inactive or /inactive <days>, with days from 1 to {INACTIVE_MAX}. Example: /inactive 30")
+            await msg.reply_text(_t("mc.in_usage", chat, max=INACTIVE_MAX))
             return
         days = int(args[0])
     r = await _rights(context.bot, chat.id, user.id)
     if r is None:
-        await msg.reply_text("I couldn't verify your permissions right now. Nothing was changed.")
+        await msg.reply_text(_t("mc.cant_verify", chat))
         return
     if r < 1:
-        await msg.reply_text(DEL_DENIED)
+        await msg.reply_text(_t("mc.dl_denied", chat))
         return
     try:
         text, kb = await _inactive_view(context.bot, chat.id, days, 0)
     except PyMongoError:
         log.exception("msgcount: /inactive failed in %s", chat.id)
-        await msg.reply_text(NO_DB)
+        await msg.reply_text(_t("mc.no_db", chat))
         return
     sent = await msg.reply_html(text, reply_markup=kb)
     extra.remember_menu_owner(sent, user.id)
