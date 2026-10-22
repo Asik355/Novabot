@@ -1112,8 +1112,10 @@ HELP_SECTIONS = {
         "A muted or warned member can ask the admins to look at it again. It is OFF until you turn it on.\n\n"
         "<b>Admin commands:</b>\n"
         "1. /appeal on: Turn Appeal on (or /appeal off).\n"
-        "2. /appeal group: Send appeals to the group (or /appeal log, /appeal dm).\n"
-        "3. /appeal: Show the settings.",
+        "2. /appeal group: Also post each appeal in the group (or /appeal log for the log channel). Admins always get it "
+        "in the bot's private chat.\n"
+        "3. /appeal: Show the settings and the Appeal List.\n"
+        "4. /myappeals: In the bot's private chat, a member sees the status of their own appeals.",
     ),
     "locks": (
         "Locks",

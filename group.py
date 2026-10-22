@@ -1034,17 +1034,21 @@ async def night_cmd(update, context):
 #     /start appeal_<chat>_<m|w>. Bans, and automatic spam/flood warnings, are not covered.
 #   * In the private chat the bot checks that the person is really muted / warned right now, asks for a reason
 #     (max 300 characters, /skip to send none) and posts a card with ✅ Unmute / ✅ Remove warning and ❌ Reject.
-#   * Where the card goes is a setting (mod_appeal_dest): group (default), the log channel (the one /setlog set; the
-#     group when none is set) or the bot's private chat with the group's admins (the group when no admin started the bot).
-#   * One open appeal per person and kind. After a rejection the same person can appeal again after 24 hours.
-# Appeals are saved in the "appeals" collection: _id, chat_id, user_id, kind ("mute"|"warn"), ref (warning id),
-# reason, status ("open"|"approved"|"rejected"), created_at, decided_at, decided_by.
+#   * The card ALWAYS goes to the bot's private chat with every admin who has started the bot, and also to ONE place
+#     the admins choose (mod_appeal_dest): "group" (default) or "log" (the log channel; the group when none is set).
+#     Whoever decides first wins; every copy of the card is then updated.
+#   * The member gets the answer in the bot's private chat, and /myappeals there lists their appeals. After a
+#     rejection the member can appeal again at once (one pending appeal per person and kind).
+#   * /help > Appeal > 📋 Appeal List shows the group's appeals (5 per page); a pending one can be opened and decided.
+# Appeals are saved in the "appeals" collection: _id, chat_id, chat_title, user_id, user_name, kind ("mute"|"warn"),
+# ref (warning id), reason, text (the card), cards [{chat, id}], status ("open"|"approved"|"rejected"), created_at,
+# decided_at, decided_by, decided_name.
 APPEAL_KEY, APPEAL_DEST_KEY = "mod_appeal", "mod_appeal_dest"
-APPEAL_DESTS = ("group", "log", "dm")
+APPEAL_DESTS = ("group", "log")
 APPEAL_REASON_MAX = 300
-APPEAL_COOLDOWN = 24 * 3600          # seconds before a rejected person can appeal the same thing again
 APPEAL_ASK_TTL = 10 * 60             # seconds the bot waits for the reason in the private chat
-APPEAL_HOME = "help:appeal"
+APPEAL_PAGE = 5                      # appeals per page of the list
+APPEAL_ICON = {"open": "⏳", "approved": "✅", "rejected": "❌"}
 _apl_pending = {}                    # user_id -> (chat_id, kind, ref, expires at): waiting for the reason
 
 
@@ -1053,8 +1057,7 @@ def appeal_on(chat_id):
 
 
 def appeal_dest(chat_id):
-    dest = D.get_setting(chat_id, APPEAL_DEST_KEY, "group")
-    return dest if dest in APPEAL_DESTS else "group"
+    return "log" if D.get_setting(chat_id, APPEAL_DEST_KEY, "group") == "log" else "group"
 
 
 def appeal_markup(chat_id, user_id, kind, kb=None):
@@ -1085,6 +1088,12 @@ async def _apl_state(bot, chat_id, user_id, kind):
     return muted, None, ""
 
 
+async def _apl_rows(**match):
+    """The saved appeals matching `match`, newest first."""
+    rows = await asyncio.to_thread(lambda: list(store.col("appeals").find(match)))
+    return sorted(rows, key=lambda r: r.get("created_at", 0), reverse=True)
+
+
 # ------------------------------------------------------------------ the /help > Appeal page and /appeal
 def _apl_panel(chat, note=""):
     cid = getattr(chat, "id", None)
@@ -1097,8 +1106,47 @@ def _apl_panel(chat, note=""):
     rows = [[InlineKeyboardButton(L.t("apl.btn_off" if on else "apl.btn_on", cid), callback_data="apb:t")],
             [InlineKeyboardButton(("✅ " if d == dest else "") + L.t("apl.dest_" + d, cid), callback_data=f"apb:d:{d}")
              for d in APPEAL_DESTS],
+            [InlineKeyboardButton(L.t("apl.btn_list", cid), callback_data="apb:l:0")],
             [InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]]
     return text, InlineKeyboardMarkup(rows)
+
+
+def _apl_status(row, cid):
+    return L.t("apl.st_" + row["status"], cid, admin=html.escape(row.get("decided_name") or ""))
+
+
+async def _apl_list_panel(chat, page):
+    """The 📋 Appeal List page: 5 appeals, newest first; a pending one can be opened."""
+    cid = chat.id
+    rows = await _apl_rows(chat_id=cid)
+    pages = max(1, -(-len(rows) // APPEAL_PAGE))
+    page = min(max(page, 0), pages - 1)
+    shown = rows[page * APPEAL_PAGE:(page + 1) * APPEAL_PAGE]
+    if not rows:
+        text = L.t("apl.list_title", cid, count=0) + "\n\n" + L.t("apl.list_empty", cid)
+    else:
+        lines = [L.t("apl.list_line", cid, n=page * APPEAL_PAGE + i + 1, user=html.escape(r.get("user_name") or ""),
+                     kind=L.t("apl.kind_" + r["kind"], cid), status=_apl_status(r, cid)) for i, r in enumerate(shown)]
+        text = L.t("apl.list_title", cid, count=len(rows)) + "\n\n" + "\n".join(lines)
+        if any(r["status"] == "open" for r in shown):
+            text += "\n\n" + L.t("apl.list_tap", cid)
+    kb = [[InlineKeyboardButton(f"⏳ {r.get('user_name') or ''}: {L.t('apl.kind_' + r['kind'], cid)}"[:60],
+                                callback_data=f"apb:v:{r['_id']}")] for r in shown if r["status"] == "open"]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"apb:l:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"apb:l:{page + 1}"))
+    if nav:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton(L.t("pick.back", cid), callback_data="apb:a")])
+    return text, InlineKeyboardMarkup(kb)
+
+
+def _apl_decide_buttons(row, cid):
+    yes = L.t("apl.btn_unmute" if row["kind"] == "mute" else "apl.btn_rmwarn", cid)
+    return [InlineKeyboardButton(yes, callback_data=f"apl:a:{row['_id']}"),
+            InlineKeyboardButton(L.t("apl.btn_reject", cid), callback_data=f"apl:r:{row['_id']}")]
 
 
 async def help_appeal_callback(update, context):
@@ -1123,7 +1171,8 @@ def _apl_set(chat_id, what, value):
 
 
 async def apb_callback(update, context):
-    """"apb:t" switches Appeal ON/OFF, "apb:d:<group|log|dm>" picks where the appeal cards go. Admins only, every tap."""
+    """"apb:t" switch ON/OFF, "apb:d:<group|log>" where the extra card goes, "apb:a" the page, "apb:l:<page>" the list,
+    "apb:v:<id>" one pending appeal. Admins only, checked on every tap."""
     q = update.callback_query
     chat = q.message.chat if q.message else None
     if chat is None:
@@ -1138,21 +1187,36 @@ async def apb_callback(update, context):
         await q.answer(L.t("apl.admin_only", chat.id), show_alert=True)
         return
     parts = (q.data or "").split(":")[1:]
-    if parts == ["t"] or (len(parts) == 2 and parts[0] == "d" and parts[1] in APPEAL_DESTS):
-        try:
+    try:
+        if parts == ["a"]:
+            await q.answer()
+            await _ac_edit(q, *_apl_panel(chat))
+        elif parts == ["t"] or (len(parts) == 2 and parts[0] == "d" and parts[1] in APPEAL_DESTS):
             note = _apl_set(chat.id, parts[0], parts[1] if len(parts) == 2 else None)
-        except Exception:
-            log.exception("appeal: saving a setting failed in %s", chat.id)
-            await q.answer(L.t("ac.db_problem", chat.id), show_alert=True)
-            return
-        await q.answer(note)
-        await _ac_edit(q, *_apl_panel(chat))
-    else:
-        await q.answer("This button is no longer valid.", show_alert=True)
+            await q.answer(note)
+            await _ac_edit(q, *_apl_panel(chat))
+        elif len(parts) == 2 and parts[0] == "l" and parts[1].isdigit():
+            await q.answer()
+            await _ac_edit(q, *await _apl_list_panel(chat, int(parts[1])))
+        elif len(parts) == 2 and parts[0] == "v":
+            rows = await _apl_rows(_id=parts[1], chat_id=chat.id)
+            if not rows:
+                await q.answer("This button is no longer valid.", show_alert=True)
+                return
+            row = rows[0]
+            kb = ([_apl_decide_buttons(row, chat.id)] if row["status"] == "open" else [])
+            kb.append([InlineKeyboardButton(L.t("pick.back", chat.id), callback_data="apb:l:0")])
+            await q.answer()
+            await _ac_edit(q, (row.get("text") or "") + "\n\n" + _apl_status(row, chat.id), InlineKeyboardMarkup(kb))
+        else:
+            await q.answer("This button is no longer valid.", show_alert=True)
+    except Exception:
+        log.exception("appeal: page action failed in %s", chat.id)
+        await q.answer(L.t("ac.db_problem", chat.id), show_alert=True)
 
 
 async def appeal_cmd(update, context):
-    """/appeal  |  /appeal on|off  |  /appeal group|log|dm"""
+    """/appeal  |  /appeal on|off  |  /appeal group|log"""
     if not await D.group_only(update):
         return
     chat, msg = update.effective_chat, update.effective_message
@@ -1183,16 +1247,11 @@ async def appeal_start(update, context):
             await msg.reply_html(L.t("apl.dm_off", chat_id))
         else:
             active, ref, _ = await _apl_state(context.bot, chat_id, user.id, kind)
-            col = store.col("appeals")
-            key = {"chat_id": chat_id, "user_id": user.id, "kind": kind}
             if not active:
                 await msg.reply_html(L.t("apl.dm_none", chat_id, kind=L.t("apl.kind_" + kind, chat_id),
                                          chat=html.escape(gchat.title or "")))
-            elif await asyncio.to_thread(col.find_one, {**key, "status": "open"}):
+            elif await _apl_rows(chat_id=chat_id, user_id=user.id, kind=kind, status="open"):
                 await msg.reply_html(L.t("apl.dm_open", chat_id))
-            elif await asyncio.to_thread(col.find_one, {**key, "status": "rejected",
-                                                        "decided_at": {"$gt": time.time() - APPEAL_COOLDOWN}}):
-                await msg.reply_html(L.t("apl.dm_cooldown", chat_id))
             else:
                 _apl_pending[user.id] = (chat_id, kind, ref, time.monotonic() + APPEAL_ASK_TTL)
                 await msg.reply_html(L.t("apl.dm_ask", chat_id, chat=html.escape(gchat.title or ""),
@@ -1233,47 +1292,64 @@ async def appeal_reason(update, context):
     raise ApplicationHandlerStop
 
 
+async def myappeals_cmd(update, context):
+    """/myappeals in the bot's private chat: the member's own appeals and what became of them."""
+    msg, user = update.effective_message, update.effective_user
+    rows = (await _apl_rows(user_id=user.id))[:10]
+    cid = rows[0]["chat_id"] if rows else None
+    if not rows:
+        await msg.reply_html(L.t("apl.my_empty"))
+        return
+    lines = [L.t("apl.my_line", cid, n=i + 1, chat=html.escape(r.get("chat_title") or str(r["chat_id"])),
+                 kind=L.t("apl.kind_" + r["kind"], cid), status=L.t("apl.my_st_" + r["status"], cid))
+             for i, r in enumerate(rows)]
+    await msg.reply_html(L.t("apl.my_title", cid) + "\n\n" + "\n".join(lines))
+
+
 async def _apl_submit(bot, chat_id, user, kind, ref, reason):
-    """Saves the appeal and posts its card where the group wants it. True when someone can see it."""
+    """Saves the appeal and posts its card: to every admin who started the bot, and to the chosen place. True when
+    at least one card went out."""
     active, _, _ = await _apl_state(bot, chat_id, user.id, kind)
     if not active:
         return False
-    appeal_id = os.urandom(5).hex()
-    await asyncio.to_thread(store.col("appeals").insert_one, {
-        "_id": appeal_id, "chat_id": chat_id, "user_id": user.id, "kind": kind, "ref": ref, "reason": reason,
-        "status": "open", "created_at": time.time()})
     gchat = await bot.get_chat(chat_id)
     text = L.t("apl.card", chat_id, chat=html.escape(gchat.title or ""), user=user.mention_html(),
                kind=L.t("apl.kind_" + kind, chat_id),
                reason=html.escape(reason) if reason else L.t("apl.no_reason", chat_id))
-    yes = L.t("apl.btn_unmute" if kind == "mute" else "apl.btn_rmwarn", chat_id)
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(yes, callback_data=f"apl:a:{appeal_id}"),
-                                InlineKeyboardButton(L.t("apl.btn_reject", chat_id), callback_data=f"apl:r:{appeal_id}")]])
-    dest = appeal_dest(chat_id)
-    if dest == "log" and D.get_setting(chat_id, "log_channel"):
+    row = {"_id": os.urandom(5).hex(), "chat_id": chat_id, "chat_title": gchat.title or "", "user_id": user.id,
+           "user_name": getattr(user, "full_name", None) or getattr(user, "first_name", "") or str(user.id),
+           "kind": kind, "ref": ref, "reason": reason, "text": text, "cards": [], "status": "open",
+           "created_at": time.time()}
+    kb = InlineKeyboardMarkup([_apl_decide_buttons(row, chat_id)])
+
+    async def send(to):
         try:
-            await bot.send_message(int(D.get_setting(chat_id, "log_channel")), text, parse_mode="HTML", reply_markup=kb)
-            return True
+            sent = await bot.send_message(to, text, parse_mode="HTML", reply_markup=kb)
         except TelegramError:
-            log.warning("appeal: the log channel of %s didn't take the card", chat_id)
-    elif dest == "dm":
-        sent = 0
-        for adm in await bot.get_chat_administrators(chat_id):
-            if adm.user.is_bot:
-                continue
-            try:
-                await bot.send_message(adm.user.id, text, parse_mode="HTML", reply_markup=kb)
-                sent += 1
-            except TelegramError:
-                pass                                       # this admin never started the bot
-        if sent:
-            return True
-    try:
-        await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)   # the group, or the fallback
+            return False
+        row["cards"].append({"chat": to, "id": sent.message_id})
         return True
+
+    try:
+        admins = [a.user.id for a in await bot.get_chat_administrators(chat_id) if not a.user.is_bot]
     except TelegramError:
+        admins = []
+    for admin_id in admins:
+        await send(admin_id)                               # always: an admin who never started the bot is skipped
+    posted = False
+    log_id = D.get_setting(chat_id, "log_channel")
+    if appeal_dest(chat_id) == "log" and log_id:
+        try:
+            posted = await send(int(log_id))
+        except ValueError:
+            pass
+    if not posted:
+        await send(chat_id)                                # the group: the default, and the fallback
+    if not row["cards"]:
         log.warning("appeal: couldn't post the card in %s", chat_id)
         return False
+    await asyncio.to_thread(store.col("appeals").insert_one, row)
+    return True
 
 
 # ------------------------------------------------------------------ the admin's side (the card)
@@ -1295,8 +1371,10 @@ async def apl_callback(update, context):
         await q.answer(L.t("apl.card_admin_only", chat_id), show_alert=True)
         return
     new = "approved" if act == "a" else "rejected"
+    who = getattr(q.from_user, "full_name", None) or getattr(q.from_user, "first_name", "") or str(q.from_user.id)
     claim = await asyncio.to_thread(col.update_one, {"_id": appeal_id, "status": "open"},
-                                    {"$set": {"status": new, "decided_by": q.from_user.id, "decided_at": time.time()}})
+                                    {"$set": {"status": new, "decided_by": q.from_user.id, "decided_name": who,
+                                              "decided_at": time.time()}})
     if claim.modified_count != 1:
         await q.answer(L.t("apl.already", chat_id), show_alert=True)
         return
@@ -1310,15 +1388,23 @@ async def apl_callback(update, context):
             await asyncio.to_thread(col.update_one, {"_id": appeal_id}, {"$set": {"status": "open"}})
             await q.answer(L.t("apl.undo_failed", chat_id), show_alert=True)
             return
-    verdict = L.t("apl.done_approved_" + kind if act == "a" else "apl.done_rejected", chat_id,
-                  admin=q.from_user.mention_html())
     await q.answer()
+    final = (row.get("text") or q.message.text_html) + "\n\n" + L.t("apl.done_" + new, chat_id, admin=html.escape(who))
+    here = (q.message.chat.id, q.message.message_id) if q.message else None
+    cards = [(c["chat"], c["id"]) for c in row.get("cards", [])]
+    for card in cards:                                     # every copy of the card shows the result
+        try:
+            if card == here:
+                await q.edit_message_text(final, parse_mode="HTML", reply_markup=None)
+            else:
+                await context.bot.edit_message_text(final, chat_id=card[0], message_id=card[1], parse_mode="HTML")
+        except TelegramError:
+            pass                                           # deleted, or the same text
+    if here not in cards:                                  # decided from the Appeal List page
+        await _ac_edit(q, final, InlineKeyboardMarkup(
+            [[InlineKeyboardButton(L.t("pick.back", chat_id), callback_data="apb:l:0")]]))
     try:
-        await q.edit_message_text(q.message.text_html + "\n\n" + verdict, parse_mode="HTML", reply_markup=None)
-    except TelegramError:
-        pass
-    try:
-        await context.bot.send_message(user_id, L.t("apl.approved_dm" if act == "a" else "apl.rejected_dm", chat_id,
+        await context.bot.send_message(user_id, L.t("apl.approved_dm_" + kind if act == "a" else "apl.rejected_dm", chat_id,
                                                     chat=html.escape(gchat.title or "")), parse_mode="HTML")
     except TelegramError:
         pass                                               # the member blocked the bot
@@ -2791,6 +2877,7 @@ def register(app, deps):
     app.add_handler(CallbackQueryHandler(apb_callback, pattern=r"^apb:"))
     app.add_handler(CallbackQueryHandler(apl_callback, pattern=r"^apl:"))
     app.add_handler(CommandHandler("start", appeal_start, filters=filters.ChatType.PRIVATE), group=-20)
+    app.add_handler(CommandHandler("myappeals", myappeals_cmd, filters=filters.ChatType.PRIVATE))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, appeal_reason), group=-19)
     L.register(app, deps, _ac_allowed, extra.menu_not_owner)   # /lang and the 🌐 Language page (lang/ folder)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, ac_custom_message),
