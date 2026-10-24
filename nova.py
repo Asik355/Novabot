@@ -990,6 +990,9 @@ HELP_SECTIONS = {
             "/setgoodbye text: Set the message shown when someone leaves.",
             "/goodbye on|off: Toggle goodbye messages.",
             "/resetgoodbye: Restore the default goodbye message.",
+            "/greet: Open the Greetings panel (extra buttons, delete after a while, preview).",
+            "/wdel 5m|off: Delete the welcome message after a while (/gdel for the goodbye).",
+            "/wbtn text link: Add a button to the welcome message (/gbtn for the goodbye).",
         ]),
     ),
     "rules": (
@@ -1600,7 +1603,11 @@ USAGE_GUIDES = {
         "• Back to default: <code>/resetwelcome</code>\n\n"
         "<b>Goodbye message</b>: same with <code>/setgoodbye</code>, <code>/goodbye on|off</code>, <code>/resetgoodbye</code>.\n\n"
         "You can also reply to a message with <code>/setwelcome</code> to use it as the text. "
-        "Placeholders that work in the text: {first} {last} {fullname} {username} {mention} {id} {chat} {count} and {rules} (rules button)."),
+        "Placeholders that work in the text: {first} {last} {fullname} {username} {mention} {id} {chat} {count} and {rules} (rules button).\n\n"
+        "<b>Buttons and auto-delete</b>\n"
+        "• Open <b>👋 Greetings Panel</b> on this page, or send <code>/greet</code>\n"
+        "• Add a button: <code>/wbtn Join channel https://t.me/abc</code> (goodbye: <code>/gbtn</code>). Remove it: <code>/wbtn 2</code>\n"
+        "• Delete the message after a while: <code>/wdel 5m</code> (goodbye: <code>/gdel 5m</code>), turn off with <code>/wdel off</code>"),
     "rules": (
         "<b>Set the rules</b>\n"
         "• <code>/setrules Be kind and no spam</code> (or reply to a message with <code>/setrules</code>)\n"
@@ -1841,6 +1848,8 @@ def help_section_keyboard(key=None, chat=None):
                      InlineKeyboardButton("📤 Export", callback_data="ie:exp")])
     if key == "approval" and chat is not None and chat.type != "private":
         rows.append([InlineKeyboardButton("⚙️ Auto Approve", callback_data="jn:m")])
+    if key == "greet" and chat is not None and chat.type != "private":
+        rows.append([group.greet_button(chat)])  # 👋 extra buttons, delete-after, preview
     if key == "reports" and chat is not None and chat.type != "private":
         rows.append([group.report_button(chat)])  # 🚨 report cards: where they go, mute time, wait between reports
     if key == "locks" and chat is not None and chat.type != "private":
@@ -2689,11 +2698,13 @@ async def send_welcome(context, chat, user, reply_to=None):
                 pass
 
     template, markup = await template_markup(template, context, chat.id)
+    markup = group.greet_markup(chat.id, "w", markup)  # + the Greetings panel's extra buttons (group.py 2i)
     send = reply_to.reply_text if reply_to else chat.send_message
     if markup:
         send = functools.partial(send, reply_markup=markup)
     sent = await safe_html(send, render(template, user, chat, count))
     set_setting(chat.id, "last_welcome_id", sent.message_id)
+    await group.greet_after_send(chat.id, "w", sent)  # deletes itself after the chosen time
 
 
 async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2724,8 +2735,10 @@ async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     template = get_setting(chat.id, "goodbye", DEFAULT_GOODBYE)
     count = await chat.get_member_count()
     template, markup = await template_markup(template, context, chat.id)
+    markup = group.greet_markup(chat.id, "g", markup)
     send = functools.partial(chat.send_message, reply_markup=markup) if markup else chat.send_message
-    await safe_html(send, render(template, user, chat, count))
+    sent = await safe_html(send, render(template, user, chat, count))
+    await group.greet_after_send(chat.id, "g", sent)
 
 
 # ------------------------------------------------------------ rules module
@@ -6600,6 +6613,7 @@ def main():
         default_perms=DEFAULT_PERMS, fun_names=fun_systems._fun_names, is_admin=is_admin,
         is_bot_owner=is_bot_owner, owner_ids=OWNER_IDS, is_super_admin=is_super_admin,
         groups_source=_stats_refresh, active_warns=active_warns, get_target=get_target, raid_left=raid_left, add_warn=add_warn, do_action=do_action,
+        render=render, template_markup=template_markup, safe_html=safe_html, DEFAULT_WELCOME=DEFAULT_WELCOME, DEFAULT_GOODBYE=DEFAULT_GOODBYE,
         find_violation=find_violation, load_allow=load_allow, lock_exempt=lock_exempt, is_service_message=is_service_message))  # /autoclose, /night, /appeal, /cleanservice, /cleancommand, /export /import /reset, /lang
     msgcount.register(app, owner_ids=OWNER_IDS, groups_source=_stats_refresh)  # /rank /top /today /week /overall /me /radmin /resetrank + counter + 📊 menu
     app.add_handler(CallbackQueryHandler(wipe_callback, pattern=r"^wipe:"))  # /clearall and /stopall confirmation

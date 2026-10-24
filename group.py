@@ -5,6 +5,7 @@ group.py: all group-management logic in ONE file (merged from autoclose.py, clea
                       (+ the 🕒 Auto Close and ⌨️ Command buttons on /help > Auto Close: hour, minute, AM/PM pickers)
   NIGHT MODE          /night 11pm 6am   /night off   /night   (text-only at night; /help > Night Mode page)
   APPEAL              /appeal [on|off|group|log|dm]   (📩 Appeal button on mute / warn notices; OFF by default)
+  GREETINGS           /greet, /wdel <time|off>, /gdel, /wbtn <text> <link>, /gbtn   (extra buttons and delete-after for welcome / goodbye)
   REPORTS             /reportpanel, /reportmute <time>, /reportcooldown <time|off>   (the /report card: Mute / Warn / Delete message / Dismiss)
   PROBATION           /probation [on|off|hours <time>|msgs <n>|start|end|status]   (new members: no links / media for a while)
   RAID SHIELD         /raidmode [ban|restrict|lock], /raidwindow [time]   (extends nova's /antiraid: mute joiners or lock the group)
@@ -49,7 +50,9 @@ deps needs:
     groups_source(bot)       async, [(chat_id, title, link)] of every group the bot is in
     active_warns(chat_id, user_id)   a member's unexpired warnings as (id, reason, time), for Appeal
 nova.py also calls group.appeal_markup(chat_id, user_id, "mute"|"warn", kb) where it builds the Unmute / Remove warning button.
-nova.py also calls group.report_submit(bot, chat, msg, reporter) from file_report, passes add_warn and do_action, and adds group.report_button(chat) on /help > Reports.
+nova.py also calls group.greet_markup / greet_after_send in send_welcome and on_left_member, passes render, template_markup, safe_html,
+    DEFAULT_WELCOME and DEFAULT_GOODBYE, and adds group.greet_button(chat) on /help > Greetings.
+    nova.py also calls group.report_submit(bot, chat, msg, reporter) from file_report, passes add_warn and do_action, and adds group.report_button(chat) on /help > Reports.
     nova.py also passes find_violation, load_allow, lock_exempt and is_service_message (its lock engine) for the probation guard, and
     adds group.probation_button(chat) on /help > Locks.
 nova.py also calls group.raid_started / raid_stopped (after /antiraid on / off) and delegates raid_new_members to group.raid_new_members;
@@ -59,6 +62,7 @@ nova.py also calls group.record_undo(...) for unmute / unban / removed warnings,
 nova.py also calls group.ladder_warn(...) inside add_warn, group.wl_summary(chat_id) in /limits and group.warn_ladder_button(chat) on /help > Warnings.
 """
 import asyncio
+import functools
 import html
 import io
 import json
@@ -3014,6 +3018,350 @@ async def reportcooldown_cmd(update, context):
 
 
 # ======================================================================================================
+# 2i. GREETINGS PANEL  (extends nova.py's welcome / goodbye: extra buttons + delete-after)
+# ======================================================================================================
+# nova.py keeps the texts (/setwelcome, /setgoodbye ...) and the old [Text](buttonurl://link) buttons. New here, per message
+# kind "w" (welcome) and "g" (goodbye):
+#   * extra link buttons, two in a line (max GR_MAX_BTNS): welcome_btns / goodbye_btns = JSON [[text, url], ...]
+#   * delete-after: welcome_del / goodbye_del = seconds (0 = the message stays). It uses the notice sweeper (extra.track_notice),
+#     which runs every minute and keeps its schedule in MongoDB, so a restart loses nothing: the message goes within about a
+#     minute of the chosen time (minimum 1 minute).
+#   * nova's send_welcome / on_left_member call greet_markup(chat_id, kind, markup) and greet_after_send(chat_id, kind, sent).
+#   * panel: /greet or /help > Greetings > 👋 Greetings Panel (callbacks "gr:..."). Short commands:
+#       /wdel 5m | off, /gdel 5m | off     (delete-after)
+#       /wbtn Join channel https://t.me/abc, /gbtn ...   (add a button: the last word is the link)
+#       /wbtn 2 removes button 2, /wbtn alone opens that screen
+#   * "➕ Add button" in the panel waits for the admin's next message (5 minutes) in that chat: "Text link".
+GR_KINDS = {"w": ("welcome", "welcome_on", "True", "welcome_btns", "welcome_del"),
+            "g": ("goodbye", "goodbye_on", "False", "goodbye_btns", "goodbye_del")}   # kind -> (template key, on key, on default, buttons key, delete key)
+GR_MAX_BTNS = 6
+GR_DELS = (0, 60, 300, 900, 3600)
+GR_DEL_MIN, GR_DEL_MAX = 60, 86400
+GR_TEXT_MAX, GR_URL_MAX = 40, 300
+GR_PENDING_SECS = 300
+GR_PREVIEW_SECS = 60
+_gr_pending = {}        # (chat_id, admin id) -> {"kind", "panel": (chat id, message id), "until": monotonic time}
+
+
+def gr_buttons(chat_id, kind):
+    """The saved extra buttons of a message kind as a list of (text, url). Anything unreadable is ignored."""
+    try:
+        raw = json.loads(D.get_setting(chat_id, GR_KINDS[kind][3], "") or "[]")
+    except (TypeError, ValueError):
+        return []
+    out = []
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, (list, tuple)) and len(item) == 2 and all(isinstance(x, str) for x in item) and item[0] and item[1]:
+            out.append((item[0][:GR_TEXT_MAX], item[1]))
+    return out[:GR_MAX_BTNS]
+
+
+def _gr_save_buttons(chat_id, kind, buttons):
+    D.set_setting(chat_id, GR_KINDS[kind][3], json.dumps([list(b) for b in buttons], ensure_ascii=False))
+
+
+def gr_delete_secs(chat_id, kind):
+    secs = _num_setting(chat_id, GR_KINDS[kind][4], 0)
+    return secs if secs == 0 or GR_DEL_MIN <= secs <= GR_DEL_MAX else 0
+
+
+def gr_on(chat_id, kind):
+    _, on_key, default, _, _ = GR_KINDS[kind]
+    return D.get_setting(chat_id, on_key, default) == "True"
+
+
+def greet_button(chat):
+    """The 👋 button nova.py adds to /help > Greetings (groups only)."""
+    return InlineKeyboardButton(L.t("gr.btn_help", getattr(chat, "id", None)), callback_data="gr:m")
+
+
+def greet_markup(chat_id, kind, markup):
+    """nova's markup (its [..](buttonurl://..) buttons and {rules}) plus the panel's extra buttons, two in a line."""
+    extras = gr_buttons(chat_id, kind)
+    if not extras:
+        return markup
+    rows = [list(r) for r in (markup.inline_keyboard if markup else [])]
+    rows += _pairs([InlineKeyboardButton(text, url=url) for text, url in extras])
+    return InlineKeyboardMarkup(rows)
+
+
+async def greet_after_send(chat_id, kind, sent):
+    """Schedules the message's deletion when the group chose a delete-after time."""
+    secs = gr_delete_secs(chat_id, kind)
+    if secs and sent is not None:
+        await extra.track_notice(sent, secs)
+
+
+def _gr_url(token):
+    """A safe link from what an admin typed: https://..., http://..., tg://..., t.me/x or @channel. None when it is not one."""
+    token = token.strip()
+    if re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{3,31}", token):
+        return "https://t.me/" + token[1:]
+    if re.match(r"(?i)(t\.me|telegram\.me)/\S+$", token):
+        token = "https://" + token
+    return token if re.fullmatch(r"(?i)(https?|tg)://\S+", token) and len(token) <= GR_URL_MAX else None
+
+
+def _gr_parse_button(text):
+    """'Join channel https://t.me/abc' -> ('Join channel', 'https://t.me/abc'), or None."""
+    bits = str(text).strip().rsplit(None, 1)
+    if len(bits) != 2:
+        return None
+    label, url = bits[0].strip(), _gr_url(bits[1])
+    return (label, url) if url and 1 <= len(label) <= GR_TEXT_MAX else None
+
+
+def _gr_add_button(chat_id, kind, text):
+    """Returns (note, error key). Same text as an existing button replaces its link."""
+    parsed = _gr_parse_button(text)
+    if parsed is None:
+        return None, "gr.err_btn"
+    buttons = [b for b in gr_buttons(chat_id, kind) if b[0] != parsed[0]]
+    if len(buttons) >= GR_MAX_BTNS:
+        return None, "gr.err_full"
+    _gr_save_buttons(chat_id, kind, buttons + [parsed])
+    return L.t("gr.t_added", chat_id, text=html.escape(parsed[0])), None
+
+
+def _gr_state(chat_id, kind):
+    on = L.t("gr.on" if gr_on(chat_id, kind) else "gr.off", chat_id)
+    secs = gr_delete_secs(chat_id, kind)
+    return on, (L.t("gr.del_after", chat_id, dur=extra.fmt_duration(secs)) if secs else L.t("gr.del_never", chat_id))
+
+
+def _gr_main(chat, note=""):
+    cid = getattr(chat, "id", None)
+    if chat is None or chat.type == "private":
+        return L.t("gr.private", cid), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]])
+    lines = []
+    for kind in ("w", "g"):
+        on, dele = _gr_state(cid, kind)
+        lines.append(L.t("gr.line_" + kind, cid, state=on, dele=dele, n=len(gr_buttons(cid, kind))))
+    clean = D.get_setting(cid, "clean_welcome", "False") == "True"
+    text = (L.t("gr.title", cid) + "\n\n" + (note + "\n\n" if note else "") + L.t("gr.intro", cid) + "\n\n" + "\n".join(lines) + "\n" +
+            L.t("gr.clean_on" if clean else "gr.clean_off", cid) + "\n\n" + L.t("gr.note", cid))
+    rows = _pairs([InlineKeyboardButton(L.t("gr.b_w", cid), callback_data="gr:w:s"), InlineKeyboardButton(L.t("gr.b_g", cid), callback_data="gr:g:s"),
+                   InlineKeyboardButton(L.t("gr.b_clean", cid, state=L.t("gr.on" if clean else "gr.off", cid)), callback_data="gr:c")])
+    rows.append([InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:greet")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _gr_screen(chat, kind, note=""):
+    cid = chat.id
+    if chat.type == "private":
+        return L.t("gr.private", cid), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]])
+    on = gr_on(cid, kind)
+    _, dele = _gr_state(cid, kind)
+    buttons, secs = gr_buttons(cid, kind), gr_delete_secs(cid, kind)
+    lines = [f"{i}. {html.escape(t)} → {html.escape(u)}" for i, (t, u) in enumerate(buttons, 1)]
+    text = (L.t("gr.s_title_" + kind, cid) + "\n\n" + (note + "\n\n" if note else "") +
+            L.t("gr.s_state", cid, state=L.t("gr.on" if on else "gr.off", cid)) + "\n" + L.t("gr.s_del", cid, dele=dele) + "\n\n" +
+            L.t("gr.s_btns", cid, n=len(buttons), max=GR_MAX_BTNS) + "\n" + ("\n".join(lines) if lines else L.t("gr.s_none", cid)) + "\n\n" +
+            L.t("gr.s_hint_" + kind, cid))
+    mark = lambda cond: "✅ " if cond else ""
+    rows = _pairs([InlineKeyboardButton(L.t("gr.b_off" if on else "gr.b_on", cid), callback_data=f"gr:{kind}:t"),
+                   InlineKeyboardButton(L.t("gr.b_preview", cid), callback_data=f"gr:{kind}:p")])
+    rows += _pairs([InlineKeyboardButton(mark(s == secs) + "⏱ " + (extra.fmt_duration(s) if s else L.t("gr.never", cid)), callback_data=f"gr:{kind}:d:{s}")
+                    for s in GR_DELS])
+    rows += _pairs([InlineKeyboardButton(f"🗑 {i}. {t[:18]}", callback_data=f"gr:{kind}:x:{i}") for i, (t, _) in enumerate(buttons, 1)])
+    if len(buttons) < GR_MAX_BTNS:
+        rows.append([InlineKeyboardButton(L.t("gr.b_add", cid), callback_data=f"gr:{kind}:a")])
+    rows.append([InlineKeyboardButton(L.t("pick.back", cid), callback_data="gr:m")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def _gr_preview(bot, chat, kind, user):
+    """Posts the message as a new member would see it (deletes itself soon)."""
+    tmpl_key, _, _, _, _ = GR_KINDS[kind]
+    template = D.get_setting(chat.id, tmpl_key, D.DEFAULT_WELCOME if kind == "w" else D.DEFAULT_GOODBYE)
+    count = await chat.get_member_count()
+    body, markup = await D.template_markup(template, _Args((), bot), chat.id)
+    markup = greet_markup(chat.id, kind, markup)
+    send = functools.partial(chat.send_message, reply_markup=markup) if markup else chat.send_message
+    sent = await D.safe_html(send, D.render(body, user, chat, count))
+    if sent is not None:
+        await extra.track_notice(sent, GR_PREVIEW_SECS)
+    return sent
+
+
+async def gr_callback(update, context):
+    """\"gr:m\" main, \"gr:c\" clean welcome on/off, \"gr:<w|g>:s\" a message's screen, \":t\" on/off, \":p\" preview,
+    \":d:<secs>\" delete after, \":x:<n>\" remove a button, \":a\" add a button. Admins only, checked on every tap."""
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    if chat is None:
+        await q.answer()
+        return
+    if await extra.menu_not_owner(q):
+        return
+    if chat.type == "private":
+        await q.answer(L.t("gr.private"), show_alert=True)
+        return
+    cid = chat.id
+    if not await _ac_allowed(chat, q.from_user.id):
+        await q.answer(L.t("gr.admin_only", cid), show_alert=True)
+        return
+    parts = (q.data or "").split(":")[1:]
+    toast, screen = None, None                               # screen: the kind whose screen to show again (None = main)
+    try:
+        if parts == ["m"]:
+            pass
+        elif parts == ["c"]:
+            now_on = D.get_setting(cid, "clean_welcome", "False") == "True"
+            D.set_setting(cid, "clean_welcome", "False" if now_on else "True")
+            toast = L.t("gr.t_clean_off" if now_on else "gr.t_clean_on", cid)
+        elif len(parts) >= 2 and parts[0] in GR_KINDS and parts[1] in ("s", "t", "p", "a", "d", "x"):
+            kind, act, arg = parts[0], parts[1], (parts[2] if len(parts) == 3 else None)
+            screen = kind
+            if act in ("s", "t", "p", "a") and len(parts) != 2 or act in ("d", "x") and len(parts) != 3:
+                raise ValueError
+            if act == "t":
+                D.set_setting(cid, GR_KINDS[kind][1], "False" if gr_on(cid, kind) else "True")
+                toast = L.t("gr.t_on" if gr_on(cid, kind) else "gr.t_off", cid)
+            elif act == "p":
+                if await _gr_preview(context.bot, chat, kind, q.from_user) is None:
+                    await q.answer(L.t("gr.err_preview", cid), show_alert=True)
+                    return
+                toast = L.t("gr.t_preview", cid)
+            elif act == "d":
+                secs = _ac_num(arg, 0, GR_DEL_MAX)
+                if secs not in GR_DELS:
+                    raise ValueError
+                D.set_setting(cid, GR_KINDS[kind][4], secs)
+                toast = L.t("gr.t_del", cid, dur=extra.fmt_duration(secs)) if secs else L.t("gr.t_del_off", cid)
+            elif act == "x":
+                n, buttons = _ac_num(arg, 1, GR_MAX_BTNS), gr_buttons(cid, kind)
+                if n is None or n > len(buttons):
+                    raise ValueError
+                _gr_save_buttons(cid, kind, buttons[:n - 1] + buttons[n:])
+                toast = L.t("gr.t_removed", cid)
+            elif act == "a":
+                if len(gr_buttons(cid, kind)) >= GR_MAX_BTNS:
+                    await q.answer(L.t("gr.err_full", cid, n=GR_MAX_BTNS), show_alert=True)
+                    return
+                _gr_pending[(cid, q.from_user.id)] = {"kind": kind, "panel": (cid, q.message.message_id), "until": time.monotonic() + GR_PENDING_SECS}
+                await q.answer(L.t("gr.t_ask", cid))
+                await chat.send_message(L.t("gr.ask", cid, user=q.from_user.mention_html()), parse_mode="HTML")
+                return
+        else:
+            raise ValueError
+    except ValueError:
+        await q.answer(L.t("gr.invalid", cid), show_alert=True)
+        return
+    except Exception:
+        log.exception("greetings: panel action failed in %s", cid)
+        await q.answer(L.t("ac.db_problem", cid), show_alert=True)
+        return
+    await q.answer(toast)
+    await _ac_edit(q, *(_gr_screen(chat, screen) if screen else _gr_main(chat)))
+
+
+async def gr_input(update, context):
+    """group=-11, cheap: only acts when the admin tapped ➕ Add button and now sends "Text link" (or "cancel")."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user or not _gr_pending:
+        return
+    key = (chat.id, user.id)
+    pending = _gr_pending.get(key)
+    if pending is None:
+        return
+    if time.monotonic() > pending["until"]:
+        _gr_pending.pop(key, None)
+        return
+    if not await D.is_admin(chat, user.id):
+        _gr_pending.pop(key, None)
+        return
+    kind, text = pending["kind"], (msg.text or "").strip()
+    if text.lower() in ("cancel", "stop"):
+        _gr_pending.pop(key, None)
+        await _rp_note(msg, "gr.t_cancel", 10)
+        raise ApplicationHandlerStop
+    note, err = _gr_add_button(chat.id, kind, text)
+    if err:
+        await _rp_note(msg, err, 15, n=GR_MAX_BTNS)
+        raise ApplicationHandlerStop
+    _gr_pending.pop(key, None)
+    try:
+        await msg.delete()
+    except TelegramError:
+        pass
+    try:
+        panel_chat, panel_id = pending["panel"]
+        screen, kb = _gr_screen(chat, kind, note)
+        await context.bot.edit_message_text(screen, chat_id=panel_chat, message_id=panel_id, parse_mode="HTML", reply_markup=kb,
+                                            disable_web_page_preview=True)
+    except TelegramError:
+        await _rp_note(msg, "gr.t_added", 10, text=html.escape(text))
+    raise ApplicationHandlerStop
+
+
+async def greet_cmd(update, context):
+    """/greet: the panel (admins)."""
+    if not await D.group_only(update):
+        return
+    text, markup = _gr_main(update.effective_chat)
+    await update.effective_message.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+async def _gr_del_cmd(update, context, kind):
+    if not await D.group_only(update):
+        return
+    chat, msg, note = update.effective_chat, update.effective_message, ""
+    if context.args:
+        text = " ".join(context.args).lower()
+        secs = 0 if text in ("off", "no", "0") else _parse_secs(text, GR_DEL_MIN, GR_DEL_MAX)
+        if secs is None:
+            await msg.reply_html(L.t("gr.err_del", chat.id, cmd="wdel" if kind == "w" else "gdel"))
+            return
+        D.set_setting(chat.id, GR_KINDS[kind][4], secs)
+        note = L.t("gr.t_del", chat.id, dur=extra.fmt_duration(secs)) if secs else L.t("gr.t_del_off", chat.id)
+    text, markup = _gr_screen(chat, kind, note)
+    await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+async def _gr_btn_cmd(update, context, kind):
+    if not await D.group_only(update):
+        return
+    chat, msg, note = update.effective_chat, update.effective_message, ""
+    if context.args:
+        buttons = gr_buttons(chat.id, kind)
+        if len(context.args) == 1 and context.args[0].isdigit():
+            n = int(context.args[0])
+            if not 1 <= n <= len(buttons):
+                await msg.reply_html(L.t("gr.err_nobtn", chat.id, n=n))
+                return
+            _gr_save_buttons(chat.id, kind, buttons[:n - 1] + buttons[n:])
+            note = L.t("gr.t_removed", chat.id)
+        else:
+            note, err = _gr_add_button(chat.id, kind, " ".join(context.args))
+            if err:
+                await msg.reply_html(L.t(err, chat.id, n=GR_MAX_BTNS))
+                return
+    text, markup = _gr_screen(chat, kind, note)
+    await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+async def wdel_cmd(update, context):
+    """/wdel 5m | off: delete the welcome message after a while."""
+    await _gr_del_cmd(update, context, "w")
+
+
+async def gdel_cmd(update, context):
+    """/gdel 5m | off: the same for the goodbye message."""
+    await _gr_del_cmd(update, context, "g")
+
+
+async def wbtn_cmd(update, context):
+    """/wbtn Join channel https://t.me/abc: add a welcome button. /wbtn 2 removes button 2. /wbtn alone opens the screen."""
+    await _gr_btn_cmd(update, context, "w")
+
+
+async def gbtn_cmd(update, context):
+    """/gbtn ...: the same for the goodbye message."""
+    await _gr_btn_cmd(update, context, "g")
+
+
+# ======================================================================================================
 # 3. CLEAN SERVICE + CLEAN COMMANDS
 # ======================================================================================================
 # Keeps a group tidy by deleting Telegram service messages and bot commands. Only admins change the settings.
@@ -3621,6 +3969,7 @@ MODULES = {
     "federations": {"keys": ()},
     "filters": {"keys": (), "filters": True},
     "greetings": {"keys": ("welcome", "welcome_on", "goodbye", "goodbye_on", "clean_welcome", "join_dm",
+                           "welcome_btns", "goodbye_btns", "welcome_del", "goodbye_del",
                            "join_dm_text", "join_delay", "captcha", "captcha_mode", "captcha_time",
                            "captcha_action")},
     "locks": {"keys": ("lock", "lockwarns", "prob", "prob_hours", "prob_msgs", "prob_block", "prob_notice"), "prefixes": ("lock_",)},
@@ -4436,6 +4785,13 @@ def register(app, deps):
     app.add_handler(CommandHandler("raidmode", raidmode_cmd))          # Raid Shield: ban / mute joiners / lock the group
     app.add_handler(CommandHandler("raidwindow", raidwindow_cmd))
     app.add_handler(CallbackQueryHandler(rd_callback, pattern=r"^rd:"))
+    app.add_handler(CommandHandler("greet", greet_cmd))                # Greetings: extra buttons, delete-after
+    app.add_handler(CommandHandler("wdel", wdel_cmd))
+    app.add_handler(CommandHandler("gdel", gdel_cmd))
+    app.add_handler(CommandHandler("wbtn", wbtn_cmd))
+    app.add_handler(CommandHandler("gbtn", gbtn_cmd))
+    app.add_handler(CallbackQueryHandler(gr_callback, pattern=r"^gr:"))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, gr_input), group=-11)   # ➕ Add button: the next message
     app.add_handler(CommandHandler("reportpanel", reportpanel_cmd))    # Reports: card settings
     app.add_handler(CommandHandler("reportmute", reportmute_cmd))
     app.add_handler(CommandHandler("reportcooldown", reportcooldown_cmd))
