@@ -38,6 +38,11 @@ try:  # needed for the AI commands and fun utilities (pure HTTP, no Google SDK)
 except ImportError:
     requests = None
 
+try:
+    from lang import lang as L   # English / Hinglish texts (lang/lang.py)
+except ImportError:
+    import lang as L             # lang.py uploaded next to this file instead of inside a lang/ folder
+
 log = logging.getLogger(__name__)
 
 _deps = {}
@@ -2798,13 +2803,93 @@ def punishment_text(kind, secs=None, now=None):
     return str(kind)
 
 
-def action_notice(mention, label, reason, punishment, by=None):
-    """The notice text (HTML). `mention` and `by` are already-safe HTML; reason and punishment are escaped here."""
-    lines = [f"🚫 <b>Action:</b> {html.escape(label)}", f"👤 <b>User:</b> {mention}"]
+# Notices are built in English everywhere (they are also saved as history rows in English). When a chat_id is given and
+# that group uses another language, action_notice() translates the known labels, default reasons and punishments just
+# before they are shown: unknown text (a reason typed by an admin, a feature's own reason) is left exactly as it is.
+_NOTICE_TEXT = {
+    "Banned": "wn.lbl_banned", "Kicked": "wn.lbl_kicked", "Muted": "wn.lbl_muted", "Message deleted": "wn.lbl_deleted",
+    "Warned": "wn.lbl_warned", "No reason given": "wn.no_reason",
+    "Muted by an admin (no reason given)": "wn.why_muted", "Banned by an admin (no reason given)": "wn.why_banned",
+    "Kicked by an admin (no reason given)": "wn.why_kicked",
+    "Banned permanently (can only return if an admin unbans)": "wn.pun_ban",
+    "Kicked out (temporary: can rejoin with an invite link)": "wn.pun_kick",
+    "Muted permanently (until an admin unmutes)": "wn.pun_mute_perm", "Message deleted only (no mute or ban)": "wn.pun_delete",
+    # undo / appeal rows of the mod log (group.py record_undo)
+    "Unmuted": "wn.lbl_unmuted", "Unbanned": "wn.lbl_unbanned", "Warning removed": "wn.lbl_unwarned",
+    "Warnings reset": "wn.lbl_reset", "Appeal rejected": "wn.lbl_appeal_no", "Appeal accepted": "wn.why_appeal_ok",
+    "Mute lifted": "wn.pun_unmute", "Ban lifted": "wn.pun_unban", "All warnings cleared": "wn.pun_reset",
+    "Nothing changed": "wn.pun_nochange",
+    # Raid Shield rows (group.py 2f)
+    # Reports (group.py 2h)
+    "Muted (report)": "wn.lbl_report_mute", "Message deleted (report)": "wn.lbl_report_del", "Reported by a member": "wn.why_report",
+    "Joined during a raid": "wn.why_raid", "Temporary ban": "wn.pun_tban", "Muted until the raid ends": "wn.pun_raid_mute",
+}
+
+
+def _notice_units(text, chat_id):
+    """'1 hour 30 minutes' -> the same in the group's language."""
+    return re.sub(r"(\d+) (day|hour|minute|second)s?\b",
+                  lambda m: L.t("wn.u_" + m.group(2) + ("s" if int(m.group(1)) != 1 else ""), chat_id, n=m.group(1)), text)
+
+
+def _notice_mode(text, chat_id):
+    """'ban' / 'kick' / 'mute' / 'mute for 1h' as describe_mode() writes them."""
+    m = re.fullmatch(r"mute for (\S+)", text)
+    if m:
+        return L.t("wn.mode_tmute", chat_id, dur=m.group(1))
+    return L.t("wn.mode_" + text, chat_id) if text in ("ban", "kick", "mute") else text
+
+
+def translate_notice(text, chat_id):
+    """The group's-language version of one notice part (label, reason or punishment); English groups: unchanged."""
+    if chat_id is None or not isinstance(text, str) or L.get_lang(chat_id) == "en":
+        return text
+    key = _NOTICE_TEXT.get(text)
+    if key:
+        return L.t(key, chat_id)
+    m = re.fullmatch(r"Warned \((\d+)/(\d+)\)", text)
+    if m:
+        return L.t("wn.lbl_warned_n", chat_id, count=m.group(1), limit=m.group(2))
+    m = re.fullmatch(r"(Banned|Kicked|Muted) \(warn limit reached\)", text)
+    if m:
+        return L.t("wn.lbl_limit", chat_id, action=L.t(_NOTICE_TEXT[m.group(1)], chat_id))
+    m = re.fullmatch(r"Warning (\d+)/(\d+): no mute or ban yet\. At \d+/\d+ warnings the action is (.+)", text, re.S)
+    if m:
+        return L.t("wn.pun_warn", chat_id, count=m.group(1), limit=m.group(2), mode=_notice_mode(m.group(3), chat_id))
+    m = re.fullmatch(r"Reached (\d+)/(\d+) warnings\. Last warning: (.*)", text, re.S)
+    if m:
+        return L.t("wn.why_limit", chat_id, count=m.group(1), limit=m.group(2), last=m.group(3))
+    m = re.fullmatch(r"Muted for (.+) \(temporary, ends (.+) IST\)", text)
+    if m:
+        return L.t("wn.pun_mute_for", chat_id, dur=_notice_units(m.group(1), chat_id), when=m.group(2))
+    # Warn Ladder (group.py): "Warned (warn 2)", "Muted (warn step 3)", "Warning 2: no action yet. At 3 warns ...", "Reached 3 warnings. ..."
+    m = re.fullmatch(r"(Banned|Muted) \(raid\)", text)
+    if m:
+        return L.t("wn.lbl_raid", chat_id, action=L.t(_NOTICE_TEXT[m.group(1)], chat_id))
+    m = re.fullmatch(r"Warned \(warn (\d+)\)", text)
+    if m:
+        return L.t("wn.lbl_warned_c", chat_id, count=m.group(1))
+    m = re.fullmatch(r"(Banned|Kicked|Muted) \(warn step (\d+)\)", text)
+    if m:
+        return L.t("wn.lbl_step", chat_id, action=L.t(_NOTICE_TEXT[m.group(1)], chat_id), count=m.group(2))
+    m = re.fullmatch(r"Warning (\d+): no action yet\. At (\d+) warns the action is (.+)", text, re.S)
+    if m:
+        return L.t("wn.pun_ladder", chat_id, count=m.group(1), next=m.group(2), mode=_notice_mode(m.group(3), chat_id))
+    m = re.fullmatch(r"Reached (\d+) warnings\. Last warning: (.*)", text, re.S)
+    if m:
+        return L.t("wn.why_step", chat_id, count=m.group(1), last=m.group(2))
+    return text
+
+
+def action_notice(mention, label, reason, punishment, by=None, chat_id=None):
+    """The notice text (HTML). `mention` and `by` are already-safe HTML; reason and punishment are escaped here.
+    Give `chat_id` to show it in that group's language (/lang)."""
+    tr = lambda s: translate_notice(s, chat_id)
+    lines = [L.t("wn.f_action", chat_id, label=html.escape(tr(label))), L.t("wn.f_user", chat_id, user=mention)]
     if by:
-        lines.append(f"👮 <b>By:</b> {by}")
-    lines.append(f"📋 <b>Reason:</b> {html.escape(reason or 'No reason given')}")
-    lines.append(f"⚖️ <b>Punishment:</b> {html.escape(punishment)}")
+        lines.append(L.t("wn.f_by", chat_id, by=by))
+    lines.append(L.t("wn.f_reason", chat_id, reason=html.escape(tr(reason or "No reason given"))))
+    lines.append(L.t("wn.f_punish", chat_id, punish=html.escape(tr(punishment))))
     return "\n".join(lines)
 
 
@@ -2824,13 +2909,20 @@ async def track_notice(sent, secs=None):
         log.exception("Couldn't schedule the automatic deletion of a notice")
 
 
-async def record_action(chat_id, user_id, name, label, reason, punishment, by=None, category="mod"):
-    """One short history row (action, user, reason, punishment). MongoDB deletes it by itself after 15 days."""
+_KIND_BY_LABEL = {"Banned": "ban", "Kicked": "kick", "Muted": "mute", "Warned": "warn", "Message deleted": "delete"}
+
+
+async def record_action(chat_id, user_id, name, label, reason, punishment, by=None, category="mod", kind=None):
+    """One short history row (action, user, reason, punishment). MongoDB deletes it by itself after 15 days.
+    The row also keeps the member's id, a `kind` (taken from the label when not given) and its parts, for /modlog."""
     line = (f"{label} | user {user_id} ({_plain(name) or 'unknown'}) | reason: {reason or 'none given'} | {punishment}"
             + (f" | by {_plain(by)}" if by else ""))
+    kind = kind or _KIND_BY_LABEL.get(str(label).split(" (")[0])
+    meta = {"label": label, "reason": reason or "", "punish": punishment, "by": _plain(by) if by else "",
+            "name": _plain(name)}
     try:
         import migrate_to_mongo as _m
-        await asyncio.to_thread(_m.modlog_add, chat_id, category, line, int(time.time()))
+        await asyncio.to_thread(_m.modlog_add, chat_id, category, line, int(time.time()), user_id, kind, meta)
     except Exception:
         log.exception("Couldn't save the action history row")
 
@@ -3516,7 +3608,7 @@ async def ads_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             label = ACTION_LABEL["delete"]
             punish = f"Message deleted only. I couldn't {action} the user: please give me the 'Restrict members' admin right"
-        text = action_notice(mention, label, why, punish)
+        text = action_notice(mention, label, why, punish, chat_id=chat.id)
         shown = (msg.text or msg.caption or "").strip().replace("\n", " ")
         if shown:  # so admins can check what was removed (in <code>: links are not clickable)
             text += f"\n🗒 <b>Removed:</b> <code>{html.escape(shown[:200])}{'…' if len(shown) > 200 else ''}</code>"
@@ -4756,7 +4848,7 @@ async def nsfw_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             label, punish = ACTION_LABEL["delete"], punishment_text("delete")
             if failed:
                 punish = f"Message deleted only. I couldn't {action} the user: please give me the 'Restrict members' admin right"
-        text = action_notice(mention, label, why, punish)
+        text = action_notice(mention, label, why, punish, chat_id=chat.id)
     else:
         text = None
         if time.time() - _nsfw_notice.get(chat.id, 0) > 600:

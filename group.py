@@ -5,6 +5,11 @@ group.py: all group-management logic in ONE file (merged from autoclose.py, clea
                       (+ the 🕒 Auto Close and ⌨️ Command buttons on /help > Auto Close: hour, minute, AM/PM pickers)
   NIGHT MODE          /night 11pm 6am   /night off   /night   (text-only at night; /help > Night Mode page)
   APPEAL              /appeal [on|off|group|log|dm]   (📩 Appeal button on mute / warn notices; OFF by default)
+  REPORTS             /reportpanel, /reportmute <time>, /reportcooldown <time|off>   (the /report card: Mute / Warn / Delete message / Dismiss)
+  PROBATION           /probation [on|off|hours <time>|msgs <n>|start|end|status]   (new members: no links / media for a while)
+  RAID SHIELD         /raidmode [ban|restrict|lock], /raidwindow [time]   (extends nova's /antiraid: mute joiners or lock the group)
+  MOD LOG             /modlog [@user]   (history page with filters; nova's /modlog calls modlog_command)
+  WARN LADDER         /warnladder [on|off|clear|<count> <action> [time]|remove <count>]   (a different action per warning count)
   LANGUAGE            /lang  (English / Hinglish; the texts live in the lang/ folder)
   CLEAN SERVICE       /cleanservice <type>  /keepservice <type>  /nocleanservice <type>  /cleanservicetypes
   CLEAN COMMANDS      /clean <type or /command>  /keep <type or /command>  /cleancommandtypes
@@ -44,6 +49,14 @@ deps needs:
     groups_source(bot)       async, [(chat_id, title, link)] of every group the bot is in
     active_warns(chat_id, user_id)   a member's unexpired warnings as (id, reason, time), for Appeal
 nova.py also calls group.appeal_markup(chat_id, user_id, "mute"|"warn", kb) where it builds the Unmute / Remove warning button.
+nova.py also calls group.report_submit(bot, chat, msg, reporter) from file_report, passes add_warn and do_action, and adds group.report_button(chat) on /help > Reports.
+    nova.py also passes find_violation, load_allow, lock_exempt and is_service_message (its lock engine) for the probation guard, and
+    adds group.probation_button(chat) on /help > Locks.
+nova.py also calls group.raid_started / raid_stopped (after /antiraid on / off) and delegates raid_new_members to group.raid_new_members;
+    raid_left(chat_id) is nova's seconds-left of a raid; group.raid_button(chat) is on /help > Raid & Flood.
+nova.py also calls group.record_undo(...) for unmute / unban / removed warnings, and group.modlog_button(chat) on /help > Log Channels.
+    get_target(update, context)   async, (user id, mention) of the replied-to or named member (replies by itself on failure)
+nova.py also calls group.ladder_warn(...) inside add_warn, group.wl_summary(chat_id) in /limits and group.warn_ladder_button(chat) on /help > Warnings.
 """
 import asyncio
 import html
@@ -317,13 +330,14 @@ async def run_once(bot):
     now = _now_minutes()
     await _auto_close_round(bot, now)
     await _night_round(bot, now)                       # Night Mode (section 2b) uses the same loop
+    await _raid_round(bot)                             # Raid Shield (section 2f): lifts the lock when the raid is over
 
 
 async def _auto_close_round(bot, now):
     for chat_id, raw in await asyncio.to_thread(_scheduled_groups):
         sched = load_schedule(raw)
-        if not sched or chat_id >= 0 or D.is_paused(chat_id):
-            continue
+        if not sched or chat_id >= 0 or D.is_paused(chat_id) or D.get_setting(chat_id, RAID_LOCK_KEY, "") == "on":
+            continue                                     # (a raid lock holds the group: section 2f)
         close, open_ = sched
         want_closed = is_closed_at(now, close, open_)
         is_closed = D.get_setting(chat_id, STATE_KEY, "open") == "closed"
@@ -869,8 +883,8 @@ async def night_off(bot, chat_id):
 async def _night_round(bot, now):
     for chat_id, raw in await asyncio.to_thread(_scheduled_groups, NIGHT_KEY):
         sched = load_schedule(raw)
-        if not sched or chat_id >= 0 or D.is_paused(chat_id):
-            continue
+        if not sched or chat_id >= 0 or D.is_paused(chat_id) or D.get_setting(chat_id, RAID_LOCK_KEY, "") == "on":
+            continue                                     # (a raid lock holds the group: section 2f)
         start, end = sched
         want = is_closed_at(now, start, end)             # "inside the window", same maths as Auto Close
         active = D.get_setting(chat_id, NIGHT_STATE_KEY, "") == "on"
@@ -1060,9 +1074,23 @@ async def _apl_state(bot, chat_id, user_id, kind):
     return muted, None, ""
 
 
+APPEAL_KEEP = 24 * 3600               # a decided appeal leaves the list this long after the decision
+
+
+def _apl_purge_find(match, name="appeals", decided=("approved", "rejected"), keep=None):
+    """Delete decided appeals older than APPEAL_KEEP (open ones stay), then return the matching rows. The Reports list
+    (section 2h) uses it too, with its own collection, statuses and keep time."""
+    col = store.col(name)
+    try:
+        col.delete_many({"status": {"$in": list(decided)}, "decided_at": {"$lt": time.time() - (keep or APPEAL_KEEP)}})
+    except Exception:
+        log.exception("%s: couldn't clear old decided rows", name)
+    return list(col.find(match))
+
+
 async def _apl_rows(**match):
-    """The saved appeals matching `match`, newest first."""
-    rows = await asyncio.to_thread(lambda: list(store.col("appeals").find(match)))
+    """The saved appeals matching `match`, newest first. Decided ones are cleared 24 hours after the decision."""
+    rows = await asyncio.to_thread(_apl_purge_find, match)
     return sorted(rows, key=lambda r: r.get("created_at", 0), reverse=True)
 
 
@@ -1361,6 +1389,13 @@ async def apl_callback(update, context):
             await q.answer(L.t("apl.undo_failed", chat_id), show_alert=True)
             return
     await q.answer()
+    by = q.from_user.mention_html() if hasattr(q.from_user, "mention_html") else html.escape(who)
+    if act == "a":                                         # the mod log: who accepted / rejected the appeal
+        await record_undo(chat_id, user_id, row.get("user_name") or str(user_id), "unmute" if kind == "mute" else "unwarn",
+                          by, "Appeal accepted")
+    else:
+        await record_undo(chat_id, user_id, row.get("user_name") or str(user_id), "appeal_no", by,
+                          row.get("reason") or None)
     final = (row.get("text") or q.message.text_html) + "\n\n" + L.t("apl.done_" + new, chat_id, admin=html.escape(who))
     here = (q.message.chat.id, q.message.message_id) if q.message else None
     cards = [(c["chat"], c["id"]) for c in row.get("cards", [])]
@@ -1390,6 +1425,1592 @@ async def _apl_undo(bot, row):
         await bot.restrict_chat_member(chat_id, user_id, perms)
     elif any(w[0] == row["ref"] for w in await asyncio.to_thread(D.active_warns, chat_id, user_id)):
         await asyncio.to_thread(store.warn_delete, row["ref"])
+
+
+# ======================================================================================================
+# 2d. WARN LADDER
+# ======================================================================================================
+# A different action for each warning count, chosen by the admins. NOTHING is set by default.
+#   * Saved per group: warn_ladder = "2:tmute:7200,5:kick" (count:action[:seconds], sorted by count) and
+#     warn_ladder_on = "on" | "off" (default off).
+#   * OFF (or ON with no steps): nova.py's add_warn keeps using /warnlimit + /warnmode, exactly as before.
+#   * ON: when a member's active warnings reach a step's count, that step's action is applied. A count without a step
+#     gets the plain warning notice. The LAST step also resets the member's warn count, so the ladder starts again;
+#     earlier steps keep the count. A member who already has more warnings than the last step gets the last step on
+#     the next warning.
+#   * A step is "mute" (permanent), "tmute" (with seconds), "kick" or "ban". Counts 1-50, at most WL_MAX_STEPS steps.
+#   * Adding the first step to an empty ladder switches it ON.
+#   * Customised from /help > Warnings > 🪜 Warn Ladder, or with /warnladder (see wl_usage in lang.py).
+WL_KEY, WL_ON_KEY = "warn_ladder", "warn_ladder_on"
+WL_KINDS = ("mute", "tmute", "kick", "ban")
+WL_MAX_STEPS = 6
+WL_MAX_COUNT = 50
+WL_MIN_SECS, WL_MAX_SECS = 60, 365 * 86400      # Telegram treats shorter / longer mutes as permanent
+WL_DURATIONS = (900, 1800, 3600, 7200, 21600, 43200, 86400, 259200, 604800, 2592000)   # 15m ... 30d
+WL_COUNT_CHOICES = 12                            # warn counts offered as buttons when adding a step
+
+
+def wl_steps(chat_id):
+    """The saved steps as a sorted list of (count, kind, seconds or None). Anything unreadable is ignored."""
+    steps = {}
+    for part in str(D.get_setting(chat_id, WL_KEY, "") or "").split(","):
+        bits = part.strip().split(":")
+        try:
+            count, kind = int(bits[0]), bits[1]
+            secs = int(bits[2]) if len(bits) > 2 else None
+        except (ValueError, IndexError):
+            continue
+        if not 1 <= count <= WL_MAX_COUNT or kind not in WL_KINDS:
+            continue
+        if kind == "tmute":
+            if not secs or not WL_MIN_SECS <= secs <= WL_MAX_SECS:
+                continue
+        else:
+            secs = None
+        steps[count] = (count, kind, secs)
+    return [steps[c] for c in sorted(steps)][:WL_MAX_STEPS]
+
+
+def wl_on(chat_id):
+    return D.get_setting(chat_id, WL_ON_KEY, "off") == "on"
+
+
+def wl_active(chat_id):
+    """The steps when the ladder is ON, else []. An empty list means: use the normal warn limit and action."""
+    return wl_steps(chat_id) if wl_on(chat_id) else []
+
+
+def _wl_save(chat_id, steps):
+    D.set_setting(chat_id, WL_KEY,
+                  ",".join(f"{c}:{k}" + (f":{s}" if k == "tmute" else "") for c, k, s in sorted(steps)))
+
+
+def wl_set_step(chat_id, count, kind, secs=None):
+    """Adds the step or changes the action of the step at `count`. Returns None, or \"full\" / \"bad\" when refused."""
+    if not 1 <= count <= WL_MAX_COUNT or kind not in WL_KINDS:
+        return "bad"
+    if kind == "tmute" and not (secs and WL_MIN_SECS <= secs <= WL_MAX_SECS):
+        return "bad"
+    steps = {s[0]: s for s in wl_steps(chat_id)}
+    if count not in steps and len(steps) >= WL_MAX_STEPS:
+        return "full"
+    was_empty = not steps
+    steps[count] = (count, kind, secs if kind == "tmute" else None)
+    _wl_save(chat_id, list(steps.values()))
+    if was_empty:
+        D.set_setting(chat_id, WL_ON_KEY, "on")
+    return None
+
+
+def wl_remove_step(chat_id, count):
+    steps = [s for s in wl_steps(chat_id) if s[0] != count]
+    _wl_save(chat_id, steps)
+
+
+def _wl_mode(kind, secs):
+    """The mode string nova's do_action understands."""
+    return f"tmute:{secs}" if kind == "tmute" else kind
+
+
+def _wl_mode_en(step):
+    """'mute' / 'mute for 2h' / 'kick' / 'ban' as describe_mode() writes them (translated at display time)."""
+    _, kind, secs = step
+    return f"mute for {extra.fmt_duration(secs)}" if kind == "tmute" else kind
+
+
+def wl_action_text(kind, secs, chat_id=None, lang=None):
+    if kind == "tmute":
+        return L.t("wl.d_tmute", chat_id, lang=lang, dur=extra.fmt_duration(secs))
+    return L.t("wl.d_" + kind, chat_id, lang=lang)
+
+
+def wl_summary(chat_id):
+    """One line for /limits when the ladder is in use, else None."""
+    steps = wl_active(chat_id)
+    if not steps:
+        return None
+    return "Warnings (ladder): " + "; ".join(
+        L.t("wl.step_line", lang="en", count=c, action=wl_action_text(k, s, lang="en")) for c, k, s in steps)
+
+
+def warn_ladder_button(chat):
+    """The 🪜 button nova.py adds to /help > Warnings (groups only)."""
+    return InlineKeyboardButton(L.t("wl.btn_help", getattr(chat, "id", None)), callback_data="wl:m")
+
+
+async def ladder_warn(chat, user_id, mention, why, by, count, do_action):
+    """Called by nova's add_warn right after a warning is saved (`count` = the member's active warnings now).
+    Returns the notice text to announce, or None when the ladder is not in use (add_warn then carries on as before).
+    `do_action(chat, user_id, mode)` is nova's own function; `why` is already \"No reason given\" when empty."""
+    steps = wl_active(chat.id)
+    if not steps:
+        return None
+    step = next((s for s in steps if s[0] == count), None)
+    if step is None and count > steps[-1][0]:
+        step = steps[-1]
+    if step is None:                                  # between steps: a plain warning
+        label = f"Warned (warn {count})"
+        nxt = next(s for s in steps if s[0] > count)
+        punish = f"Warning {count}: no action yet. At {nxt[0]} warns the action is {_wl_mode_en(nxt)}"
+        await extra.record_action(chat.id, user_id, mention, label, why, punish, by, "warn")
+        return extra.action_notice(mention, label, why, punish, by, chat_id=chat.id)
+    if step == steps[-1]:                             # the last step: the member starts again from 0
+        await asyncio.to_thread(store.warn_clear, chat.id, user_id)
+    done = await do_action(chat, user_id, _wl_mode(step[1], step[2]))
+    if done:
+        kind, secs = extra.mode_kind(_wl_mode(step[1], step[2]))
+        label = f"{extra.ACTION_LABEL.get(kind, kind.title())} (warn step {step[0]})"
+        punish = extra.punishment_text(kind, secs)
+        reason = f"Reached {count} warnings. Last warning: {why}"
+        await extra.record_action(chat.id, user_id, mention, label, reason, punish, by, "warn")
+        return extra.action_notice(mention, label, reason, punish, by, chat_id=chat.id)
+    return L.t("wn.step_fail", chat.id, mention=mention, count=count,
+               mode=extra._notice_mode(_wl_mode_en(step), chat.id), reason=html.escape(why))
+
+
+# ------------------------------------------------------------------ the panel
+def _wl_back(cid, data="wl:m"):
+    return [InlineKeyboardButton(L.t("pick.back", cid), callback_data=data)]
+
+
+def _wl_panel(chat, note=""):
+    cid = getattr(chat, "id", None)
+    if chat is None or chat.type == "private":
+        return L.t("wl.private", cid), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]])
+    on, steps = wl_on(cid), wl_steps(cid)
+    status = L.t("wl.status_off" if not on else ("wl.status_on" if steps else "wl.status_on_empty"), cid)
+    lines = [L.t("wl.step_line", cid, count=c, action=wl_action_text(k, s, cid)) for c, k, s in steps]
+    text = (L.t("wl.title", cid) + "\n\n" + (note + "\n\n" if note else "") + L.t("wl.intro", cid) + "\n\n" + status + "\n\n" +
+            ("\n".join(lines) if lines else L.t("wl.no_steps", cid)) + "\n\n" + L.t("wl.note", cid))
+    rows = [[InlineKeyboardButton(L.t("wl.btn_off" if on else "wl.btn_on", cid), callback_data="wl:t")]]
+    rows += [[InlineKeyboardButton("✏️ " + line, callback_data=f"wl:s:{c}")] for (c, _, _), line in zip(steps, lines)]
+    if len(steps) < WL_MAX_STEPS:
+        rows.append([InlineKeyboardButton(L.t("wl.btn_add", cid), callback_data="wl:n")])
+    rows.append(_wl_back(cid, "help:warn"))
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _wl_count_panel(cid):
+    used = {s[0] for s in wl_steps(cid)}
+    free = [c for c in range(1, WL_COUNT_CHOICES + 1) if c not in used]
+    text = L.t("wl.new_title", cid) + "\n\n" + L.t("wl.new_hint", cid, max=WL_MAX_COUNT)
+    buttons = [InlineKeyboardButton(str(c), callback_data=f"wl:s:{c}") for c in free]
+    rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)] + [_wl_back(cid)]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _wl_step_panel(cid, count):
+    current = next((s for s in wl_steps(cid) if s[0] == count), None)
+    now = wl_action_text(current[1], current[2], cid) if current else L.t("wl.step_unset", cid)
+    text = L.t("wl.step_title", cid, count=count) + "\n\n" + L.t("wl.step_now", cid, action=now) + "\n\n" + L.t("wl.pick_action", cid)
+    mark = lambda kind: "✅ " if current and current[1] == kind else ""
+    rows = [[InlineKeyboardButton(mark("mute") + L.t("wl.act_mute", cid), callback_data=f"wl:a:{count}:mute")],
+            [InlineKeyboardButton(mark("tmute") + L.t("wl.act_tmute", cid), callback_data=f"wl:d:{count}")],
+            [InlineKeyboardButton(mark("kick") + L.t("wl.act_kick", cid), callback_data=f"wl:a:{count}:kick")],
+            [InlineKeyboardButton(mark("ban") + L.t("wl.act_ban", cid), callback_data=f"wl:a:{count}:ban")]]
+    if current:
+        rows.append([InlineKeyboardButton(L.t("wl.btn_remove", cid), callback_data=f"wl:x:{count}")])
+    rows.append(_wl_back(cid))
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _wl_dur_panel(cid, count):
+    current = next((s for s in wl_steps(cid) if s[0] == count and s[1] == "tmute"), None)
+    text = L.t("wl.dur_title", cid, count=count) + "\n\n" + L.t("wl.dur_hint", cid, count=count)
+    buttons = [InlineKeyboardButton(("✅ " if current and current[2] == d else "") + extra.fmt_duration(d),
+                                    callback_data=f"wl:u:{count}:{d}") for d in WL_DURATIONS]
+    rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)] + [_wl_back(cid, f"wl:s:{count}")]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _wl_save_note(cid, count, kind, secs):
+    """Saves a step and returns the note shown on the panel (or None + error key)."""
+    err = wl_set_step(cid, count, kind, secs)
+    if err:
+        return None, err
+    return L.t("wl.t_saved", cid, count=count, action=wl_action_text(kind, secs, cid)), None
+
+
+async def wl_callback(update, context):
+    """\"wl:m\" panel, \"wl:t\" switch, \"wl:n\" pick a count, \"wl:s:<count>\" pick the action, \"wl:a:<count>:<mute|kick|ban>\",
+    \"wl:d:<count>\" + \"wl:u:<count>:<seconds>\" timed mute, \"wl:x:<count>\" remove. Admins only, checked on every tap."""
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    if chat is None:
+        await q.answer()
+        return
+    if await extra.menu_not_owner(q):
+        return
+    if chat.type == "private":
+        await q.answer(L.t("wl.private"), show_alert=True)
+        return
+    cid = chat.id
+    if not await _ac_allowed(chat, q.from_user.id):
+        await q.answer(L.t("wl.admin_only", cid), show_alert=True)
+        return
+    parts = (q.data or "").split(":")[1:]
+    act, args = (parts[0] if parts else ""), parts[1:]
+    count = _ac_num(args[0], 1, WL_MAX_COUNT) if args else None
+    try:
+        if act == "m" and not args:
+            await q.answer()
+            await _ac_edit(q, *_wl_panel(chat))
+        elif act == "t" and not args:
+            on = not wl_on(cid)
+            D.set_setting(cid, WL_ON_KEY, "on" if on else "off")
+            await q.answer(L.t("wl.t_on" if on else "wl.t_off", cid))
+            await _ac_edit(q, *_wl_panel(chat))
+        elif act == "n" and not args:
+            if len(wl_steps(cid)) >= WL_MAX_STEPS:
+                await q.answer(L.t("wl.t_full", cid, n=WL_MAX_STEPS), show_alert=True)
+                return
+            await q.answer()
+            await _ac_edit(q, *_wl_count_panel(cid))
+        elif act in ("s", "d") and count and len(args) == 1:
+            if count not in {s[0] for s in wl_steps(cid)} and len(wl_steps(cid)) >= WL_MAX_STEPS:
+                await q.answer(L.t("wl.t_full", cid, n=WL_MAX_STEPS), show_alert=True)
+                return
+            await q.answer()
+            await _ac_edit(q, *(_wl_step_panel(cid, count) if act == "s" else _wl_dur_panel(cid, count)))
+        elif act == "a" and count and len(args) == 2 and args[1] in ("mute", "kick", "ban"):
+            note, err = _wl_save_note(cid, count, args[1], None)
+            await q.answer(note if note else L.t("wl.t_full", cid, n=WL_MAX_STEPS), show_alert=bool(err))
+            if not err:
+                await _ac_edit(q, *_wl_panel(chat))
+        elif act == "u" and count and len(args) == 2 and args[1].isascii() and args[1].isdigit() and int(args[1]) in WL_DURATIONS:
+            note, err = _wl_save_note(cid, count, "tmute", int(args[1]))
+            await q.answer(note if note else L.t("wl.t_full", cid, n=WL_MAX_STEPS), show_alert=bool(err))
+            if not err:
+                await _ac_edit(q, *_wl_panel(chat))
+        elif act == "x" and count and len(args) == 1:
+            wl_remove_step(cid, count)
+            await q.answer(L.t("wl.t_removed", cid, count=count))
+            await _ac_edit(q, *_wl_panel(chat))
+        else:
+            await q.answer(L.t("wl.invalid", cid), show_alert=True)
+    except Exception:
+        log.exception("warn ladder: panel action failed in %s", cid)
+        await q.answer(L.t("ac.db_problem", cid), show_alert=True)
+
+
+async def warnladder_cmd(update, context):
+    """/warnladder  |  on | off | clear  |  <count> mute|kick|ban  |  <count> tmute <time>  |  remove <count>"""
+    if not await D.group_only(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    cid, args, note = chat.id, [a.lower() for a in (context.args or [])], ""
+    try:
+        if not args:
+            pass
+        elif args in (["on"], ["off"]):
+            D.set_setting(cid, WL_ON_KEY, args[0])
+            note = L.t("wl.t_on" if args[0] == "on" else "wl.t_off", cid)
+        elif args == ["clear"]:
+            _wl_save(cid, [])
+            note = L.t("wl.t_cleared", cid)
+        elif len(args) == 2 and args[0] in ("remove", "rm", "del") and _ac_num(args[1], 1, WL_MAX_COUNT):
+            count = int(args[1])
+            if count not in {s[0] for s in wl_steps(cid)}:
+                await msg.reply_html(L.t("wl.err_nostep", cid, count=count))
+                return
+            wl_remove_step(cid, count)
+            note = L.t("wl.t_removed", cid, count=count)
+        elif len(args) in (2, 3) and _ac_num(args[0], 1, WL_MAX_COUNT) and args[1] in ("mute", "tmute", "kick", "ban"):
+            count, kind, secs = int(args[0]), args[1], None
+            if len(args) == 3:
+                if kind not in ("mute", "tmute"):
+                    raise ValueError("usage")
+                secs, kind = extra.parse_duration(args[2]), "tmute"
+                if not secs or not WL_MIN_SECS <= secs <= WL_MAX_SECS:
+                    await msg.reply_html(L.t("wl.err_dur", cid))
+                    return
+            elif kind == "tmute":
+                await msg.reply_html(L.t("wl.err_dur", cid))
+                return
+            note, err = _wl_save_note(cid, count, kind, secs)
+            if err:
+                await msg.reply_html(L.t("wl.t_full", cid, n=WL_MAX_STEPS))
+                return
+        else:
+            raise ValueError("usage")
+    except ValueError:
+        await msg.reply_html(L.t("wl.usage", cid))
+        return
+    text, markup = _wl_panel(chat, note)
+    await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+# ======================================================================================================
+# 2e. MOD LOG
+# ======================================================================================================
+# The history of what the bot and the admins did in THIS group: bans, kicks, mutes, warnings, unmutes, unbans, removed
+# warnings and appeal decisions, each with who did it and why. Rows are written by extra.record_action (nova.py calls
+# group.record_undo for the "undo" kinds) and kept 15 days (store.HISTORY_KEEP_DAYS). Rows stay in English; the page
+# translates their parts when it shows them (extra.translate_notice), like the action notices.
+#   /modlog                the page: filters [All] [Bans] [Kicks] [Mutes] [Warns] [Undone], 6 rows per page
+#   /modlog @user | id     the same page for one member (or reply to the member with /modlog)
+# Callback data "ml:<filter>:<page>:<member id or 0>"; "ml:s" is the 🔍 Find member help screen.
+ML_PAGE = 6
+ML_FILTERS = {"a": None, "b": ("ban",), "k": ("kick",), "m": ("mute",), "w": ("warn",),
+              "u": ("unmute", "unban", "unwarn")}
+ML_ORDER = ("a", "b", "k", "m", "w", "u")
+# what: (label, punishment text, category, kind) of the rows record_undo writes. The texts must stay in extra._NOTICE_TEXT.
+_ML_UNDO = {"unmute": ("Unmuted", "Mute lifted", "mute", "unmute"),
+            "unban": ("Unbanned", "Ban lifted", "ban", "unban"),
+            "unwarn": ("Warning removed", "Warning removed", "warn", "unwarn"),
+            "reset": ("Warnings reset", "All warnings cleared", "warn", "unwarn"),
+            "appeal_no": ("Appeal rejected", "Nothing changed", "appeal", "appeal")}
+
+
+async def record_undo(chat_id, user_id, name, what, by=None, reason=None):
+    """History row for an unmute / unban / removed warning / reset / rejected appeal. `what` is a key of _ML_UNDO,
+    `name` and `by` are the same HTML (or plain) text the other history rows use."""
+    label, punish, category, kind = _ML_UNDO[what]
+    await extra.record_action(chat_id, user_id, name, label, reason or "No reason given", punish, by, category, kind=kind)
+
+
+def modlog_button(chat):
+    """The 📜 Mod Log button nova.py adds to /help > Log Channels (groups only)."""
+    return InlineKeyboardButton(L.t("ml.btn_help", getattr(chat, "id", None)), callback_data="ml:a:0:0")
+
+
+def _ml_text(s, cid, cap):
+    """A stored part, translated for the group, cut to `cap` characters and made safe for HTML."""
+    s = extra.translate_notice(str(s or ""), cid)
+    return html.escape(s[:cap] + ("…" if len(s) > cap else ""))
+
+
+def _ml_row(row, n, cid):
+    when = datetime.fromtimestamp(row.get("ts") or 0, extra.NOTICE_IST).strftime("%d %b %I:%M %p")
+    meta = row.get("meta") or {}
+    if not meta:                                       # a row saved before the mod log page existed: shown as it was saved
+        return L.t("ml.row_old", cid, n=n, when=when, text=html.escape(str(row.get("text") or "")[:300]))
+    uid, name = row.get("user_id"), html.escape(meta.get("name") or "")
+    user = f"{name} ({uid})" if name and uid and name != str(uid) else (name or str(uid or "?"))
+    by = html.escape(meta.get("by") or "") or L.t("ml.by_bot", cid)
+    return L.t("ml.row", cid, n=n, when=when, label=_ml_text(meta.get("label"), cid, 80), user=user, by=by,
+               reason=_ml_text(meta.get("reason") or "No reason given", cid, 150), punish=_ml_text(meta.get("punish"), cid, 120))
+
+
+async def _ml_panel(chat, f, page, uid, name=None):
+    """(text, keyboard) of the page. `uid` 0 = every member."""
+    cid = chat.id
+    kinds = ML_FILTERS[f]
+    back = [InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:log")]
+    try:
+        total = await asyncio.to_thread(store.modlog_count, cid, uid or None, kinds)
+        pages = max(1, -(-total // ML_PAGE))
+        page = min(max(page, 0), pages - 1)
+        rows = await asyncio.to_thread(store.modlog_recent, cid, ML_PAGE, user_id=uid or None, kinds=kinds, skip=page * ML_PAGE)
+    except Exception:
+        log.exception("modlog: couldn't read the history of %s", cid)
+        return L.t("ml.err", cid), InlineKeyboardMarkup([back])
+    head = L.t("ml.title", cid)
+    if uid:
+        who = name or next((html.escape((r.get("meta") or {}).get("name") or "") for r in rows if (r.get("meta") or {}).get("name")), "") or str(uid)
+        head += "\n" + L.t("ml.member", cid, user=who, id=uid)
+    head += "\n" + L.t("ml.showing", cid, what=L.t("ml.f_" + f, cid), page=page + 1, pages=pages, total=total)
+    foot = L.t("ml.foot", cid, days=store.HISTORY_KEEP_DAYS)
+    lines = [_ml_row(r, page * ML_PAGE + i + 1, cid) for i, r in enumerate(rows)]
+    while lines and len(head) + len(foot) + sum(len(x) + 2 for x in lines) > 3900:
+        lines.pop()                                    # never let one page go over Telegram's size limit
+    body = "\n\n".join(lines) if lines else L.t("ml.empty_user" if uid else "ml.empty", cid)
+    text = head + "\n\n" + body + "\n\n" + foot
+    kb = [[InlineKeyboardButton(("✅ " if k == f else "") + L.t("ml.f_" + k, cid), callback_data=f"ml:{k}:0:{uid}")
+           for k in ML_ORDER[i:i + 3]] for i in (0, 3)]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"ml:{f}:{page - 1}:{uid}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"ml:{f}:{page + 1}:{uid}"))
+    if nav:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton(L.t("ml.btn_clear" if uid else "ml.btn_find", cid), callback_data="ml:a:0:0" if uid else "ml:s")])
+    kb.append(back)
+    return text, InlineKeyboardMarkup(kb)
+
+
+async def ml_callback(update, context):
+    """\"ml:<filter>:<page>:<member id or 0>\" shows a page, \"ml:s\" the Find member screen. Admins only, checked on every tap."""
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    if chat is None:
+        await q.answer()
+        return
+    if await extra.menu_not_owner(q):
+        return
+    if chat.type == "private":
+        await q.answer(L.t("ml.private"), show_alert=True)
+        return
+    if not await _ac_allowed(chat, q.from_user.id):
+        await q.answer(L.t("ml.admin_only", chat.id), show_alert=True)
+        return
+    parts = (q.data or "").split(":")[1:]
+    try:
+        if parts == ["s"]:
+            await q.answer()
+            await _ac_edit(q, L.t("ml.find", chat.id), InlineKeyboardMarkup(
+                [[InlineKeyboardButton(L.t("pick.back", chat.id), callback_data="ml:a:0:0")]]))
+        elif (len(parts) == 3 and parts[0] in ML_FILTERS and _ac_num(parts[1], 0, 100000) is not None
+              and _ac_num(parts[2], 0, 10 ** 15) is not None):
+            await q.answer()
+            await _ac_edit(q, *await _ml_panel(chat, parts[0], int(parts[1]), int(parts[2])))
+        else:
+            await q.answer(L.t("ml.invalid", chat.id), show_alert=True)
+    except Exception:
+        log.exception("modlog: page action failed in %s", chat.id)
+        await q.answer(L.t("ac.db_problem", chat.id), show_alert=True)
+
+
+async def modlog_command(update, context):
+    """/modlog  |  /modlog @user  |  /modlog <id>  |  reply to a member with /modlog   (admins only)"""
+    if not await D.group_only(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    uid, name = 0, None
+    if msg.reply_to_message or context.args:
+        uid, name = await D.get_target(update, context)   # replies by itself when it can't find the member
+        if not uid:
+            return
+    text, markup = await _ml_panel(chat, "a", 0, uid or 0, name)
+    await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+# ======================================================================================================
+# 2f. RAID SHIELD  (extends nova.py's AntiRaid: /antiraid, /raidtime, /raidactiontime, /autoantiraid)
+# ======================================================================================================
+# A raid is on while the group's `raid_until` time is in the future (set by /antiraid or by the join counter). New here:
+#   * raid_mode   "ban" (default: every joiner is banned for raid_action_time, exactly as before) | "restrict" (every
+#                 joiner is muted until the raid ends) | "lock" (the whole group is closed for everyone until the raid ends)
+#   * raid_window seconds the join counter looks back (default 60): /autoantiraid N starts a raid when more than N
+#                 people join within it
+#   * raid_time   how long a raid lasts. Not set: 6h in ban mode (as before), 30 minutes in restrict / lock mode.
+#   * the lift is automatic: "restrict" uses Telegram's own until_date, "lock" is lifted by the 30-second loop
+#     (run_once -> _raid_round) or at once by /antiraid off.
+#   * NIGHT MODE + AUTO CLOSE: while the lock is on (raid_lock_state = "on") both are put on hold for that group (their
+#     rounds skip it) so nothing re-opens it. raid_lock_saved remembers what to give back: a permissions JSON (group was
+#     open), "default", "night" (Night Mode was on: its media-off state comes back) or "" (Auto Close or an admin had
+#     it closed already: nothing to restore). After the lift the normal rounds catch up on their own.
+#   * panel: /help > Raid & Flood > 🛡 Raid Shield (callbacks "rd:..."), or /raidmode, /raidwindow.
+RAID_MODE_KEY, RAID_WINDOW_KEY = "raid_mode", "raid_window"
+RAID_LOCK_KEY, RAID_LOCK_SAVED_KEY, RAID_MUTED_KEY = "raid_lock_state", "raid_lock_saved", "raid_muted"
+RAID_MODES = ("ban", "restrict", "lock")
+RAID_TIME_BAN_DEFAULT = 6 * 3600       # the same default nova.py always had
+RAID_TIME_SOFT_DEFAULT = 30 * 60       # restrict / lock: a shorter default
+RAID_ACTION_DEFAULT = 3600
+RAID_MAX_SECS = 30 * 86400
+RAID_JOINS = (5, 10, 15, 25)           # auto-start buttons (0 = off)
+RAID_WINDOWS = (30, 60, 120, 300)
+RAID_DURATIONS = (900, 1800, 3600, 10800, 21600)
+RAID_MUTED_MAX = 300                   # joiners remembered per raid, so /antiraid off can free them
+_raid_joins = {}                       # chat_id -> recent join times
+_raid_notice_at = {}                   # chat_id -> monotonic time of the last "couldn't lock" notice
+
+
+def _int_setting(chat_id, key, default):
+    try:
+        return int(D.get_setting(chat_id, key, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def raid_mode(chat_id):
+    mode = D.get_setting(chat_id, RAID_MODE_KEY, "ban")
+    return mode if mode in RAID_MODES else "ban"
+
+
+def raid_window(chat_id):
+    secs = _int_setting(chat_id, RAID_WINDOW_KEY, 60)
+    return secs if 10 <= secs <= 3600 else 60
+
+
+def raid_default_secs(chat_id):
+    return RAID_TIME_BAN_DEFAULT if raid_mode(chat_id) == "ban" else RAID_TIME_SOFT_DEFAULT
+
+
+def raid_secs(chat_id):
+    """How long a raid lasts: the saved /raidtime, else the default of the current mode."""
+    default = raid_default_secs(chat_id)
+    secs = _int_setting(chat_id, "raid_time", default)
+    return secs if 60 <= secs <= RAID_MAX_SECS else default
+
+
+def _window_text(secs, chat_id=None):
+    if secs == 60:
+        return L.t("rd.w_min1", chat_id)
+    return L.t("rd.w_mins", chat_id, n=secs // 60) if secs % 60 == 0 else L.t("rd.w_secs", chat_id, n=secs)
+
+
+def _parse_secs(text, low, high):
+    """'30s', '5m', '2h' ... in seconds, or None when it is not a time between `low` and `high` seconds."""
+    m = re.fullmatch(r"(\d{1,6})\s*s", str(text).strip().lower())
+    secs = int(m.group(1)) if m else extra.parse_duration(str(text).lower())
+    return secs if secs and low <= secs <= high else None
+
+
+def _parse_window(text):
+    return _parse_secs(text, 10, 3600)
+
+
+def raid_button(chat):
+    """The 🛡 button nova.py adds to /help > Raid & Flood (groups only)."""
+    return InlineKeyboardButton(L.t("rd.btn_help", getattr(chat, "id", None)), callback_data="rd:m")
+
+
+async def _raid_fail(bot, chat_id, what, exc):
+    _retry_at[(chat_id, what)] = time.monotonic() + RETRY_AFTER
+    log.warning("raid shield: couldn't %s %s: %s: %s", what, chat_id, type(exc).__name__, exc)
+    last = _raid_notice_at.get(chat_id)
+    if last is not None and time.monotonic() - last < NOTICE_EVERY:
+        return
+    _raid_notice_at[chat_id] = time.monotonic()
+    try:
+        await bot.send_message(chat_id, L.t("rd.fail", chat_id, label=L.t("rd.lbl_" + what.replace("-", "_"), chat_id)))
+    except TelegramError:
+        pass
+
+
+# ------------------------------------------------------------------ lock / unlock the group
+async def raid_lock(bot, chat_id):
+    """Closes the group for the raid. Returns True when it is locked (or already closed by Auto Close / an admin)."""
+    if D.get_setting(chat_id, RAID_LOCK_KEY, "") == "on":
+        return True
+    saved = ""
+    try:
+        if D.get_setting(chat_id, STATE_KEY, "open") != "closed":          # Auto Close has it closed: nothing to do
+            chat = await bot.get_chat(chat_id)
+            perms = getattr(chat, "permissions", None)
+            if perms is None or getattr(perms, "can_send_messages", True) is not False:   # not closed by hand either
+                saved = "night" if D.get_setting(chat_id, NIGHT_STATE_KEY, "") == "on" else (_saved_perms(chat) or "default")
+                await bot.set_chat_permissions(chat_id, CLOSED_PERMS)
+    except TelegramError as e:
+        await _raid_fail(bot, chat_id, "lock", e)
+        return False
+    D.set_setting(chat_id, RAID_LOCK_SAVED_KEY, saved)
+    D.set_setting(chat_id, RAID_LOCK_KEY, "on")
+    return True
+
+
+async def raid_unlock(bot, chat_id):
+    """Gives the group back as it was, tells the group. Returns True when it is done (or was not locked)."""
+    if D.get_setting(chat_id, RAID_LOCK_KEY, "") != "on":
+        return True
+    saved = D.get_setting(chat_id, RAID_LOCK_SAVED_KEY, "") or ""
+    perms = None
+    if saved == "night":                                                  # Night Mode was on: media stays off
+        perms = _night_variant(_night_saved_perms(chat_id))
+    elif saved == "default":
+        perms = D.default_perms
+    elif saved:
+        try:
+            perms = ChatPermissions(**json.loads(saved))
+        except (TypeError, ValueError):
+            perms = D.default_perms
+        if perms.can_send_messages is False:                              # never give back a closed state
+            perms = D.default_perms
+    if perms is not None:
+        try:
+            await bot.set_chat_permissions(chat_id, perms)
+        except TelegramError as e:
+            await _raid_fail(bot, chat_id, "raid-end", e)
+            return False                                                  # the state stays on: the loop tries again
+    store.del_setting(chat_id, RAID_LOCK_KEY)
+    store.del_setting(chat_id, RAID_LOCK_SAVED_KEY)
+    try:
+        await bot.send_message(chat_id, L.t("rd.lock_end", chat_id), parse_mode="HTML")
+    except TelegramError:
+        pass
+    return True
+
+
+def _raid_muted_ids(chat_id):
+    return [int(x) for x in str(D.get_setting(chat_id, RAID_MUTED_KEY, "") or "").split(",") if x.strip().isdigit()]
+
+
+def _raid_muted_add(chat_id, user_id):
+    ids = [i for i in _raid_muted_ids(chat_id) if i != user_id] + [user_id]
+    D.set_setting(chat_id, RAID_MUTED_KEY, ",".join(str(i) for i in ids[-RAID_MUTED_MAX:]))
+
+
+async def _raid_lift_muted(bot, chat_id):
+    """Frees the joiners muted by the raid (when it is stopped early; otherwise Telegram lifts them by itself)."""
+    for uid in _raid_muted_ids(chat_id):
+        try:
+            await bot.restrict_chat_member(chat_id, uid, D.default_perms)
+        except TelegramError as e:
+            log.debug("raid shield: couldn't free %s in %s: %s", uid, chat_id, e)
+        await asyncio.sleep(0.05)
+    store.del_setting(chat_id, RAID_MUTED_KEY)
+
+
+async def raid_started(bot, chat):
+    """nova.py calls this right after it switched a raid ON (/antiraid, or the join counter). Lock mode closes the group."""
+    return await raid_lock(bot, chat.id) if raid_mode(chat.id) == "lock" else True
+
+
+async def raid_stopped(bot, chat):
+    """nova.py calls this after /antiraid off: lifts the lock and frees the muted joiners."""
+    await raid_unlock(bot, chat.id)
+    await _raid_lift_muted(bot, chat.id)
+
+
+async def _raid_round(bot):
+    """Part of run_once (every 30 seconds): lifts the lock of every group whose raid is over."""
+    for chat_id, value in await asyncio.to_thread(_scheduled_groups, RAID_LOCK_KEY):
+        try:
+            if value == "on" and not D.raid_left(chat_id) and time.monotonic() >= _retry_at.get((chat_id, "raid-end"), 0):
+                await raid_unlock(bot, chat_id)
+        except Exception:
+            log.exception("raid shield: lifting the lock failed in %s", chat_id)
+    for chat_id, value in await asyncio.to_thread(_scheduled_groups, RAID_MUTED_KEY):
+        if value and not D.raid_left(chat_id):                           # Telegram already lifted them: forget the list
+            store.del_setting(chat_id, RAID_MUTED_KEY)
+
+
+# ------------------------------------------------------------------ the joins
+async def _raid_record(chat, user, mode):
+    ban = mode == "ban"
+    await extra.record_action(chat.id, user.id, user.mention_html() if hasattr(user, "mention_html") else str(user.id),
+                              "Banned (raid)" if ban else "Muted (raid)", "Joined during a raid",
+                              "Temporary ban" if ban else "Muted until the raid ends", None, "ban" if ban else "mute",
+                              kind="ban" if ban else "mute")
+
+
+async def raid_new_members(update, context):
+    """group=-9 (nova registers it), before the captcha / welcome handler: counts the joins, starts the raid by itself
+    and, while it lasts, bans (default) or mutes the joiners; in lock mode the group is closed instead. Never touches
+    bots, admins, the bot owner or members an admin added."""
+    chat, msg = update.effective_chat, update.effective_message
+    people = [u for u in (msg.new_chat_members or []) if not u.is_bot]
+    if not people:
+        return
+    now = time.time()
+    limit = _int_setting(chat.id, "auto_raid", 0)
+    if limit:
+        window = raid_window(chat.id)
+        recent = [t for t in _raid_joins.get(chat.id, []) if now - t < window] + [now] * len(people)
+        _raid_joins[chat.id] = recent
+        if len(recent) > limit and not D.raid_left(chat.id):
+            secs, mode = raid_secs(chat.id), raid_mode(chat.id)
+            D.set_setting(chat.id, "raid_until", int(now) + secs)
+            await raid_started(context.bot, chat)
+            try:
+                await chat.send_message(L.t("rd.detected_" + mode, chat.id, limit=limit, window=_window_text(window, chat.id),
+                                            dur=extra.fmt_duration(secs)))
+            except TelegramError:
+                pass
+    if not D.raid_left(chat.id):
+        return
+    mode = raid_mode(chat.id)
+    if mode == "lock":
+        return                                    # nobody is banned or muted: the group is closed for everyone
+    until = _int_setting(chat.id, "raid_until", 0)
+    act = _int_setting(chat.id, "raid_action_time", RAID_ACTION_DEFAULT)
+    done = 0
+    for user in people:
+        if D.is_bot_owner(user.id) or await D.is_admin(chat, user.id):
+            continue
+        if msg.from_user and msg.from_user.id != user.id and await D.is_admin(chat, msg.from_user.id):
+            continue                              # an admin added them on purpose
+        try:
+            if mode == "ban":
+                await chat.ban_member(user.id, until_date=int(now) + max(act, 60))
+            else:
+                await chat.restrict_member(user.id, CLOSED_PERMS, until_date=max(until, int(now) + 60))
+                _raid_muted_add(chat.id, user.id)
+        except TelegramError as e:
+            log.warning("antiraid: couldn't %s %s in %s: %s", "ban" if mode == "ban" else "mute", user.id, chat.id, e)
+            continue
+        done += 1
+        await _raid_record(chat, user, mode)
+    if done:
+        try:
+            await msg.delete()
+        except TelegramError:
+            pass
+        if done == len(people):
+            raise ApplicationHandlerStop          # nobody left to welcome or verify
+
+
+# ------------------------------------------------------------------ the panel
+def _rd_panel(chat, note=""):
+    cid = getattr(chat, "id", None)
+    if chat is None or chat.type == "private":
+        return L.t("rd.private", cid), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]])
+    mode, left = raid_mode(cid), D.raid_left(cid)
+    limit, window = _int_setting(cid, "auto_raid", 0), raid_window(cid)
+    act = _int_setting(cid, "raid_action_time", RAID_ACTION_DEFAULT)
+    text = (L.t("rd.title", cid) + "\n\n" + (note + "\n\n" if note else "") + L.t("rd.intro", cid) + "\n\n" +
+            (L.t("rd.status_on", cid, dur=extra.fmt_duration(left)) if left else L.t("rd.status_off", cid)) + "\n" +
+            (L.t("rd.auto_on", cid, n=limit, window=_window_text(window, cid)) if limit else L.t("rd.auto_off", cid)) + "\n" +
+            L.t("rd.mode_line", cid, mode=L.t("rd.mode_" + mode, cid, act=extra.fmt_duration(act))) + "\n" +
+            L.t("rd.dur_line", cid, dur=extra.fmt_duration(raid_secs(cid))) + "\n\n" + L.t("rd.legend", cid) + "\n\n" + L.t("rd.note", cid))
+    mark = lambda cond: "✅ " if cond else ""
+    rows = [[InlineKeyboardButton(L.t("rd.btn_stop" if left else "rd.btn_start", cid), callback_data="rd:g")],
+            [InlineKeyboardButton(mark(mode == m) + L.t("rd.btn_" + m, cid), callback_data=f"rd:o:{m}") for m in RAID_MODES],
+            [InlineKeyboardButton(mark(limit == n) + "👥 " + (str(n) if n else L.t("rd.off", cid)), callback_data=f"rd:j:{n}")
+             for n in (0,) + RAID_JOINS],
+            [InlineKeyboardButton(mark(window == w) + "⏱ " + extra.fmt_duration(w), callback_data=f"rd:w:{w}") for w in RAID_WINDOWS],
+            [InlineKeyboardButton(mark(raid_secs(cid) == d) + "⌛ " + extra.fmt_duration(d), callback_data=f"rd:t:{d}")
+             for d in RAID_DURATIONS],
+            [InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:flood")]]
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def _rd_set_mode(bot, chat, mode):
+    old = raid_mode(chat.id)
+    D.set_setting(chat.id, RAID_MODE_KEY, mode)
+    if D.raid_left(chat.id) and old != mode:                  # a raid is on right now: follow the new mode
+        if mode == "lock":
+            await raid_lock(bot, chat.id)
+        elif old == "lock":
+            await raid_unlock(bot, chat.id)
+
+
+async def rd_callback(update, context):
+    """\"rd:m\" panel, \"rd:g\" start / stop now, \"rd:o:<mode>\", \"rd:j:<joins or 0>\", \"rd:w:<seconds>\", \"rd:t:<seconds>\".
+    Admins only, checked on every tap."""
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    if chat is None:
+        await q.answer()
+        return
+    if await extra.menu_not_owner(q):
+        return
+    if chat.type == "private":
+        await q.answer(L.t("rd.private"), show_alert=True)
+        return
+    cid = chat.id
+    if not await _ac_allowed(chat, q.from_user.id):
+        await q.answer(L.t("rd.admin_only", cid), show_alert=True)
+        return
+    parts = (q.data or "").split(":")[1:]
+    act, arg = (parts[0] if parts else ""), (parts[1] if len(parts) == 2 else None)
+    num = _ac_num(arg, 0, 100000) if arg is not None else None
+    toast = None
+    try:
+        if act == "m" and arg is None and len(parts) == 1:
+            pass
+        elif act == "g" and arg is None and len(parts) == 1:
+            if D.raid_left(cid):
+                D.set_setting(cid, "raid_until", 0)
+                await raid_stopped(context.bot, chat)
+                toast = L.t("rd.t_stopped", cid)
+            else:
+                secs = raid_secs(cid)
+                D.set_setting(cid, "raid_until", int(time.time()) + secs)
+                await raid_started(context.bot, chat)
+                toast = L.t("rd.t_started", cid, dur=extra.fmt_duration(secs))
+        elif act == "o" and arg in RAID_MODES:
+            await _rd_set_mode(context.bot, chat, arg)
+            toast = L.t("rd.t_mode", cid, mode=L.t("rd.btn_" + arg, cid))
+        elif act == "j" and num is not None and (num == 0 or num in RAID_JOINS):
+            D.set_setting(cid, "auto_raid", num)
+            toast = L.t("rd.t_joins", cid, n=num) if num else L.t("rd.t_joins_off", cid)
+        elif act == "w" and num in RAID_WINDOWS:
+            D.set_setting(cid, RAID_WINDOW_KEY, num)
+            toast = L.t("rd.t_window", cid, window=_window_text(num, cid))
+        elif act == "t" and num in RAID_DURATIONS:
+            D.set_setting(cid, "raid_time", num)
+            toast = L.t("rd.t_dur", cid, dur=extra.fmt_duration(num))
+        else:
+            await q.answer(L.t("rd.invalid", cid), show_alert=True)
+            return
+        await q.answer(toast)
+        await _ac_edit(q, *_rd_panel(chat))
+    except Exception:
+        log.exception("raid shield: panel action failed in %s", cid)
+        await q.answer(L.t("ac.db_problem", cid), show_alert=True)
+
+
+async def raidmode_cmd(update, context):
+    """/raidmode  |  /raidmode ban|restrict|lock"""
+    if not await D.group_only(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    note = ""
+    if context.args:
+        mode = context.args[0].lower()
+        if mode not in RAID_MODES or len(context.args) != 1:
+            await msg.reply_html(L.t("rd.err_mode", chat.id))
+            return
+        await _rd_set_mode(context.bot, chat, mode)
+        note = L.t("rd.t_mode", chat.id, mode=L.t("rd.btn_" + mode, chat.id))
+    text, markup = _rd_panel(chat, note)
+    await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+async def raidwindow_cmd(update, context):
+    """/raidwindow  |  /raidwindow 30s | 2m   (how far back the join counter looks)"""
+    if not await D.group_only(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    note = ""
+    if context.args:
+        secs = _parse_window(" ".join(context.args))
+        if secs is None:
+            await msg.reply_html(L.t("rd.err_window", chat.id))
+            return
+        D.set_setting(chat.id, RAID_WINDOW_KEY, secs)
+        note = L.t("rd.t_window", chat.id, window=_window_text(secs, chat.id))
+    text, markup = _rd_panel(chat, note)
+    await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+# ======================================================================================================
+# 2g. NEW-MEMBER PROBATION
+# ======================================================================================================
+# New members can't send links / media / stickers / forwards for their first hours or their first messages. It reuses
+# nova's lock engine (find_violation + the allowlist + lock_exempt), so allowlisted links stay allowed and admins,
+# approved members and the bot owner are never touched.
+#   * settings: prob "on"|"off" (default off), prob_hours (seconds, 0 = not used, default 24h), prob_msgs (0 = not used),
+#     prob_block (which of links, media, stickers, forwards; default "links,media"), prob_notice "on"|"off" (default on).
+#   * it ends at whichever limit comes FIRST (time or messages). Only messages that are allowed count.
+#   * a record {joined, count} per member lives in the "probation" collection (store.probation_*). It is created when
+#     the member joins (handler group -8) or when an admin runs `/probation start`; it is removed when probation ends.
+#     Members who were already in the group when probation was switched on are not affected.
+#   * the guard (handler group -10) runs before the locks, flood and spam handlers: a blocked message is deleted, the
+#     member gets a short notice (deleted by itself after 15 seconds) and no other handler sees the message.
+#   * panel: /help > Locks > 🆕 New Member Probation (callbacks "pb:..."), or /probation.
+PB_KEY, PB_HOURS_KEY, PB_MSGS_KEY, PB_BLOCK_KEY, PB_NOTICE_KEY = "prob", "prob_hours", "prob_msgs", "prob_block", "prob_notice"
+PB_BLOCKS = {"links": ("links", "invitelinks", "stickerpack"), "media": ("media",), "stickers": ("stickers",),
+             "forwards": ("forwards",)}               # block name -> nova lock names
+PB_BLOCK_ORDER = tuple(PB_BLOCKS)
+PB_BLOCK_DEFAULT = ("links", "media")
+PB_HOURS_DEFAULT = 86400
+PB_HOURS = (3600, 21600, 43200, 86400, 259200, 604800)    # panel presets (the command takes any time up to 30 days)
+PB_MSGS = (3, 5, 10, 20)
+PB_MAX_SECS, PB_MAX_MSGS = 30 * 86400, 1000
+PB_NOTICE_SECS = 15
+_pb_cache = {}          # (chat_id, user_id) -> (record or None, monotonic time loaded)
+_pb_notice_at = {}      # (chat_id, user_id) -> monotonic time of the last notice to that member
+_pb_nodelete_at = {}    # chat_id -> monotonic time of the last "I can't delete" notice
+PB_NONE_TTL, PB_CACHE_MAX, PB_NOTICE_EVERY = 600, 20000, 30
+
+
+class _Args:
+    """Stand-in `context` for nova's get_target: it only reads .args and .bot."""
+    def __init__(self, args, bot):
+        self.args, self.bot = list(args), bot
+
+
+def _num_setting(chat_id, key, default):
+    raw = D.get_setting(chat_id, key, None)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def pb_on(chat_id):
+    return D.get_setting(chat_id, PB_KEY, "off") == "on"
+
+
+def pb_hours(chat_id):
+    secs = _num_setting(chat_id, PB_HOURS_KEY, PB_HOURS_DEFAULT)
+    return secs if 0 <= secs <= PB_MAX_SECS else PB_HOURS_DEFAULT
+
+
+def pb_msgs(chat_id):
+    n = _num_setting(chat_id, PB_MSGS_KEY, 0)
+    return n if 0 <= n <= PB_MAX_MSGS else 0
+
+
+def pb_blocks(chat_id):
+    raw = D.get_setting(chat_id, PB_BLOCK_KEY, None)
+    if raw is None:
+        return PB_BLOCK_DEFAULT
+    return tuple(b for b in PB_BLOCK_ORDER if b in str(raw).split(","))
+
+
+def pb_locks(chat_id):
+    """The nova lock names probation applies to in this group."""
+    return {lock for b in pb_blocks(chat_id) for lock in PB_BLOCKS[b]}
+
+
+def probation_button(chat):
+    """The 🆕 button nova.py adds to /help > Locks (groups only)."""
+    return InlineKeyboardButton(L.t("pb.btn_help", getattr(chat, "id", None)), callback_data="pb:p")
+
+
+def _pb_state(chat_id, rec, now):
+    """(still on probation, seconds left or None, messages left or None) for a record."""
+    hours, msgs = pb_hours(chat_id), pb_msgs(chat_id)
+    if not hours and not msgs:
+        return False, None, None
+    left_t = hours - (now - rec["joined"]) if hours else None
+    left_m = msgs - rec["count"] if msgs else None
+    over = (left_t is not None and left_t <= 0) or (left_m is not None and left_m <= 0)
+    return (not over), left_t, left_m
+
+
+async def _pb_record(chat_id, user_id):
+    key, now = (chat_id, user_id), time.monotonic()
+    hit = _pb_cache.get(key)
+    if hit and (hit[0] is not None or now - hit[1] < PB_NONE_TTL):
+        return hit[0]
+    rec = await asyncio.to_thread(store.probation_get, chat_id, user_id)
+    if len(_pb_cache) > PB_CACHE_MAX:
+        _pb_cache.clear()
+    _pb_cache[key] = (rec, now)
+    return rec
+
+
+async def _pb_begin(chat_id, user_id):
+    now = int(time.time())
+    await asyncio.to_thread(store.probation_start, chat_id, user_id, now)
+    _pb_cache[(chat_id, user_id)] = ({"joined": now, "count": 0}, time.monotonic())
+
+
+async def _pb_finish(chat_id, user_id):
+    """Probation is over (or an admin ended it). Returns True when the member was on probation."""
+    _pb_cache[(chat_id, user_id)] = (None, time.monotonic())
+    return await asyncio.to_thread(store.probation_end, chat_id, user_id)
+
+
+def _pb_when(chat_id, left_t, left_m):
+    dur = extra.fmt_duration(max(60, -(-int(left_t) // 60) * 60)) if left_t is not None else None   # rounded up to whole minutes
+    if dur and left_m is not None:
+        return L.t("pb.when_both", chat_id, dur=dur, n=left_m)
+    return L.t("pb.when_time", chat_id, dur=dur) if dur else L.t("pb.when_msgs", chat_id, n=left_m)
+
+
+async def probation_new_members(update, context):
+    """group=-8 (a service message: nobody else uses this group for one): a new member starts probation."""
+    chat, msg = update.effective_chat, update.effective_message
+    if not pb_on(chat.id):
+        return
+    for user in msg.new_chat_members or []:
+        if not user.is_bot:
+            await _pb_begin(chat.id, user.id)
+
+
+async def probation_guard(update, context):
+    """group=-10, before the locks, flood and spam handlers: deletes what a member on probation may not send yet."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user or chat.type == "private" or not pb_on(chat.id):
+        return                                          # (settings are cached in memory: no Telegram or database call)
+    if D.is_service_message(msg) or D.is_paused(chat.id):
+        return
+    rec = await _pb_record(chat.id, user.id)
+    if rec is None:
+        return
+    on, left_t, left_m = _pb_state(chat.id, rec, time.time())
+    if not on:
+        await _pb_finish(chat.id, user.id)
+        return
+    if await D.lock_exempt(chat, msg, user, context.bot.id):   # admins, approved members, the bot owner: trusted
+        await _pb_finish(chat.id, user.id)
+        return
+    name = D.find_violation(msg, pb_locks(chat.id), D.load_allow(chat.id)) if pb_locks(chat.id) else None
+    if not name:                                        # an allowed message counts towards the message limit
+        rec["count"] += 1
+        await asyncio.to_thread(store.probation_add_message, chat.id, user.id)
+        if pb_msgs(chat.id) and rec["count"] >= pb_msgs(chat.id):
+            await _pb_finish(chat.id, user.id)
+        return
+    try:
+        await msg.delete()
+    except TelegramError as e:
+        log.warning("probation: couldn't delete in chat %s: %s: %s", chat.id, type(e).__name__, e)
+        if time.monotonic() - _pb_nodelete_at.get(chat.id, -1e9) > 600:
+            _pb_nodelete_at[chat.id] = time.monotonic()
+            try:
+                await chat.send_message(L.t("pb.no_delete", chat.id))
+            except TelegramError:
+                pass
+        return
+    key = (chat.id, user.id)
+    if D.get_setting(chat.id, PB_NOTICE_KEY, "on") == "on" and time.monotonic() - _pb_notice_at.get(key, -1e9) > PB_NOTICE_EVERY:
+        _pb_notice_at[key] = time.monotonic()
+        kind = next((b for b, locks in PB_BLOCKS.items() if name in locks), "links")
+        try:
+            sent = await chat.send_message(L.t("pb.notice", chat.id, user=user.mention_html(), what=L.t("pb.w_" + kind, chat.id),
+                                               when=_pb_when(chat.id, left_t, left_m)), parse_mode="HTML")
+            await extra.track_notice(sent, PB_NOTICE_SECS)
+        except TelegramError:
+            pass
+    raise ApplicationHandlerStop                        # nothing else acts on a deleted message
+
+
+# ------------------------------------------------------------------ the panel
+async def _pb_panel(chat, note=""):
+    cid = chat.id
+    if chat.type == "private":
+        return L.t("pb.private", cid), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]])
+    on, hours, msgs, blocks = pb_on(cid), pb_hours(cid), pb_msgs(cid), pb_blocks(cid)
+    try:
+        total = await asyncio.to_thread(store.probation_total, cid)
+    except Exception:
+        total = 0
+    if hours and msgs:
+        rule = L.t("pb.rule_both", cid, dur=extra.fmt_duration(hours), n=msgs)
+    elif hours:
+        rule = L.t("pb.rule_time", cid, dur=extra.fmt_duration(hours))
+    elif msgs:
+        rule = L.t("pb.rule_msgs", cid, n=msgs)
+    else:
+        rule = L.t("pb.rule_none", cid)
+    text = (L.t("pb.title", cid) + "\n\n" + (note + "\n\n" if note else "") + L.t("pb.intro", cid) + "\n\n" +
+            L.t("pb.status_on" if on else "pb.status_off", cid) + "\n" + rule + "\n" +
+            L.t("pb.blocked", cid, what=", ".join(L.t("pb.b_" + b, cid) for b in blocks) or L.t("pb.nothing", cid)) + "\n" +
+            L.t("pb.notice_on" if D.get_setting(cid, PB_NOTICE_KEY, "on") == "on" else "pb.notice_off", cid) + "\n" +
+            L.t("pb.total", cid, n=total) + "\n\n" + L.t("pb.legend", cid) + "\n\n" + L.t("pb.note", cid))
+    mark = lambda cond: "✅ " if cond else ""
+    hour_btns = [InlineKeyboardButton(mark(hours == h) + "⌛ " + (extra.fmt_duration(h) if h else L.t("pb.off", cid)), callback_data=f"pb:h:{h}")
+                 for h in (0,) + PB_HOURS]
+    msg_btns = [InlineKeyboardButton(mark(msgs == n) + "✉️ " + (str(n) if n else L.t("pb.off", cid)), callback_data=f"pb:c:{n}")
+                for n in (0,) + PB_MSGS]
+    rows = [[InlineKeyboardButton(L.t("pb.btn_off" if on else "pb.btn_on", cid), callback_data="pb:t")],
+            hour_btns[:4], hour_btns[4:], msg_btns,
+            [InlineKeyboardButton(mark(b in blocks) + L.t("pb.b_" + b, cid), callback_data=f"pb:b:{b}") for b in PB_BLOCK_ORDER],
+            [InlineKeyboardButton(L.t("pb.btn_notice_off" if D.get_setting(cid, PB_NOTICE_KEY, "on") == "on" else "pb.btn_notice_on", cid),
+                                  callback_data="pb:n")],
+            [InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:locks")]]
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def pb_callback(update, context):
+    """\"pb:p\" panel, \"pb:t\" on/off, \"pb:h:<seconds or 0>\", \"pb:c:<messages or 0>\", \"pb:b:<links|media|stickers|forwards>\",
+    \"pb:n\" notice on/off. Admins only, checked on every tap."""
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    if chat is None:
+        await q.answer()
+        return
+    if await extra.menu_not_owner(q):
+        return
+    if chat.type == "private":
+        await q.answer(L.t("pb.private"), show_alert=True)
+        return
+    cid = chat.id
+    if not await _ac_allowed(chat, q.from_user.id):
+        await q.answer(L.t("pb.admin_only", cid), show_alert=True)
+        return
+    parts = (q.data or "").split(":")[1:]
+    act, arg = (parts[0] if parts else ""), (parts[1] if len(parts) == 2 else None)
+    num = _ac_num(arg, 0, 10 ** 7) if arg is not None else None
+    toast = None
+    try:
+        if act == "p" and len(parts) == 1:
+            pass
+        elif act == "t" and len(parts) == 1:
+            if pb_on(cid):
+                D.set_setting(cid, PB_KEY, "off")
+                toast = L.t("pb.t_off", cid)
+            else:
+                if not pb_hours(cid) and not pb_msgs(cid):
+                    D.set_setting(cid, PB_HOURS_KEY, PB_HOURS_DEFAULT)
+                D.set_setting(cid, PB_KEY, "on")
+                toast = L.t("pb.t_on", cid)
+        elif act == "h" and num is not None and (num == 0 or num in PB_HOURS):
+            if num == 0 and not pb_msgs(cid):
+                await q.answer(L.t("pb.t_keep_one", cid), show_alert=True)
+                return
+            D.set_setting(cid, PB_HOURS_KEY, num)
+            toast = L.t("pb.t_hours", cid, dur=extra.fmt_duration(num)) if num else L.t("pb.t_hours_off", cid)
+        elif act == "c" and num is not None and (num == 0 or num in PB_MSGS):
+            if num == 0 and not pb_hours(cid):
+                await q.answer(L.t("pb.t_keep_one", cid), show_alert=True)
+                return
+            D.set_setting(cid, PB_MSGS_KEY, num)
+            toast = L.t("pb.t_msgs", cid, n=num) if num else L.t("pb.t_msgs_off", cid)
+        elif act == "b" and arg in PB_BLOCKS:
+            blocks = set(pb_blocks(cid)) ^ {arg}
+            if not blocks:
+                await q.answer(L.t("pb.t_keep_block", cid), show_alert=True)
+                return
+            D.set_setting(cid, PB_BLOCK_KEY, ",".join(b for b in PB_BLOCK_ORDER if b in blocks))
+            toast = L.t("pb.t_block", cid)
+        elif act == "n" and len(parts) == 1:
+            now_on = D.get_setting(cid, PB_NOTICE_KEY, "on") == "on"
+            D.set_setting(cid, PB_NOTICE_KEY, "off" if now_on else "on")
+            toast = L.t("pb.t_notice_off" if now_on else "pb.t_notice_on", cid)
+        else:
+            await q.answer(L.t("pb.invalid", cid), show_alert=True)
+            return
+        await q.answer(toast)
+        await _ac_edit(q, *await _pb_panel(chat))
+    except Exception:
+        log.exception("probation: panel action failed in %s", cid)
+        await q.answer(L.t("ac.db_problem", cid), show_alert=True)
+
+
+async def probation_cmd(update, context):
+    """/probation  |  on | off  |  hours <time|off>  |  msgs <number|off>  |  start | end | status (reply to a member, @user or id)"""
+    if not await D.group_only(update):
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    cid, args, note = chat.id, [a.lower() for a in (context.args or [])], ""
+    if not args:
+        pass
+    elif args in (["on"], ["off"]):
+        if args[0] == "on" and not pb_hours(cid) and not pb_msgs(cid):
+            D.set_setting(cid, PB_HOURS_KEY, PB_HOURS_DEFAULT)
+        D.set_setting(cid, PB_KEY, args[0])
+        note = L.t("pb.t_on" if args[0] == "on" else "pb.t_off", cid)
+    elif args[0] == "hours" and len(args) == 2:
+        secs = 0 if args[1] == "off" else extra.parse_duration(args[1])
+        if secs is None or not 0 <= secs <= PB_MAX_SECS or (secs and secs < 60):
+            await msg.reply_html(L.t("pb.err_hours", cid))
+            return
+        if not secs and not pb_msgs(cid):
+            await msg.reply_html(L.t("pb.t_keep_one", cid))
+            return
+        D.set_setting(cid, PB_HOURS_KEY, secs)
+        note = L.t("pb.t_hours", cid, dur=extra.fmt_duration(secs)) if secs else L.t("pb.t_hours_off", cid)
+    elif args[0] in ("msgs", "messages") and len(args) == 2:
+        n = 0 if args[1] == "off" else (_ac_num(args[1], 1, PB_MAX_MSGS) or None)
+        if n is None:
+            await msg.reply_html(L.t("pb.err_msgs", cid, max=PB_MAX_MSGS))
+            return
+        if not n and not pb_hours(cid):
+            await msg.reply_html(L.t("pb.t_keep_one", cid))
+            return
+        D.set_setting(cid, PB_MSGS_KEY, n)
+        note = L.t("pb.t_msgs", cid, n=n) if n else L.t("pb.t_msgs_off", cid)
+    elif args[0] in ("start", "end", "status"):
+        sub = _Args(args=context.args[1:], bot=context.bot)         # get_target reads the member from the arguments after the word
+        uid, name = await D.get_target(update, sub)
+        if not uid:
+            return
+        if args[0] == "start":
+            if D.is_bot_owner(uid) or await D.is_admin(chat, uid):
+                await msg.reply_html(L.t("pb.err_admin", cid))
+                return
+            await _pb_begin(cid, uid)
+            await msg.reply_html(L.t("pb.m_started", cid, user=name))
+        elif args[0] == "end":
+            await msg.reply_html(L.t("pb.m_ended" if await _pb_finish(cid, uid) else "pb.m_not_on", cid, user=name))
+        else:
+            rec = await _pb_record(cid, uid)
+            on, left_t, left_m = _pb_state(cid, rec, time.time()) if rec else (False, None, None)
+            await msg.reply_html(L.t("pb.m_status_on", cid, user=name, when=_pb_when(cid, left_t, left_m)) if on
+                                 else L.t("pb.m_not_on", cid, user=name))
+        return
+    else:
+        await msg.reply_html(L.t("pb.usage", cid))
+        return
+    text, markup = await _pb_panel(chat, note)
+    await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+# ======================================================================================================
+# 2h. REPORTS  (extends nova.py's /report and "@admin": the reply that mentioned every admin is now a card)
+# ======================================================================================================
+# A member replies /report (or @admin) to a message. Admins get a card, in the same style as an Appeal card:
+#   [🔇 Mute 1h] [⚠️ Warn]  /  [🗑 Delete message] [✅ Dismiss]      (two buttons in a line)
+#   * the card goes to the private chat of every admin who started the bot, plus the chosen place (report_dest:
+#     "log" channel (default) | "group" | "none" = private chats only). When no card could be delivered at all, to the group.
+#   * one open report per message: a second member reporting the same message only adds to the card (+N more).
+#   * the first admin to tap decides; every copy of the card then shows who did what; the reporters get a short message
+#     in the bot's private chat. Decided reports leave the list 24 hours later (REPORT_KEEP). Open ones never do.
+#   * Mute = a timed mute (report_mute, default 1h); Warn = nova's add_warn (so the Warn Ladder applies); Delete message;
+#     Dismiss. Mute and Delete are written to the mod log (Warn writes its own row).
+#   * settings: reports_on (nova's /reports), report_dest, report_mute (seconds), report_cooldown (seconds a member waits
+#     between reports, default 60, 0 = none).
+#   * panel: /help > Reports > 🚨 Report Settings (callbacks "rp:..."), or /reportpanel, /reportmute, /reportcooldown.
+#   * data: collection "reports" {_id, chat_id, chat_title, msg_id, reported_id, reported_name, reported_mention,
+#     reporter_ids, reporter_mentions, pkind, preview, link, mute_secs, cards [{chat, id}], status
+#     (open|muted|warned|deleted|dismissed), created_at, decided_at, decided_by, decided_name}.
+REPORT_KEEP = 24 * 3600
+RP_DECIDED = ("muted", "warned", "deleted", "dismissed")
+RP_ACTS = {"m": "muted", "w": "warned", "x": "deleted", "d": "dismissed"}
+RP_DESTS = ("log", "group", "none")
+RP_PAGE = 6
+RP_MUTES = (900, 3600, 21600, 86400)
+RP_COOLDOWNS = (0, 30, 60, 120, 300)
+RP_KINDS = (("photo", "photo"), ("video", "video"), ("video_note", "video"), ("voice", "voice"), ("audio", "audio"),
+            ("document", "file"), ("animation", "gif"), ("sticker", "sticker"), ("poll", "poll"))
+_rp_last = {}           # (chat_id, reporter id) -> monotonic time of that member's last report
+
+
+def reports_on(chat_id):
+    return D.get_setting(chat_id, "reports_on", "True") == "True"
+
+
+def report_dest(chat_id):
+    dest = D.get_setting(chat_id, "report_dest", "log")
+    return dest if dest in RP_DESTS else "log"
+
+
+def report_mute_secs(chat_id):
+    secs = _num_setting(chat_id, "report_mute", 3600)
+    return secs if 60 <= secs <= RAID_MAX_SECS else 3600
+
+
+def report_cooldown(chat_id):
+    secs = _num_setting(chat_id, "report_cooldown", 60)
+    return secs if 0 <= secs <= 3600 else 60
+
+
+def report_button(chat):
+    """The 🚨 button nova.py adds to /help > Reports (groups only)."""
+    return InlineKeyboardButton(L.t("rp.btn_help", getattr(chat, "id", None)), callback_data="rp:p")
+
+
+def _pairs(buttons):
+    """Two buttons in a line."""
+    return [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+
+
+def _rp_preview(msg):
+    """(kind, text): the reported text (cut), or what kind of message it is."""
+    text = (getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip()
+    if text:
+        return "text", text[:150] + ("…" if len(text) > 150 else "")
+    for attr, kind in RP_KINDS:
+        if getattr(msg, attr, None):
+            return kind, ""
+    return "other", ""
+
+
+def _rp_link(chat, msg_id):
+    if getattr(chat, "username", None):
+        return f"https://t.me/{chat.username}/{msg_id}"
+    sid = str(chat.id)
+    return f"https://t.me/c/{sid[4:]}/{msg_id}" if sid.startswith("-100") else None
+
+
+def _rp_card_text(row, cid):
+    kind = row.get("pkind") or "other"
+    preview = html.escape(row.get("preview") or "") if kind == "text" else L.t("rp.p_" + kind, cid)
+    n = len(row.get("reporter_ids") or [])
+    reporter = (row.get("reporter_mentions") or ["?"])[0] + (L.t("rp.more", cid, n=n - 1) if n > 1 else "")
+    text = L.t("rp.card", cid, chat=html.escape(row.get("chat_title") or ""), user=row.get("reported_mention") or "?",
+               reporter=reporter, preview=preview)
+    return text + ("\n" + L.t("rp.link", cid, url=row["link"]) if row.get("link") else "")
+
+
+def _rp_buttons(row, cid):
+    i = row["_id"]
+    return _pairs([InlineKeyboardButton(L.t("rp.btn_mute", cid, dur=extra.fmt_duration(row.get("mute_secs") or 3600)), callback_data=f"rp:m:{i}"),
+                   InlineKeyboardButton(L.t("rp.btn_warn", cid), callback_data=f"rp:w:{i}"),
+                   InlineKeyboardButton(L.t("rp.btn_delete", cid), callback_data=f"rp:x:{i}"),
+                   InlineKeyboardButton(L.t("rp.btn_dismiss", cid), callback_data=f"rp:d:{i}")])
+
+
+def _rp_done_text(row, cid):
+    return L.t("rp.done_" + row["status"], cid, admin=html.escape(row.get("decided_name") or ""),
+               dur=extra.fmt_duration(row.get("mute_secs") or 3600))
+
+
+async def _rp_edit_cards(bot, row, text, markup=None, skip=None):
+    """Shows `text` on every copy of the card (except the one at `skip`, which the caller edits itself)."""
+    for card in row.get("cards", []):
+        if (card["chat"], card["id"]) == skip:
+            continue
+        try:
+            await bot.edit_message_text(text, chat_id=card["chat"], message_id=card["id"], parse_mode="HTML", reply_markup=markup)
+        except TelegramError:
+            pass                                           # deleted, or the same text
+
+
+async def _rp_note(msg, key, secs, **values):
+    """A short reply in the group that deletes itself."""
+    try:
+        sent = await msg.reply_html(L.t(key, msg.chat.id, **values))
+        await extra.track_notice(sent, secs)
+    except TelegramError:
+        pass
+
+
+async def report_submit(bot, chat, msg, reporter):
+    """nova's file_report calls this with the /report message (`msg`, a reply to the reported one). Returns True when the
+    report was filed (a new card, or the reporter added to an open one)."""
+    cid, target = chat.id, msg.reply_to_message
+    cd, key, now = report_cooldown(cid), (chat.id, reporter.id), time.monotonic()
+    if cd and key in _rp_last and now - _rp_last[key] < cd:
+        await _rp_note(msg, "rp.cooldown", 10, n=max(1, int(cd - (now - _rp_last[key]))))
+        return False
+    col = store.col("reports")
+    open_row = await asyncio.to_thread(col.find_one, {"chat_id": cid, "msg_id": target.message_id, "status": "open"})
+    if open_row:                                           # the same message again: one card, a counter
+        if reporter.id in open_row.get("reporter_ids", []):
+            await _rp_note(msg, "rp.dup", 10)
+            return False
+        open_row["reporter_ids"] = open_row.get("reporter_ids", []) + [reporter.id]
+        open_row["reporter_mentions"] = open_row.get("reporter_mentions", []) + [reporter.mention_html()]
+        await asyncio.to_thread(col.update_one, {"_id": open_row["_id"]},
+                                {"$set": {"reporter_ids": open_row["reporter_ids"], "reporter_mentions": open_row["reporter_mentions"]}})
+        await _rp_edit_cards(bot, open_row, _rp_card_text(open_row, cid), InlineKeyboardMarkup(_rp_buttons(open_row, cid)))
+        _rp_last[key] = now
+        await _rp_note(msg, "rp.sent", 60, reporter=reporter.mention_html())
+        return True
+    reported = target.from_user
+    pkind, preview = _rp_preview(target)
+    row = {"_id": os.urandom(5).hex(), "chat_id": cid, "chat_title": chat.title or "", "msg_id": target.message_id,
+           "reported_id": reported.id, "reported_name": getattr(reported, "full_name", None) or str(reported.id),
+           "reported_mention": reported.mention_html(), "reporter_ids": [reporter.id], "reporter_mentions": [reporter.mention_html()],
+           "pkind": pkind, "preview": preview, "link": _rp_link(chat, target.message_id), "mute_secs": report_mute_secs(cid),
+           "cards": [], "status": "open", "created_at": time.time()}
+    text, kb = _rp_card_text(row, cid), InlineKeyboardMarkup(_rp_buttons(row, cid))
+
+    async def send(to):
+        try:
+            sent = await bot.send_message(to, text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+        except TelegramError:
+            return False
+        row["cards"].append({"chat": to, "id": sent.message_id})
+        return True
+
+    try:
+        admins = [a.user.id for a in await bot.get_chat_administrators(cid) if not a.user.is_bot]
+    except TelegramError:
+        admins = []
+    for admin_id in admins:
+        await send(admin_id)                               # an admin who never started the bot is skipped
+    dest = report_dest(cid)
+    if dest == "log" and D.get_setting(cid, "log_channel"):
+        try:
+            await send(int(D.get_setting(cid, "log_channel")))
+        except ValueError:
+            pass
+    elif dest == "group":
+        await send(cid)
+    if not row["cards"]:
+        await send(cid)                                    # nobody could be reached any other way
+    if not row["cards"]:
+        log.warning("report: couldn't post the card in %s", cid)
+        return False
+    await asyncio.to_thread(col.insert_one, row)
+    _rp_last[key] = now
+    await _rp_note(msg, "rp.sent", 60, reporter=reporter.mention_html())
+    return True
+
+
+# ------------------------------------------------------------------ deciding (the card)
+async def _rp_apply(bot, gchat, row, act, admin_mention):
+    """Does what the button says. Returns True when it worked."""
+    cid, uid, mode_secs = row["chat_id"], row["reported_id"], row.get("mute_secs") or 3600
+    if act == "muted":
+        mode = f"tmute:{mode_secs}"
+        if not await D.do_action(gchat, uid, mode):
+            return False
+        kind, secs = extra.mode_kind(mode)
+        await extra.record_action(cid, uid, row.get("reported_mention") or str(uid), "Muted (report)", "Reported by a member",
+                                  extra.punishment_text(kind, secs), admin_mention, "mute", kind="mute")
+    elif act == "warned":
+        notice = await D.add_warn(gchat, uid, row.get("reported_mention") or str(uid), "Reported by a member", admin_mention)
+        try:
+            await bot.send_message(cid, notice, parse_mode="HTML")
+        except TelegramError:
+            pass
+    elif act == "deleted":
+        try:
+            await bot.delete_message(cid, row["msg_id"])
+        except TelegramError as e:
+            if "not found" not in str(e).lower():          # already gone is fine
+                return False
+        await extra.record_action(cid, uid, row.get("reported_mention") or str(uid), "Message deleted (report)", "Reported by a member",
+                                  "Message deleted only (no mute or ban)", admin_mention, "mod", kind="delete")
+    return True
+
+
+async def rp_decide(update, context, act_key, report_id):
+    q, bot = update.callback_query, context.bot
+    col = store.col("reports")
+    try:
+        row = await asyncio.to_thread(col.find_one, {"_id": report_id})
+        gchat = await bot.get_chat(row["chat_id"]) if row else None
+    except TelegramError:
+        row = gchat = None
+    if row is None or gchat is None:
+        await q.answer(L.t("rp.invalid"), show_alert=True)
+        return
+    cid, new = row["chat_id"], RP_ACTS[act_key]
+    if not await _ac_allowed(gchat, q.from_user.id):
+        await q.answer(L.t("rp.card_admin_only", cid), show_alert=True)
+        return
+    who = getattr(q.from_user, "full_name", None) or getattr(q.from_user, "first_name", "") or str(q.from_user.id)
+    claim = await asyncio.to_thread(col.update_one, {"_id": report_id, "status": "open"},
+                                    {"$set": {"status": new, "decided_by": q.from_user.id, "decided_name": who, "decided_at": time.time()}})
+    if claim.modified_count != 1:
+        await q.answer(L.t("rp.already", cid), show_alert=True)
+        return
+    by = q.from_user.mention_html() if hasattr(q.from_user, "mention_html") else html.escape(who)
+    try:
+        worked = await _rp_apply(bot, gchat, row, new, by)
+    except TelegramError as e:
+        log.warning("report: couldn't %s in %s: %s", new, cid, e)
+        worked = False
+    if not worked:
+        await asyncio.to_thread(col.update_one, {"_id": report_id}, {"$set": {"status": "open"}})      # still open: try again
+        await q.answer(L.t("rp.act_failed", cid), show_alert=True)
+        return
+    await q.answer()
+    row["status"], row["decided_name"] = new, who
+    final = _rp_card_text(row, cid) + "\n\n" + _rp_done_text(row, cid)
+    here = (q.message.chat.id, q.message.message_id) if q.message else None
+    cards = [(c["chat"], c["id"]) for c in row.get("cards", [])]
+    await _rp_edit_cards(bot, row, final, None, skip=here)
+    if here is not None and here in cards:
+        try:
+            await q.edit_message_text(final, parse_mode="HTML", reply_markup=None, disable_web_page_preview=True)
+        except TelegramError:
+            pass
+    elif here is not None:                                 # decided from the Report List page
+        await _ac_edit(q, final, InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="rp:l:0")]]))
+    for reporter_id in row.get("reporter_ids", []):        # the reporters get a plain status message
+        try:
+            await bot.send_message(reporter_id, L.t("rp.dm_dismissed" if new == "dismissed" else "rp.dm_acted", cid,
+                                                    chat=html.escape(gchat.title or "")), parse_mode="HTML")
+        except TelegramError:
+            pass                                           # they never started the bot
+
+
+# ------------------------------------------------------------------ the settings panel and the list
+def _rp_panel(chat, note=""):
+    cid = getattr(chat, "id", None)
+    if chat is None or chat.type == "private":
+        return L.t("rp.private", cid), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]])
+    on, dest, mute, cd = reports_on(cid), report_dest(cid), report_mute_secs(cid), report_cooldown(cid)
+    text = (L.t("rp.title", cid) + "\n\n" + (note + "\n\n" if note else "") + L.t("rp.intro", cid) + "\n\n" +
+            L.t("rp.status_on" if on else "rp.status_off", cid) + "\n" + L.t("rp.dest_line", cid, dest=L.t("rp.dest_" + dest, cid)) + "\n" +
+            L.t("rp.mute_line", cid, dur=extra.fmt_duration(mute)) + "\n" +
+            L.t("rp.cd_line", cid, dur=extra.fmt_duration(cd) if cd else L.t("rp.off", cid)) + "\n\n" + L.t("rp.note", cid))
+    mark = lambda cond: "✅ " if cond else ""
+    rows = [[InlineKeyboardButton(L.t("rp.btn_off" if on else "rp.btn_on", cid), callback_data="rp:t")]]
+    rows += _pairs([InlineKeyboardButton(mark(d == dest) + L.t("rp.d_" + d, cid), callback_data=f"rp:e:{d}") for d in RP_DESTS])
+    rows += _pairs([InlineKeyboardButton(mark(s == mute) + "🔇 " + extra.fmt_duration(s), callback_data=f"rp:u:{s}") for s in RP_MUTES])
+    rows += _pairs([InlineKeyboardButton(mark(s == cd) + "⏱ " + (extra.fmt_duration(s) if s else L.t("rp.off", cid)), callback_data=f"rp:c:{s}")
+                    for s in RP_COOLDOWNS])
+    rows.append([InlineKeyboardButton(L.t("rp.btn_list", cid), callback_data="rp:l:0")])
+    rows.append([InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:reports")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def _rp_list_panel(chat, page):
+    cid = chat.id
+    rows = await asyncio.to_thread(_apl_purge_find, {"chat_id": cid}, "reports", RP_DECIDED, REPORT_KEEP)
+    rows.sort(key=lambda r: r.get("created_at", 0), reverse=True)
+    pages = max(1, -(-len(rows) // RP_PAGE))
+    page = min(max(page, 0), pages - 1)
+    shown = rows[page * RP_PAGE:(page + 1) * RP_PAGE]
+    if not rows:
+        text = L.t("rp.list_title", cid, count=0) + "\n\n" + L.t("rp.list_empty", cid)
+    else:
+        lines = [L.t("rp.list_line", cid, n=page * RP_PAGE + i + 1, user=html.escape(r.get("reported_name") or ""),
+                     status=L.t("rp.st_" + r["status"], cid, admin=html.escape(r.get("decided_name") or "")))
+                 for i, r in enumerate(shown)]
+        text = L.t("rp.list_title", cid, count=len(rows)) + "\n\n" + "\n".join(lines)
+        if any(r["status"] == "open" for r in shown):
+            text += "\n\n" + L.t("rp.list_tap", cid)
+    kb = [[InlineKeyboardButton(f"🔴 {r.get('reported_name') or ''}"[:60], callback_data=f"rp:o:{r['_id']}")] for r in shown if r["status"] == "open"]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"rp:l:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"rp:l:{page + 1}"))
+    if nav:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton(L.t("pick.back", cid), callback_data="rp:p")])
+    return text, InlineKeyboardMarkup(kb)
+
+
+async def rp_callback(update, context):
+    """\"rp:<m|w|x|d>:<id>\" the card buttons (Mute, Warn, Delete message, Dismiss: admins of the report's group, in any chat),
+    and for the panel in a group: \"rp:p\", \"rp:t\", \"rp:e:<dest>\", \"rp:u:<secs>\", \"rp:c:<secs>\", \"rp:l:<page>\", \"rp:o:<id>\"."""
+    q = update.callback_query
+    parts = (q.data or "").split(":")[1:]
+    act, arg = (parts[0] if parts else ""), (parts[1] if len(parts) == 2 else None)
+    if act in RP_ACTS and arg and len(parts) == 2:
+        await rp_decide(update, context, act, arg)
+        return
+    chat = q.message.chat if q.message else None
+    if chat is None:
+        await q.answer()
+        return
+    if await extra.menu_not_owner(q):
+        return
+    if chat.type == "private":
+        await q.answer(L.t("rp.private"), show_alert=True)
+        return
+    cid = chat.id
+    if not await _ac_allowed(chat, q.from_user.id):
+        await q.answer(L.t("rp.admin_only", cid), show_alert=True)
+        return
+    num = _ac_num(arg, 0, 10 ** 7) if arg is not None else None
+    toast = None
+    try:
+        if act == "p" and len(parts) == 1:
+            await q.answer()
+            await _ac_edit(q, *_rp_panel(chat))
+            return
+        if act == "l" and num is not None:
+            await q.answer()
+            await _ac_edit(q, *await _rp_list_panel(chat, num))
+            return
+        if act == "o" and arg and len(parts) == 2:
+            row = await asyncio.to_thread(store.col("reports").find_one, {"_id": arg, "chat_id": cid})
+            if not row:
+                await q.answer(L.t("rp.invalid", cid), show_alert=True)
+                return
+            await q.answer()
+            back = [[InlineKeyboardButton(L.t("pick.back", cid), callback_data="rp:l:0")]]
+            if row["status"] == "open":
+                await _ac_edit(q, _rp_card_text(row, cid), InlineKeyboardMarkup(_rp_buttons(row, cid) + back))
+            else:
+                await _ac_edit(q, _rp_card_text(row, cid) + "\n\n" + _rp_done_text(row, cid), InlineKeyboardMarkup(back))
+            return
+        if act == "t" and len(parts) == 1:
+            on = not reports_on(cid)
+            D.set_setting(cid, "reports_on", "True" if on else "False")      # the same text nova's /reports saves
+            toast = L.t("rp.t_on" if on else "rp.t_off", cid)
+        elif act == "e" and arg in RP_DESTS:
+            D.set_setting(cid, "report_dest", arg)
+            toast = L.t("rp.t_dest", cid, dest=L.t("rp.dest_" + arg, cid))
+        elif act == "u" and num in RP_MUTES:
+            D.set_setting(cid, "report_mute", num)
+            toast = L.t("rp.t_mute", cid, dur=extra.fmt_duration(num))
+        elif act == "c" and num in RP_COOLDOWNS:
+            D.set_setting(cid, "report_cooldown", num)
+            toast = L.t("rp.t_cd", cid, dur=extra.fmt_duration(num) if num else L.t("rp.off", cid))
+        else:
+            await q.answer(L.t("rp.invalid", cid), show_alert=True)
+            return
+        await q.answer(toast)
+        await _ac_edit(q, *_rp_panel(chat))
+    except Exception:
+        log.exception("reports: panel action failed in %s", cid)
+        await q.answer(L.t("ac.db_problem", cid), show_alert=True)
+
+
+async def _rp_setting_cmd(update, context, key, low, high, err, toast, allow_off=False):
+    """Shared by /reportmute and /reportcooldown."""
+    if not await D.group_only(update):
+        return
+    chat, msg, note = update.effective_chat, update.effective_message, ""
+    if context.args:
+        text = " ".join(context.args).lower()
+        secs = 0 if (allow_off and text == "off") else _parse_secs(text, low, high)
+        if secs is None:
+            await msg.reply_html(L.t(err, chat.id))
+            return
+        D.set_setting(chat.id, key, secs)
+        note = L.t(toast, chat.id, dur=extra.fmt_duration(secs) if secs else L.t("rp.off", chat.id))
+    text, markup = _rp_panel(chat, note)
+    await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+async def reportpanel_cmd(update, context):
+    """/reportpanel: the settings panel (admins)."""
+    if not await D.group_only(update):
+        return
+    text, markup = _rp_panel(update.effective_chat)
+    await update.effective_message.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+async def reportmute_cmd(update, context):
+    """/reportmute 2h: how long the card's Mute button mutes."""
+    await _rp_setting_cmd(update, context, "report_mute", 60, RAID_MAX_SECS, "rp.err_mute", "rp.t_mute")
+
+
+async def reportcooldown_cmd(update, context):
+    """/reportcooldown 60s | off: how long a member waits between reports."""
+    await _rp_setting_cmd(update, context, "report_cooldown", 10, 3600, "rp.err_cd", "rp.t_cd", allow_off=True)
 
 
 # ======================================================================================================
@@ -2002,14 +3623,14 @@ MODULES = {
     "greetings": {"keys": ("welcome", "welcome_on", "goodbye", "goodbye_on", "clean_welcome", "join_dm",
                            "join_dm_text", "join_delay", "captcha", "captcha_mode", "captcha_time",
                            "captcha_action")},
-    "locks": {"keys": ("lock", "lockwarns"), "prefixes": ("lock_",)},
+    "locks": {"keys": ("lock", "lockwarns", "prob", "prob_hours", "prob_msgs", "prob_block", "prob_notice"), "prefixes": ("lock_",)},
     "notes": {"keys": ("private_notes",), "notes": True},
     "pins": {"keys": ()},
-    "raids": {"keys": ("auto_raid", "raid_time", "raid_action_time")},
+    "raids": {"keys": ("auto_raid", "raid_time", "raid_action_time", "raid_mode", "raid_window")},
     "reports": {"keys": ("reports_on",)},
     "rules": {"keys": ("rules", "rules_private", "rules_button")},
     "translations": {"keys": ()},
-    "warns": {"keys": ("warn_limit", "warn_time", "warn_mode")},
+    "warns": {"keys": ("warn_limit", "warn_time", "warn_mode", "warn_ladder", "warn_ladder_on")},
 }
 ORDER = tuple(MODULES)
 _last_use = {}
@@ -2809,6 +4430,20 @@ def register(app, deps):
     app.add_handler(CallbackQueryHandler(apl_callback, pattern=r"^apl:"))
     app.add_handler(CommandHandler("start", appeal_start, filters=filters.ChatType.PRIVATE), group=-20)
     app.add_handler(CommandHandler("myappeals", myappeals_cmd, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("warnladder", warnladder_cmd))      # custom action for each warning count
+    app.add_handler(CallbackQueryHandler(wl_callback, pattern=r"^wl:"))
+    app.add_handler(CallbackQueryHandler(ml_callback, pattern=r"^ml:"))        # /modlog page buttons (the command itself is nova's /modlog)
+    app.add_handler(CommandHandler("raidmode", raidmode_cmd))          # Raid Shield: ban / mute joiners / lock the group
+    app.add_handler(CommandHandler("raidwindow", raidwindow_cmd))
+    app.add_handler(CallbackQueryHandler(rd_callback, pattern=r"^rd:"))
+    app.add_handler(CommandHandler("reportpanel", reportpanel_cmd))    # Reports: card settings
+    app.add_handler(CommandHandler("reportmute", reportmute_cmd))
+    app.add_handler(CommandHandler("reportcooldown", reportcooldown_cmd))
+    app.add_handler(CallbackQueryHandler(rp_callback, pattern=r"^rp:"))
+    app.add_handler(CommandHandler("probation", probation_cmd))        # new members: no links / media for a while
+    app.add_handler(CallbackQueryHandler(pb_callback, pattern=r"^pb:"))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, probation_guard), group=-10)   # before the locks (-2)
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, probation_new_members), group=-8)           # after the raid shield (-9)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, appeal_reason), group=-19)
     L.register(app, deps, _ac_allowed, extra.menu_not_owner)   # /lang and the 🌐 Language page (lang/ folder)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, ac_custom_message),

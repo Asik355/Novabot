@@ -119,6 +119,7 @@ UNIQUE_INDEXES = {
     "court_votes": ["case_id", "voter_id"], "court_verdicts": ["id"],
     "modlog": ["id"], "notice_pending": ["chat_id", "message_id"],
     "fun_commands": ["id"], "fun_gifs": ["id"], "fun_aliases": ["id"],
+    "probation": ["chat_id", "user_id"],
 }
 # Extra unique indexes (one list of keys each): a Fun command name is unique, and the same GIF is saved once per command.
 EXTRA_UNIQUE_INDEXES = {"fun_commands": [["name"]], "fun_gifs": [["command_id", "file_unique_id"]],
@@ -132,7 +133,7 @@ PLAIN_INDEXES = {
 }
 # MongoDB deletes a document by itself once its "expire_at" date has passed (no bot code involved).
 # Documents without an expire_at (the old modlog rows) are never touched by this.
-TTL_INDEXES = ("modlog", "notice_pending")
+TTL_INDEXES = ("modlog", "notice_pending", "probation")
 
 
 def _ensure_indexes():
@@ -577,12 +578,21 @@ HISTORY_KEEP_DAYS = 15  # action history rows are deleted automatically by Mongo
 _MODLOG_PRUNE_EVERY = 50
 
 
-def modlog_add(chat_id, category, text, ts):
+def modlog_add(chat_id, category, text, ts, user_id=None, kind=None, meta=None):
+    """One history row. Optional: user_id (the member it was about), kind (ban, kick, mute, warn, unmute, unban, unwarn,
+    appeal, delete) and meta ({label, reason, punish, by, name}: the parts of the row, so it can be shown translated)."""
     chat_id = int(chat_id)
     row_id = next_id("modlog")
-    col("modlog").insert_one({"id": row_id, "chat_id": chat_id, "category": str(category),
-                              "text": str(text)[:2000], "ts": int(ts),
-                              "expire_at": datetime.fromtimestamp(int(ts), timezone.utc) + timedelta(days=HISTORY_KEEP_DAYS)})
+    doc = {"id": row_id, "chat_id": chat_id, "category": str(category),
+           "text": str(text)[:2000], "ts": int(ts),
+           "expire_at": datetime.fromtimestamp(int(ts), timezone.utc) + timedelta(days=HISTORY_KEEP_DAYS)}
+    if user_id is not None:
+        doc["user_id"] = int(user_id)
+    if kind:
+        doc["kind"] = str(kind)
+    if isinstance(meta, dict):
+        doc["meta"] = {str(k): str(v)[:300] for k, v in meta.items()}
+    col("modlog").insert_one(doc)
     if row_id % _MODLOG_PRUNE_EVERY == 0:  # keep the history bounded, one group at a time
         cutoff = list(col("modlog").find({"chat_id": chat_id}, {"id": 1}, sort=[("id", DESCENDING)],
                                          skip=MODLOG_KEEP, limit=1))
@@ -590,18 +600,28 @@ def modlog_add(chat_id, category, text, ts):
             col("modlog").delete_many({"chat_id": chat_id, "id": {"$lte": cutoff[0]["id"]}})
 
 
-def modlog_recent(chat_id, limit=20, category=None):
-    """Newest first: [{id, category, text, ts}] for THIS group only."""
+def _modlog_filter(chat_id, category=None, user_id=None, kinds=None):
     flt = {"chat_id": int(chat_id)}
     if category:
         flt["category"] = category
-    rows = col("modlog").find(flt, sort=[("id", DESCENDING)], limit=max(1, min(int(limit), 200)))
-    return [{"id": r["id"], "category": r.get("category"), "text": r.get("text", ""), "ts": r.get("ts", 0)}
+    if user_id:
+        flt["user_id"] = int(user_id)
+    if kinds:
+        flt["kind"] = {"$in": list(kinds)}
+    return flt
+
+
+def modlog_recent(chat_id, limit=20, category=None, user_id=None, kinds=None, skip=0):
+    """Newest first: [{id, category, text, ts, user_id, kind, meta}] for THIS group only. Filter by member and / or kinds."""
+    rows = col("modlog").find(_modlog_filter(chat_id, category, user_id, kinds), sort=[("id", DESCENDING)],
+                              skip=max(0, int(skip)), limit=max(1, min(int(limit), 200)))
+    return [{"id": r["id"], "category": r.get("category"), "text": r.get("text", ""), "ts": r.get("ts", 0),
+             "user_id": r.get("user_id"), "kind": r.get("kind"), "meta": r.get("meta") or {}}
             for r in rows]
 
 
-def modlog_count(chat_id):
-    return col("modlog").count_documents({"chat_id": int(chat_id)})
+def modlog_count(chat_id, user_id=None, kinds=None):
+    return col("modlog").count_documents(_modlog_filter(chat_id, None, user_id, kinds))
 
 
 # ------------------------------------------------------------------ action notices that delete themselves later
@@ -852,10 +872,42 @@ def warn_recent(chat_id, limit=10):
     return [(r["user_id"], r.get("reason"), r.get("ts")) for r in rows]
 
 
+# ------------------------------------------------------------------ new-member probation (group.py 2g)
+PROBATION_KEEP_DAYS = 35  # a record is only a safety net for the cleanup: the rules (hours / messages) are read from the settings
+
+
+def probation_start(chat_id, user_id, ts):
+    """A member just joined (or an admin started it): the clock and the message count start from zero."""
+    chat_id, user_id, ts = int(chat_id), int(user_id), int(ts)
+    col("probation").update_one(
+        {"chat_id": chat_id, "user_id": user_id},
+        {"$set": {"joined": ts, "count": 0, "expire_at": datetime.fromtimestamp(ts, timezone.utc) + timedelta(days=PROBATION_KEEP_DAYS)}},
+        upsert=True)
+
+
+def probation_get(chat_id, user_id):
+    """{joined, count} or None when the member is not on probation."""
+    doc = col("probation").find_one({"chat_id": int(chat_id), "user_id": int(user_id)})
+    return {"joined": int(doc.get("joined", 0)), "count": int(doc.get("count", 0))} if doc else None
+
+
+def probation_add_message(chat_id, user_id):
+    col("probation").update_one({"chat_id": int(chat_id), "user_id": int(user_id)}, {"$inc": {"count": 1}})
+
+
+def probation_end(chat_id, user_id):
+    """True when the member was on probation."""
+    return col("probation").delete_one({"chat_id": int(chat_id), "user_id": int(user_id)}).deleted_count > 0
+
+
+def probation_total(chat_id):
+    return col("probation").count_documents({"chat_id": int(chat_id)})
+
+
 # ------------------------------------------------------------------ group -> supergroup migration
 CHAT_COLLECTIONS = ("settings", "warn_log", "notes", "filters", "blocklist", "approved", "allowlist",
                     "captcha_pending", "roast_profiles", "roast_battles", "roast_results", "roast_votes",
-                    "court_cases", "court_votes", "court_verdicts", "modlog")
+                    "court_cases", "court_votes", "court_verdicts", "modlog", "probation")
 
 
 def migrate_chat(old_id, new_id):

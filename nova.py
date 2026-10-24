@@ -109,6 +109,10 @@ except ModuleNotFoundError:  # the file was saved as extras.py: accept it instea
     sys.modules["extra"] = extra
 import fun_systems  # roast + court entertainment (wired up in main())
 import group  # /autoclose, /cleanservice, /cleancommand, /export /import /reset (wired up in main())
+try:
+    from lang import lang as L  # English / Hinglish texts (lang/lang.py)
+except ImportError:
+    import lang as L  # lang.py uploaded next to nova.py instead of inside a lang/ folder
 import msgcount  # message count / leaderboard / milestones (wired up in main())
 import migrate_to_mongo as store  # the MongoDB data layer (the only file that talks to the database)
 from extra import (  # pure helpers (no bot state): see extra.py
@@ -430,10 +434,12 @@ def parse_mode(args, allowed):
     return kind
 
 
-def describe_mode(mode):
+def describe_mode(mode, chat_id=None):
     kind, _, arg = mode.partition(":")
     if kind == "tmute":
-        return f"mute for {fmt_duration(int(arg))}"
+        return L.t("wn.mode_tmute", chat_id, dur=fmt_duration(int(arg))) if chat_id is not None else f"mute for {fmt_duration(int(arg))}"
+    if chat_id is not None and kind in ("ban", "kick", "mute"):
+        return L.t("wn.mode_" + kind, chat_id)
     return MODE_TEXT.get(kind, kind)
 
 
@@ -483,6 +489,9 @@ async def add_warn(chat, user_id, mention, reason, by=None):
     limit = int(get_setting(chat.id, "warn_limit", 3))
     store.warn_add(chat.id, user_id, reason, int(time.time()))
     count = len(active_warns(chat.id, user_id))
+    ladder = await group.ladder_warn(chat, user_id, mention, reason or "No reason given", by, count, do_action)
+    if ladder is not None:  # 🪜 Warn Ladder is ON with steps: it decides (None = normal limit and action below)
+        return ladder
     mode = get_setting(chat.id, "warn_mode", "ban")
     why = reason or "No reason given"
     if count < limit:
@@ -490,7 +499,7 @@ async def add_warn(chat, user_id, mention, reason, by=None):
         punish = (f"Warning {count}/{limit}: no mute or ban yet. At {limit}/{limit} warnings the action is "
                   f"{describe_mode(mode)}")
         await extra.record_action(chat.id, user_id, mention, label, why, punish, by, "warn")
-        return extra.action_notice(mention, label, why, punish, by)
+        return extra.action_notice(mention, label, why, punish, by, chat_id=chat.id)
 
     store.warn_clear(chat.id, user_id)
     done = await do_action(chat, user_id, mode)
@@ -500,11 +509,9 @@ async def add_warn(chat, user_id, mention, reason, by=None):
         punish = extra.punishment_text(kind, secs)
         why = f"Reached {limit}/{limit} warnings. Last warning: {why}"
         await extra.record_action(chat.id, user_id, mention, label, why, punish, by, "warn")
-        return extra.action_notice(mention, label, why, punish, by)
-    return (
-        f"{mention} reached {limit}/{limit} warnings, but I couldn't "
-        f"{describe_mode(mode)}. Check my admin permissions.\nReason: {html.escape(why)}"
-    )
+        return extra.action_notice(mention, label, why, punish, by, chat_id=chat.id)
+    return L.t("wn.limit_fail", chat.id, mention=mention, limit=limit, mode=describe_mode(mode, chat.id),
+               reason=html.escape(why))
 
 
 async def enforce(chat, user_id, mention, mode, reason, category=None):
@@ -520,7 +527,7 @@ async def enforce(chat, user_id, mention, mode, reason, category=None):
         if done:
             kind, secs = extra.mode_kind(mode)
             label, punish = extra.ACTION_LABEL.get(kind, kind.title()), extra.punishment_text(kind, secs)
-            text = extra.action_notice(mention, label, reason, punish)
+            text = extra.action_notice(mention, label, reason, punish, chat_id=chat.id)
             await extra.record_action(chat.id, user_id, mention, label, reason, punish, None, category or "mod")
     if text and category:
         await log_action(chat, category, text)
@@ -533,7 +540,7 @@ async def announce(chat, text, uid=None):
     kb = None
     # when the bot itself just muted this user, attach the same Unmute button /mute uses
     if uid is not None and time.time() - _recent_mutes.pop((chat.id, uid), 0) < 15:
-        kb = group.appeal_markup(chat.id, uid, "mute", InlineKeyboardMarkup([[InlineKeyboardButton("✅ Unmute", callback_data=f"unmute:{uid}")]]))
+        kb = group.appeal_markup(chat.id, uid, "mute", InlineKeyboardMarkup([[InlineKeyboardButton(L.t("wn.btn_unmute", chat.id), callback_data=f"unmute:{uid}")]]))
     try:
         sent = await chat.send_message(text, parse_mode="HTML", reply_markup=kb)
     except TelegramError as e:
@@ -837,16 +844,8 @@ async def file_report(update, context):
     # Admins don't need to report, and can't be reported - they're assumed exempt.
     if await is_admin(chat, reporter.id) or await is_admin(chat, reported.id):
         return
-    try:
-        admins = await chat.get_administrators()
-    except TelegramError:
+    if not await group.report_submit(context.bot, chat, msg, reporter):  # a card with buttons for the admins (group.py 2h)
         return
-    mentions = " ".join(a.user.mention_html() for a in admins if not a.user.is_bot)
-    if not mentions:
-        return
-    await target_msg.reply_html(
-        f"{reporter.mention_html()} reported this message to: {mentions}"
-    )
     await log_action(
         chat, "report", f"🚨 {reporter.mention_html()} reported {reported.mention_html()}."
     )
@@ -924,6 +923,11 @@ RAID_HELP_TEXT = (
     "- Disable antiraid:\n-&gt; /antiraid off\n\n"
     "- Automatically enable antiraid if over 15 users join in under a minute:\n-&gt; /autoantiraid 15\n\n"
     "- Disable automatic antiraid:\n-&gt; /autoantiraid off"
+    "\n\n<b>Raid Shield</b>\n\n"
+    "- Open the 🛡 Raid Shield button for every setting: what a raid does (ban, mute new members, or lock the group), "
+    "how many joins start it and within how long, and how long it lasts. Everything lifts by itself.\n"
+    "- /raidmode &lt;ban/restrict/lock&gt;: Choose what a raid does. Default ban.\n"
+    "- /raidwindow &lt;time&gt;: How far back the join counter looks, like 30s or 2m. Default 1m."
 )
 
 HELP_SECTIONS = {
@@ -952,6 +956,7 @@ HELP_SECTIONS = {
             "/warnlimit N: Set how many warnings trigger the warn action.",
             "/warnmode ban|kick|mute|tmute: Set the action at the limit.",
             "/warntime 7d|off: Make warnings expire after a time, or never.",
+            "/warnladder: Set a different action for each warning count (2 warns mute, 5 kick...).",
         ]),
     ),
     "flood": (
@@ -1126,6 +1131,7 @@ HELP_SECTIONS = {
             "/locktypes: List every item that can be locked.",
             "/lockwarns yes|no: Warn people who send a locked item.",
             "/allowlist [items]: Exempt URLs, IDs, @names, commands, cashtags or sticker packs from locks; no items shows the list.",
+            "/probation: New members can't send links or media for their first hours or messages.",
             "/rmallowlist items: Remove items from the allowlist.",
             "/rmallowlistall: Clear the whole allowlist.",
         ]),
@@ -1151,6 +1157,7 @@ HELP_SECTIONS = {
             "/nolog category: Stop logging that category.",
             "/logcategories: List every loggable category and what it covers.",
             "/modlog: Show the last bot and admin actions in this group (action, reason, punishment). Kept for 15 days.",
+            "/modlog @user: Show the history of one member (or reply to them with /modlog). Filter by bans, kicks, mutes, warns or undone.",
         ]),
     ),
     "reports": (
@@ -1159,6 +1166,7 @@ HELP_SECTIONS = {
             "/report (reply): Report a message to all admins.",
             "Reply with @admin: Same as /report.",
             "/reports yes|no|on|off: Turn user reports on or off (admin only).",
+            "/reportpanel: Choose where report cards go, how long Mute lasts and the wait between reports.",
         ]),
     ),
     "disabling": (
@@ -1557,7 +1565,11 @@ USAGE_GUIDES = {
         "• Reply <code>/warn spamming</code>\n"
         "• Check: reply <code>/warns</code>\n"
         "• Remove the latest one: reply <code>/rmwarn</code>\n"
-        "• Clear all: reply <code>/resetwarns</code>"),
+        "• Clear all: reply <code>/resetwarns</code>\n\n"
+        "<b>Different action for each warning count</b>\n"
+        "• Open <b>🪜 Warn Ladder</b> on this page, or use <code>/warnladder</code>\n"
+        "• Example: <code>/warnladder 2 tmute 2h</code> (mute for 2 hours at 2 warns), <code>/warnladder 5 kick</code>\n"
+        "• Change a step by sending its count again, or tap it in the panel. Remove: <code>/warnladder remove 2</code>"),
     "flood": (
         "<b>Antiflood</b> stops people sending too many messages fast.\n"
         "• 6 messages within 5 seconds: <code>/setflood 6 5</code>\n"
@@ -1569,7 +1581,9 @@ USAGE_GUIDES = {
         "• <code>/mentionlimit 5</code>: 5 @mentions in one message count as spam\n"
         "• <code>/spammode warn</code>: what happens to spammers\n\n"
         "<b>AntiRaid</b>: <code>/antiraid 3h</code> blocks all new joins for 3 hours, "
-        "<code>/antiraid off</code> ends it, <code>/autoantiraid 15</code> turns it on by itself when 15 people join in a minute."),
+        "<code>/antiraid off</code> ends it, <code>/autoantiraid 15</code> turns it on by itself when 15 people join in a minute.\n"
+        "<b>Raid Shield</b>: open <b>🛡 Raid Shield</b> on this page to choose what a raid does: ban new members (default), "
+        "mute them, or <b>lock the whole group</b>. It lifts by itself, and works with Night Mode and Auto Close."),
     "captcha": (
         "<b>Set it up in 4 steps</b>\n"
         "1. <code>/captcha on</code>\n"
@@ -1654,7 +1668,11 @@ USAGE_GUIDES = {
         "• Warn people who break a lock: <code>/lockwarns yes</code>\n\n"
         "<b>Allowlist</b> (exceptions to locks)\n"
         "• <code>/allowlist example.com @somebot</code>\n"
-        "• Remove: <code>/rmallowlist example.com</code>, clear all: <code>/rmallowlistall</code>"),
+        "• Remove: <code>/rmallowlist example.com</code>, clear all: <code>/rmallowlistall</code>\n\n"
+        "<b>New member probation</b>\n"
+        "• Open <b>🆕 New Member Probation</b> on this page, or use <code>/probation</code>\n"
+        "• New members can't send links or media for their first hours or messages (you choose both). Admins, approved members and the allowlist are never affected.\n"
+        "• Examples: <code>/probation hours 12h</code>, <code>/probation msgs 5</code>, <code>/probation start</code> (reply to a member)"),
     "purge": (
         "The bot needs the \"Delete messages\" right.\n\n"
         "• Delete everything from a message to now: reply to the first message with <code>/purge</code>\n"
@@ -1673,11 +1691,16 @@ USAGE_GUIDES = {
         "• <code>/logcategories</code>: all categories\n"
         "• <code>/log ban</code> starts and <code>/nolog ban</code> stops a category (names: ban, mute, warn, admin, blocklist, flood, spam, lock, note, filter, purge, captcha...)\n"
         "• <code>/logchannel</code> shows the current channel, <code>/unsetlog</code> removes it\n\n"
-        "<code>/modlog</code> shows the last actions in this group (kept for 15 days)."),
+        "<code>/modlog</code> shows the last actions in this group (kept for 15 days).\n"
+        "<code>/modlog @user</code> shows one member's history. Use the filter buttons to see only bans, kicks, mutes, warns or undone actions."),
     "reports": (
         "• A member replies to a bad message with <code>/report</code> (or types <code>@admin</code> in the reply). "
         "All admins are notified.\n"
-        "• Turn reports on/off: <code>/reports on</code> / <code>/reports off</code> (admins)."),
+        "• Turn reports on/off: <code>/reports on</code> / <code>/reports off</code> (admins).\n\n"
+        "<b>Report cards</b>\n"
+        "• Admins get a card with <b>Mute</b>, <b>Warn</b>, <b>Delete message</b> and <b>Dismiss</b> buttons. The first admin to tap decides.\n"
+        "• Cards go to the private chat of every admin who started the bot, plus your log channel (or the group, your choice).\n"
+        "• Open <b>🚨 Report Settings</b> on this page, or use <code>/reportpanel</code>, <code>/reportmute 2h</code>, <code>/reportcooldown 60s</code>."),
     "disabling": (
         "<b>Stop members using a command</b>\n"
         "• <code>/disableable</code>: commands that can be disabled\n"
@@ -1818,6 +1841,16 @@ def help_section_keyboard(key=None, chat=None):
                      InlineKeyboardButton("📤 Export", callback_data="ie:exp")])
     if key == "approval" and chat is not None and chat.type != "private":
         rows.append([InlineKeyboardButton("⚙️ Auto Approve", callback_data="jn:m")])
+    if key == "reports" and chat is not None and chat.type != "private":
+        rows.append([group.report_button(chat)])  # 🚨 report cards: where they go, mute time, wait between reports
+    if key == "locks" and chat is not None and chat.type != "private":
+        rows.append([group.probation_button(chat)])  # 🆕 new members: no links or media for a while
+    if key == "flood" and chat is not None and chat.type != "private":
+        rows.append([group.raid_button(chat)])  # 🛡 Raid Shield: ban / mute new members / lock the group
+    if key == "log" and chat is not None and chat.type != "private":
+        rows.append([group.modlog_button(chat)])  # 📜 the Mod Log page (filters, pages, one member's history)
+    if key == "warn" and chat is not None and chat.type != "private":
+        rows.append([group.warn_ladder_button(chat)])  # 🪜 a different action for each warning count
     if key in USAGE_GUIDES:  # 📖 every help page that has a guide gets the button, right above Back
         rows.append([InlineKeyboardButton("📖 Usage Guide", callback_data=f"help:g_{key}")])
     back = {"roast": "help:games", "court": "help:games", "extras": "help:more"}.get(key, "help:main")
@@ -1848,28 +1881,31 @@ async def action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not (await is_admin(chat, q.from_user.id)
             or is_bot_owner(q.from_user.id) or store.is_super_admin(q.from_user.id)):
-        await q.answer("Admins only.", show_alert=True)
+        await q.answer(L.t("wn.admins_only", chat.id), show_alert=True)
         return
     action, _, uid = q.data.partition(":")
     uid = int(uid)
     if action == "unban":
         await chat.unban_member(uid, only_if_banned=True)
-        await q.answer("Unbanned.")
+        await q.answer(L.t("wn.t_unbanned", chat.id))
+        await group.record_undo(chat.id, uid, str(uid), "unban", q.from_user.mention_html())
         await q.edit_message_reply_markup(None)
-        await q.edit_message_text(q.message.text_html + "\n<i>Unbanned.</i>", parse_mode="HTML")
+        await q.edit_message_text(q.message.text_html + "\n" + L.t("wn.a_unbanned", chat.id), parse_mode="HTML")
     elif action == "unmute":
         perms = (await context.bot.get_chat(chat.id)).permissions or DEFAULT_PERMS
         await chat.restrict_member(uid, perms)
-        await q.answer("Unmuted.")
-        await q.edit_message_text(q.message.text_html + "\n<i>Unmuted.</i>", parse_mode="HTML")
+        await q.answer(L.t("wn.t_unmuted", chat.id))
+        await group.record_undo(chat.id, uid, str(uid), "unmute", q.from_user.mention_html())
+        await q.edit_message_text(q.message.text_html + "\n" + L.t("wn.a_unmuted", chat.id), parse_mode="HTML")
     elif action == "rmwarn":
         rows = active_warns(chat.id, uid)
         if rows:
             store.warn_delete(rows[-1][0])
-            await q.answer("Warning removed.")
-            await q.edit_message_text(q.message.text_html + "\n<i>Warning removed.</i>", parse_mode="HTML")
+            await q.answer(L.t("wn.t_removed", chat.id))
+            await group.record_undo(chat.id, uid, str(uid), "unwarn", q.from_user.mention_html())
+            await q.edit_message_text(q.message.text_html + "\n" + L.t("wn.a_removed", chat.id), parse_mode="HTML")
         else:
-            await q.answer("No warnings left.")
+            await q.answer(L.t("wn.t_none_left", chat.id))
             await q.edit_message_reply_markup(None)
 
 
@@ -2076,9 +2112,9 @@ async def ban(update, context):
     uid, name, reason = await target_and_rest(update, context)
     if uid and await can_target(update, uid):
         await update.effective_chat.ban_member(uid)
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Unban", callback_data=f"unban:{uid}")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(L.t("wn.btn_unban", update.effective_chat.id), callback_data=f"unban:{uid}")]])
         by, why, punish = update.effective_user.mention_html(), reason[:200] or "Banned by an admin (no reason given)", extra.punishment_text("ban")
-        sent = await update.effective_message.reply_html(extra.action_notice(name, "Banned", why, punish, by), reply_markup=kb)
+        sent = await update.effective_message.reply_html(extra.action_notice(name, "Banned", why, punish, by, chat_id=update.effective_chat.id), reply_markup=kb)
         await extra.track_notice(sent)
         await extra.record_action(update.effective_chat.id, uid, name, "Banned", why, punish, by, "ban")
         await log_action(update.effective_chat, "ban", f"🚫 {by} banned {name}.")
@@ -2091,6 +2127,7 @@ async def unban(update, context):
     if uid:
         await update.effective_chat.unban_member(uid, only_if_banned=True)
         await update.effective_message.reply_html(f"Unbanned {name}.")
+        await group.record_undo(update.effective_chat.id, uid, name, "unban", update.effective_user.mention_html())
         await log_action(update.effective_chat, "ban", f"✅ {update.effective_user.mention_html()} unbanned {name}.")
 
 
@@ -2102,7 +2139,7 @@ async def kick(update, context):
         await update.effective_chat.ban_member(uid)
         await update.effective_chat.unban_member(uid)
         by, why, punish = update.effective_user.mention_html(), reason[:200] or "Kicked by an admin (no reason given)", extra.punishment_text("kick")
-        sent = await update.effective_message.reply_html(extra.action_notice(name, "Kicked", why, punish, by))
+        sent = await update.effective_message.reply_html(extra.action_notice(name, "Kicked", why, punish, by, chat_id=update.effective_chat.id))
         await extra.track_notice(sent)
         await extra.record_action(update.effective_chat.id, uid, name, "Kicked", why, punish, by, "ban")
         await log_action(update.effective_chat, "ban", f"👢 {by} kicked {name}.")
@@ -2314,9 +2351,9 @@ async def _mute_cmd(update, context, timed_required=False, delete_replied=False)
         return
     why = reason[:200] or "Muted by an admin (no reason given)"
     by, punish = update.effective_user.mention_html(), extra.punishment_text("mute", secs)
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Unmute", callback_data=f"unmute:{uid}")]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(L.t("wn.btn_unmute", chat.id), callback_data=f"unmute:{uid}")]])
     kb = group.appeal_markup(chat.id, uid, "mute", kb)  # adds 📩 Appeal when Appeal is ON
-    sent = await msg.reply_html(extra.action_notice(name, "Muted", why, punish, by), reply_markup=kb)
+    sent = await msg.reply_html(extra.action_notice(name, "Muted", why, punish, by, chat_id=chat.id), reply_markup=kb)
     await extra.track_notice(sent)
     await extra.record_action(chat.id, uid, name, "Muted", why, punish, by, "mute")
     await log_action(chat, "mute", f"🔇 {by} {done} {name}.\nReason: {html.escape(why)}")
@@ -2353,6 +2390,7 @@ async def unmute(update, context):
         await msg.reply_text("I couldn't unmute that user. Check my admin permissions.")
         return
     await msg.reply_html(f"Unmuted {name}.")
+    await group.record_undo(chat.id, uid, name, "unmute", update.effective_user.mention_html())
     await log_action(chat, "mute", f"🔊 {update.effective_user.mention_html()} unmuted {name}.")
 
 
@@ -2368,7 +2406,7 @@ async def _warn_cmd(update, context, delete_replied=False):
     text = await add_warn(chat, uid, name, reason[:200], update.effective_user.mention_html())
     kb = None
     if warn_summary(chat.id, uid).split("/")[0] != "0":
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Remove warning", callback_data=f"rmwarn:{uid}")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(L.t("wn.btn_rmwarn", chat.id), callback_data=f"rmwarn:{uid}")]])
         kb = group.appeal_markup(chat.id, uid, "warn", kb)  # adds 📩 Appeal when Appeal is ON
     await extra.track_notice(await msg.reply_html(text, reply_markup=kb))
     await log_action(chat, "warn", f"⚠️ {update.effective_user.mention_html()} warned {name}. {text}")
@@ -2388,7 +2426,7 @@ async def warns_cmd(update, context):
     """/warns  - your own warnings; admins can reply to or name someone else."""
     msg, chat, me = update.effective_message, update.effective_chat, update.effective_user
     if chat.type == "private":
-        await msg.reply_text("This command only works in groups.")
+        await msg.reply_text(L.t("wn.group_only", chat.id))
         return
     if msg.reply_to_message or (context.args and (context.args[0].isdigit() or context.args[0].startswith("@"))):
         if not await admin_only(update):
@@ -2401,12 +2439,12 @@ async def warns_cmd(update, context):
     rows = active_warns(chat.id, uid)
     limit = int(get_setting(chat.id, "warn_limit", 3))
     if not rows:
-        await msg.reply_html(f"{name} has no warnings.")
+        await msg.reply_html(L.t("wn.none", chat.id, name=name))
         return
-    lines = [f"{name} has {len(rows)}/{limit} warnings:"]
+    lines = [L.t("wn.head", chat.id, name=name, n=len(rows), limit=limit)]
     for i, (_, reason, ts) in enumerate(rows, 1):
         date = time.strftime("%Y-%m-%d", time.gmtime(ts))
-        lines.append(f"{i}. {html.escape(reason) if reason else 'no reason given'} ({date})")
+        lines.append(L.t("wn.line", chat.id, i=i, reason=html.escape(reason) if reason else L.t("wn.reason_none", chat.id), date=date))
     await msg.reply_html("\n".join(lines))
 
 
@@ -2420,35 +2458,18 @@ async def rmwarn(update, context):
         return
     rows = active_warns(chat.id, uid)
     if not rows:
-        await msg.reply_html(f"{name} has no warnings.")
+        await msg.reply_html(L.t("wn.none", chat.id, name=name))
         return
     store.warn_delete(rows[-1][0])
     limit = int(get_setting(chat.id, "warn_limit", 3))
-    await msg.reply_html(f"Removed the latest warning from {name} ({len(rows) - 1}/{limit}).")
+    await msg.reply_html(L.t("wn.removed", chat.id, name=name, n=len(rows) - 1, limit=limit))
+    await group.record_undo(chat.id, uid, name, "unwarn", update.effective_user.mention_html())
     await log_action(chat, "warn", f"🗑 {update.effective_user.mention_html()} removed a warning from {name}.")
 
 
 async def modlog_cmd(update, context):
-    """/modlog - the last actions taken in THIS group (admins only). History is kept for 15 days."""
-    if not await group_only(update) or not await admin_only(update):
-        return
-    chat, msg = update.effective_chat, update.effective_message
-    try:
-        rows = await asyncio.to_thread(store.modlog_recent, chat.id, 15)
-    except store.DBError:
-        logging.exception("modlog read failed in chat %s", chat.id)
-        await msg.reply_text("I couldn't read the action history right now. Please try again.")
-        return
-    if not rows:
-        await msg.reply_text("No actions recorded in the last 15 days.")
-        return
-    ist = timezone(timedelta(hours=5, minutes=30))
-    lines = [f"Last {len(rows)} actions in this group (kept for {store.HISTORY_KEEP_DAYS} days, times in IST):", ""]
-    for r in rows:
-        when = datetime.fromtimestamp(r["ts"], ist).strftime("%d %b %I:%M %p")
-        lines.append(f"{when}: {r['text']}")
-    out = "\n".join(lines)
-    await msg.reply_text(out[:4000])
+    """/modlog [@user] - the action history of THIS group, with filters and pages (admins only; all in group.py)."""
+    await group.modlog_command(update, context)
 
 
 async def resetwarns(update, context):
@@ -2457,7 +2478,8 @@ async def resetwarns(update, context):
     uid, name, _ = await target_and_rest(update, context)
     if uid:
         store.warn_clear(update.effective_chat.id, uid)
-        await update.effective_message.reply_html(f"Warnings reset for {name}.")
+        await update.effective_message.reply_html(L.t("wn.reset", update.effective_chat.id, name=name))
+        await group.record_undo(update.effective_chat.id, uid, name, "reset", update.effective_user.mention_html())
         await log_action(update.effective_chat, "warn", f"🗑 {update.effective_user.mention_html()} reset warnings for {name}.")
 
 
@@ -2469,10 +2491,10 @@ async def warnlimit(update, context):
     arg = context.args[0] if context.args else ""
     if arg.isdigit() and 1 <= int(arg) <= 100:
         set_setting(chat_id, "warn_limit", int(arg))
-        await msg.reply_text(f"Warn limit set to {arg}.")
+        await msg.reply_text(L.t("wn.limit_set", chat_id, n=arg))
     else:
         current = get_setting(chat_id, "warn_limit", 3)
-        await msg.reply_text(f"Warn limit is {current}.\nUsage: /warnlimit <1-100>")
+        await msg.reply_text(L.t("wn.limit_now", chat_id, n=current))
 
 
 async def warnmode(update, context):
@@ -2490,16 +2512,16 @@ async def warntime(update, context):
     arg = context.args[0].lower() if context.args else ""
     if arg in ("off", "0", "no"):
         set_setting(chat_id, "warn_time", 0)
-        await msg.reply_text("Warnings no longer expire.")
+        await msg.reply_text(L.t("wn.time_off", chat_id))
         return
     secs = parse_duration(arg)
     if secs:
         set_setting(chat_id, "warn_time", secs)
-        await msg.reply_text(f"Warnings now expire after {fmt_duration(secs)}.")
+        await msg.reply_text(L.t("wn.time_set", chat_id, dur=fmt_duration(secs)))
         return
     expiry = int(get_setting(chat_id, "warn_time", 0))
-    current = f"expire after {fmt_duration(expiry)}" if expiry else "never expire"
-    await msg.reply_text(f"Warnings {current}.\nUsage: /warntime <30m|2h|7d|1w> or /warntime off")
+    current = L.t("wn.time_exp", chat_id, dur=fmt_duration(expiry)) if expiry else L.t("wn.time_never", chat_id)
+    await msg.reply_text(L.t("wn.time_now", chat_id, current=current))
 
 
 # --------------------------------------------------------- welcome & rules
@@ -3092,7 +3114,7 @@ async def captcha_fail(bot, chat_id, user_id, msg_id, mention, why):
         kind, secs = extra.mode_kind(mode)
         label, punish = extra.ACTION_LABEL.get(kind, kind.title()), extra.punishment_text(kind, secs)
         reason = f"Failed the CAPTCHA: {why}"
-        text = extra.action_notice(mention, label, reason, punish)
+        text = extra.action_notice(mention, label, reason, punish, chat_id=chat_id)
         await announce(chat, text, user_id)
         await extra.record_action(chat_id, user_id, mention, label, reason, punish, None, "captcha")
         await log_action(chat, "captcha", f"🤖 {text}")
@@ -4111,7 +4133,7 @@ def limits_lines(chat_id):
     warn_mode = describe_mode(get_setting(chat_id, "warn_mode", "ban"))
     expires = f", warnings expire after {fmt_duration(expiry)}" if expiry else ""
     return [
-        f"Warnings: {limit} warns, then {warn_mode}{expires}",
+        group.wl_summary(chat_id) or f"Warnings: {limit} warns, then {warn_mode}{expires}",
         f"Antiflood: {flood_text(chat_id)}",
         f"Antispam: {spam_text(chat_id)}",
         "Blocklist action: " + describe_mode(get_setting(chat_id, "blocklist_mode", "delete")),
@@ -6184,10 +6206,9 @@ async def stats_callback(update, context):
 #   raid_action_time  how long each raider is banned for, seconds (default 1h)
 #   auto_raid         joins per minute that switch antiraid on by itself (0 = off)
 #   auto_approve      "True" = approve join requests automatically (never during a raid)
-RAID_TIME_DEFAULT = 6 * 3600
-RAID_ACTION_DEFAULT = 3600
-RAID_MAX_SECS = 30 * 86400
-_raid_joins = {}  # chat_id -> list of recent join times (for /autoantiraid)
+RAID_TIME_DEFAULT = group.RAID_TIME_BAN_DEFAULT  # 6h (ban mode); the Raid Shield (group.py 2f) has its own mode defaults
+RAID_ACTION_DEFAULT = group.RAID_ACTION_DEFAULT
+RAID_MAX_SECS = group.RAID_MAX_SECS
 
 
 def raid_left(chat_id) -> int:
@@ -6214,13 +6235,19 @@ async def antiraid_cmd(update, context):
     left = raid_left(chat.id)
     if arg in ("off", "no", "0", "false", "disable") or (not arg and left):
         set_setting(chat.id, "raid_until", 0)
+        await group.raid_stopped(context.bot, chat)  # Raid Shield: lifts a group lock, frees muted joiners
         await msg.reply_text("✅ Antiraid is now OFF. New members can join again.")
         return
-    secs = parse_duration(arg) if arg else _raid_secs(chat.id, "raid_time", RAID_TIME_DEFAULT)
+    secs = parse_duration(arg) if arg else group.raid_secs(chat.id)
     if not secs or secs > RAID_MAX_SECS:
         await msg.reply_text("Usage: /antiraid <time like 30m, 3h, 1d | off>\nExample: /antiraid 3h")
         return
     set_setting(chat.id, "raid_until", int(time.time()) + secs)
+    await group.raid_started(context.bot, chat)  # Raid Shield, lock mode: closes the group now
+    mode = group.raid_mode(chat.id)
+    if mode != "ban":
+        await msg.reply_text(L.t("rd.on_" + mode, chat.id, dur=fmt_duration(secs)))
+        return
     act = _raid_secs(chat.id, "raid_action_time", RAID_ACTION_DEFAULT)
     await msg.reply_text(
         f"🛡 Antiraid is ON for {fmt_duration(secs)}. Everyone who joins is banned for {fmt_duration(act)}.\n"
@@ -6244,7 +6271,8 @@ async def _raid_time_cmd(update, context, key, default, label, usage_name):
 
 
 async def raidtime_cmd(update, context):
-    await _raid_time_cmd(update, context, "raid_time", RAID_TIME_DEFAULT, "Antiraid duration", "raidtime")
+    await _raid_time_cmd(update, context, "raid_time", group.raid_default_secs(update.effective_chat.id),
+                         "Antiraid duration", "raidtime")
 
 
 async def raidactiontime_cmd(update, context):
@@ -6407,47 +6435,9 @@ async def joinoff_cmd(update, context):
 
 
 async def raid_new_members(update, context):
-    """group=-9, before the captcha/welcome handler: counts joins, switches antiraid on by itself, and bans
-    new members while antiraid is active. Never touches bots or admins."""
-    chat, msg = update.effective_chat, update.effective_message
-    people = [u for u in (msg.new_chat_members or []) if not u.is_bot]
-    if not people:
-        return
-    now = time.time()
-    limit = _raid_secs(chat.id, "auto_raid", 0)
-    if limit:
-        recent = [t for t in _raid_joins.get(chat.id, []) if now - t < 60] + [now] * len(people)
-        _raid_joins[chat.id] = recent
-        if len(recent) > limit and not raid_left(chat.id):
-            secs = _raid_secs(chat.id, "raid_time", RAID_TIME_DEFAULT)
-            set_setting(chat.id, "raid_until", int(now) + secs)
-            try:
-                await chat.send_message(
-                    f"🚨 Raid detected: more than {limit} users joined within a minute. "
-                    f"Antiraid is ON for {fmt_duration(secs)}. Turn it off with /antiraid off.")
-            except TelegramError:
-                pass
-    if not raid_left(chat.id):
-        return
-    act = _raid_secs(chat.id, "raid_action_time", RAID_ACTION_DEFAULT)
-    banned = 0
-    for user in people:
-        if is_bot_owner(user.id) or await is_admin(chat, user.id):
-            continue
-        if msg.from_user and msg.from_user.id != user.id and await is_admin(chat, msg.from_user.id):
-            continue  # an admin added them on purpose
-        try:
-            await chat.ban_member(user.id, until_date=int(now) + max(act, 60))
-            banned += 1
-        except TelegramError as e:
-            logging.warning("antiraid: couldn't ban %s in %s: %s", user.id, chat.id, e)
-    if banned:
-        try:
-            await msg.delete()
-        except TelegramError:
-            pass
-        if banned == len(people):
-            raise ApplicationHandlerStop  # nobody left to welcome or verify
+    """group=-9, before the captcha/welcome handler: the Raid Shield (counts joins, starts antiraid by itself, bans or
+    mutes the joiners, or locks the group). All of it lives in group.py section 2f."""
+    await group.raid_new_members(update, context)
 
 
 async def on_join_request(update, context):
@@ -6609,7 +6599,8 @@ def main():
         group_only=group_only, get_setting=get_setting, set_setting=set_setting, is_paused=is_paused,
         default_perms=DEFAULT_PERMS, fun_names=fun_systems._fun_names, is_admin=is_admin,
         is_bot_owner=is_bot_owner, owner_ids=OWNER_IDS, is_super_admin=is_super_admin,
-        groups_source=_stats_refresh, active_warns=active_warns))  # /autoclose, /night, /appeal, /cleanservice, /cleancommand, /export /import /reset, /lang
+        groups_source=_stats_refresh, active_warns=active_warns, get_target=get_target, raid_left=raid_left, add_warn=add_warn, do_action=do_action,
+        find_violation=find_violation, load_allow=load_allow, lock_exempt=lock_exempt, is_service_message=is_service_message))  # /autoclose, /night, /appeal, /cleanservice, /cleancommand, /export /import /reset, /lang
     msgcount.register(app, owner_ids=OWNER_IDS, groups_source=_stats_refresh)  # /rank /top /today /week /overall /me /radmin /resetrank + counter + 📊 menu
     app.add_handler(CallbackQueryHandler(wipe_callback, pattern=r"^wipe:"))  # /clearall and /stopall confirmation
     app.add_handler(CallbackQueryHandler(captcha_callback, pattern=r"^cap:"))
