@@ -113,7 +113,7 @@ UNIQUE_INDEXES = {
     "settings": ["chat_id", "key"], "notes": ["chat_id", "name"], "filters": ["chat_id", "keyword"],
     "blocklist": ["chat_id", "word"], "approved": ["chat_id", "user_id"],
     "allowlist": ["chat_id", "kind", "value"], "captcha_pending": ["chat_id", "user_id"],
-    "setlog_pending": ["channel_id"], "super_admins": ["user_id"], "warn_log": ["id"],
+    "rules_gate": ["chat_id", "user_id"], "setlog_pending": ["channel_id"], "super_admins": ["user_id"], "warn_log": ["id"],
     "roast_profiles": ["chat_id", "user_id"], "roast_battles": ["id"], "roast_results": ["id"],
     "roast_votes": ["battle_id", "voter_id"], "court_cases": ["id"],
     "court_votes": ["case_id", "voter_id"], "court_verdicts": ["id"],
@@ -125,7 +125,7 @@ UNIQUE_INDEXES = {
 EXTRA_UNIQUE_INDEXES = {"fun_commands": [["name"]], "fun_gifs": [["command_id", "file_unique_id"]],
                         "fun_aliases": [["name"]]}
 PLAIN_INDEXES = {
-    "warn_log": [["chat_id", "user_id"]], "captcha_pending": [["expires"]],
+    "warn_log": [["chat_id", "user_id"]], "captcha_pending": [["expires"]], "rules_gate": [["expires"]],
     "roast_battles": [["chat_id"]], "roast_profiles": [["chat_id", "points"]],
     "court_cases": [["chat_id", "case_no"], ["chat_id", "defendant_id"]], "court_verdicts": [["case_id"]],
     "modlog": [["chat_id", "id"]], "notice_pending": [["delete_at"]],
@@ -499,6 +499,52 @@ def captcha_take_expired(now):
     out = []
     for r in list(col("captcha_pending").find({"expires": {"$lte": int(now)}})):
         if col("captcha_pending").delete_one({"chat_id": r["chat_id"], "user_id": r["user_id"]}).deleted_count:
+            out.append((r["chat_id"], r["user_id"], r["msg_id"], r.get("mention")))
+    return out
+
+
+# ------------------------------------------------------------------ rules gate (group.py 2j): members waiting to accept the rules
+def gate_put(chat_id, user_id, msg_id, expires, mention):
+    chat_id, user_id = int(chat_id), int(user_id)
+    col("rules_gate").replace_one({"chat_id": chat_id, "user_id": user_id},
+                                  {"chat_id": chat_id, "user_id": user_id, "msg_id": msg_id, "expires": int(expires), "mention": mention},
+                                  upsert=True)
+
+
+def gate_get(chat_id, user_id):
+    """(msg_id, mention) or None."""
+    r = col("rules_gate").find_one({"chat_id": int(chat_id), "user_id": int(user_id)})
+    return (r["msg_id"], r.get("mention")) if r else None
+
+
+def gate_delete(chat_id, user_id):
+    """True when the member was waiting (the record is removed)."""
+    return col("rules_gate").delete_one({"chat_id": int(chat_id), "user_id": int(user_id)}).deleted_count > 0
+
+
+def gate_pop(chat_id, user_id):
+    """msg_id of the member's waiting message (or None); the record is removed."""
+    r = col("rules_gate").find_one_and_delete({"chat_id": int(chat_id), "user_id": int(user_id)})
+    return r["msg_id"] if r else None
+
+
+def gate_pop_chat(chat_id):
+    """[(user_id, msg_id)] for everyone still waiting in this chat; all records removed."""
+    chat_id = int(chat_id)
+    rows = [(r["user_id"], r["msg_id"]) for r in col("rules_gate").find({"chat_id": chat_id})]
+    col("rules_gate").delete_many({"chat_id": chat_id})
+    return rows
+
+
+def gate_count(chat_id):
+    return col("rules_gate").count_documents({"chat_id": int(chat_id)})
+
+
+def gate_take_expired(now):
+    """[(chat_id, user_id, msg_id, mention)] whose time ran out; removed. Each one is claimed atomically."""
+    out = []
+    for r in list(col("rules_gate").find({"expires": {"$lte": int(now)}})):
+        if col("rules_gate").delete_one({"chat_id": r["chat_id"], "user_id": r["user_id"]}).deleted_count:
             out.append((r["chat_id"], r["user_id"], r["msg_id"], r.get("mention")))
     return out
 
@@ -907,7 +953,7 @@ def probation_total(chat_id):
 # ------------------------------------------------------------------ group -> supergroup migration
 CHAT_COLLECTIONS = ("settings", "warn_log", "notes", "filters", "blocklist", "approved", "allowlist",
                     "captcha_pending", "roast_profiles", "roast_battles", "roast_results", "roast_votes",
-                    "court_cases", "court_votes", "court_verdicts", "modlog", "probation")
+                    "court_cases", "court_votes", "court_verdicts", "modlog", "probation", "rules_gate")
 
 
 def migrate_chat(old_id, new_id):

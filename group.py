@@ -5,6 +5,7 @@ group.py: all group-management logic in ONE file (merged from autoclose.py, clea
                       (+ the 🕒 Auto Close and ⌨️ Command buttons on /help > Auto Close: hour, minute, AM/PM pickers)
   NIGHT MODE          /night 11pm 6am   /night off   /night   (text-only at night; /help > Night Mode page)
   APPEAL              /appeal [on|off|group|log|dm]   (📩 Appeal button on mute / warn notices; OFF by default)
+  RULES GATE          /gate [on|off|<time>|kick|mute|ban]   (new members must accept the rules before they can chat)
   GREETINGS           /greet, /wdel <time|off>, /gdel, /wbtn <text> <link>, /gbtn   (extra buttons and delete-after for welcome / goodbye)
   REPORTS             /reportpanel, /reportmute <time>, /reportcooldown <time|off>   (the /report card: Mute / Warn / Delete message / Dismiss)
   PROBATION           /probation [on|off|hours <time>|msgs <n>|start|end|status]   (new members: no links / media for a while)
@@ -50,7 +51,9 @@ deps needs:
     groups_source(bot)       async, [(chat_id, title, link)] of every group the bot is in
     active_warns(chat_id, user_id)   a member's unexpired warnings as (id, reason, time), for Appeal
 nova.py also calls group.appeal_markup(chat_id, user_id, "mute"|"warn", kb) where it builds the Unmute / Remove warning button.
-nova.py also calls group.greet_markup / greet_after_send in send_welcome and on_left_member, passes render, template_markup, safe_html,
+nova.py also calls group.gate_start (on_new_members, captcha_callback) and group.gate_cleanup (on_left_member), passes
+    restore_permissions, send_welcome, rules_button and announce, and adds group.gate_button(chat) on /help > Rules.
+    nova.py also calls group.greet_markup / greet_after_send in send_welcome and on_left_member, passes render, template_markup, safe_html,
     DEFAULT_WELCOME and DEFAULT_GOODBYE, and adds group.greet_button(chat) on /help > Greetings.
     nova.py also calls group.report_submit(bot, chat, msg, reporter) from file_report, passes add_warn and do_action, and adds group.report_button(chat) on /help > Reports.
     nova.py also passes find_violation, load_allow, lock_exempt and is_service_message (its lock engine) for the probation guard, and
@@ -335,6 +338,7 @@ async def run_once(bot):
     await _auto_close_round(bot, now)
     await _night_round(bot, now)                       # Night Mode (section 2b) uses the same loop
     await _raid_round(bot)                             # Raid Shield (section 2f): lifts the lock when the raid is over
+    await _gate_round(bot)                             # Rules gate (section 2j): members who didn't accept in time
 
 
 async def _auto_close_round(bot, now):
@@ -3362,6 +3366,258 @@ async def gbtn_cmd(update, context):
 
 
 # ======================================================================================================
+# 2j. RULES GATE
+# ======================================================================================================
+# New members must read the rules and tap ✅ I accept before they can chat. Until then they are muted and a short message
+# with [📜 Read the rules] (nova's rules button) and [✅ I accept] waits for them. It uses the group's saved rules (/setrules).
+#   * settings: rules_gate "on"|"off" (default off), gate_time (seconds to accept, default 5 minutes),
+#     gate_action ("kick" default | "mute" = stay muted | "ban") when the time runs out.
+#   * nova.py: on_new_members calls gate_start (not for admins, the bot owner or members an admin added); with the CAPTCHA on,
+#     captcha_callback calls gate_start after the member verified (so: verify first, then accept the rules);
+#     on_left_member calls gate_cleanup.
+#   * waiting members live in the "rules_gate" collection (store.gate_*): a restart loses nothing. The 30-second loop
+#     (run_once -> _gate_round) applies the action to members whose time ran out.
+#   * accepting: the member's own tap (callback "rg:a:<user id>") gives back the group's permissions, removes the message and
+#     sends the normal welcome. Turning the gate OFF lets everyone waiting in.
+#   * panel: /help > Rules > 📜 Rules Gate, or /gate  |  /gate on|off  |  /gate 10m  |  /gate kick|mute|ban  (callbacks "rg:...").
+RG_KEY, RG_TIME_KEY, RG_ACTION_KEY = "rules_gate", "gate_time", "gate_action"
+RG_ACTIONS = ("kick", "mute", "ban")
+RG_TIMES = (120, 300, 600, 1800, 3600)
+RG_TIME_DEFAULT, RG_TIME_MIN, RG_TIME_MAX = 300, 60, 86400
+
+
+def gate_on(chat_id):
+    return D.get_setting(chat_id, RG_KEY, "off") == "on"
+
+
+def gate_secs(chat_id):
+    secs = _num_setting(chat_id, RG_TIME_KEY, RG_TIME_DEFAULT)
+    return secs if RG_TIME_MIN <= secs <= RG_TIME_MAX else RG_TIME_DEFAULT
+
+
+def gate_action(chat_id):
+    action = D.get_setting(chat_id, RG_ACTION_KEY, "kick")
+    return action if action in RG_ACTIONS else "kick"
+
+
+def gate_needed(chat_id):
+    """The gate is ON and the group has rules to accept."""
+    return gate_on(chat_id) and bool(D.get_setting(chat_id, "rules"))
+
+
+_rg_origin = {}         # (chat_id, panel message id) -> True when the panel was opened from /help page 2 (Back goes there)
+
+
+def gate_button(chat, from_more=False):
+    """The 📜 button nova.py adds to /help > Rules and to /help page 2 "More Features" (groups only; `from_more` makes the
+    panel's Back button return to page 2)."""
+    return InlineKeyboardButton(L.t("rg.btn_help", getattr(chat, "id", None)), callback_data="rg:q" if from_more else "rg:p")
+
+
+async def gate_start(context, chat, user, after_captcha=False):
+    """Mutes the member and posts the "read the rules, tap I accept" message. Returns True when the gate is up (the caller then
+    does not send the welcome yet); False when there is no gate for this member (or Telegram refused)."""
+    if not gate_needed(chat.id):
+        return False
+    secs = gate_secs(chat.id)
+    pending = await asyncio.to_thread(store.gate_get, chat.id, user.id)
+    if pending:                                       # they rejoined while waiting: one message only
+        try:
+            await context.bot.delete_message(chat.id, pending[0])
+        except TelegramError:
+            pass
+    elif not after_captcha:
+        try:
+            member = await chat.get_member(user.id)
+            if member.status == "restricted" and not getattr(member, "can_send_messages", True):
+                return False                          # already muted by an admin: don't override that
+        except TelegramError:
+            pass
+    try:
+        await chat.restrict_member(user.id, CLOSED_PERMS)
+    except TelegramError as e:
+        log.warning("rules gate: can't restrict in chat %s: %s", chat.id, e)
+        return False
+    kb = InlineKeyboardMarkup([[await D.rules_button(context, chat.id)],
+                               [InlineKeyboardButton(L.t("rg.btn_accept", chat.id), callback_data=f"rg:a:{user.id}")]])
+    try:
+        sent = await chat.send_message(L.t("rg.ask", chat.id, user=user.mention_html(), dur=extra.fmt_duration(secs)), parse_mode="HTML", reply_markup=kb)
+    except TelegramError as e:
+        log.warning("rules gate: couldn't post the message in chat %s: %s", chat.id, e)
+        await D.restore_permissions(_Args((), context.bot), chat, user.id)
+        return False
+    await asyncio.to_thread(store.gate_put, chat.id, user.id, sent.message_id, time.time() + secs, user.mention_html())
+    return True
+
+
+async def gate_cleanup(bot, chat_id, user_id):
+    """A member left while waiting: drop the message and the record."""
+    msg_id = await asyncio.to_thread(store.gate_pop, chat_id, user_id)
+    if msg_id:
+        try:
+            await bot.delete_message(chat_id, msg_id)
+        except TelegramError:
+            pass
+
+
+async def gate_release_all(bot, chat):
+    """The gate was turned OFF: everyone still waiting is let in."""
+    for user_id, msg_id in await asyncio.to_thread(store.gate_pop_chat, chat.id):
+        try:
+            await bot.delete_message(chat.id, msg_id)
+        except TelegramError:
+            pass
+        await D.restore_permissions(_Args((), bot), chat, user_id)
+
+
+async def _gate_round(bot):
+    """Part of run_once (every 30 seconds): applies the chosen action to members who didn't accept in time."""
+    for chat_id, user_id, msg_id, mention in await asyncio.to_thread(store.gate_take_expired, int(time.time())):
+        try:
+            await bot.delete_message(chat_id, msg_id)
+        except TelegramError:
+            pass
+        try:
+            chat = await bot.get_chat(chat_id)
+            mode = gate_action(chat_id)
+            if not await D.do_action(chat, user_id, mode):
+                continue
+            kind, secs = extra.mode_kind(mode)
+            label, punish, reason = extra.ACTION_LABEL.get(kind, kind.title()), extra.punishment_text(kind, secs), "Didn't accept the rules in time"
+            await D.announce(chat, extra.action_notice(mention, label, reason, punish, chat_id=chat_id), user_id)
+            await extra.record_action(chat_id, user_id, mention, label, reason, punish, None, "mod", kind=kind)
+        except Exception:
+            log.exception("rules gate: applying the action failed in %s", chat_id)
+
+
+async def _rg_accept(update, context, user_id):
+    q, chat = update.callback_query, update.callback_query.message.chat
+    if q.from_user.id != user_id:
+        await q.answer(L.t("rg.not_you", chat.id), show_alert=True)
+        return
+    if not await asyncio.to_thread(store.gate_delete, chat.id, user_id):
+        await q.answer(L.t("rg.expired", chat.id))
+        return
+    if not await D.restore_permissions(context, chat, user_id):
+        await asyncio.to_thread(store.gate_put, chat.id, user_id, q.message.message_id, time.time() + gate_secs(chat.id), q.from_user.mention_html())
+        await q.answer(L.t("rg.unmute_failed", chat.id), show_alert=True)       # still waiting: they can tap again
+        return
+    await q.answer(L.t("rg.accepted", chat.id))
+    try:
+        await q.message.delete()
+    except TelegramError:
+        pass
+    await D.send_welcome(context, chat, q.from_user)
+
+
+# ------------------------------------------------------------------ the panel
+async def _rg_panel(chat, note="", back="help:rules"):
+    cid = getattr(chat, "id", None)
+    if chat is None or chat.type == "private":
+        return L.t("rg.private", cid), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]])
+    on, secs, action = gate_on(cid), gate_secs(cid), gate_action(cid)
+    try:
+        waiting = await asyncio.to_thread(store.gate_count, cid)
+    except Exception:
+        waiting = 0
+    text = (L.t("rg.title", cid) + "\n\n" + (note + "\n\n" if note else "") + L.t("rg.intro", cid) + "\n\n" +
+            L.t("rg.status_on" if on else "rg.status_off", cid) + "\n" +
+            ((L.t("rg.no_rules", cid) + "\n") if on and not D.get_setting(cid, "rules") else "") +
+            L.t("rg.time_line", cid, dur=extra.fmt_duration(secs)) + "\n" + L.t("rg.action_line", cid, action=L.t("rg.a_" + action, cid)) + "\n" +
+            L.t("rg.waiting", cid, n=waiting) + "\n\n" + L.t("rg.note", cid))
+    mark = lambda cond: "✅ " if cond else ""
+    rows = [[InlineKeyboardButton(L.t("rg.btn_off" if on else "rg.btn_on", cid), callback_data="rg:t")]]
+    rows += _pairs([InlineKeyboardButton(mark(s == secs) + "⏱ " + extra.fmt_duration(s), callback_data=f"rg:m:{s}") for s in RG_TIMES])
+    rows += _pairs([InlineKeyboardButton(mark(a == action) + L.t("rg.act_" + a, cid), callback_data=f"rg:x:{a}") for a in RG_ACTIONS])
+    rows.append([InlineKeyboardButton(L.t("pick.back", cid), callback_data=back)])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def _rg_set_on(bot, chat, on):
+    D.set_setting(chat.id, RG_KEY, "on" if on else "off")
+    if not on:
+        await gate_release_all(bot, chat)
+
+
+async def rg_callback(update, context):
+    """\"rg:a:<user id>\" the member's own ✅ I accept (anyone else is told it isn't theirs); for admins in a group: \"rg:p\" panel
+    (\"rg:q\": the same, opened from /help page 2),
+    \"rg:t\" on/off, \"rg:m:<seconds>\" time, \"rg:x:<kick|mute|ban>\" action."""
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    if chat is None:
+        await q.answer()
+        return
+    parts = (q.data or "").split(":")[1:]
+    if len(parts) == 2 and parts[0] == "a":
+        uid = _ac_num(parts[1], 1, 10 ** 15)
+        if uid is None:
+            await q.answer(L.t("rg.invalid", chat.id), show_alert=True)
+            return
+        await _rg_accept(update, context, uid)
+        return
+    if await extra.menu_not_owner(q):
+        return
+    if chat.type == "private":
+        await q.answer(L.t("rg.private"), show_alert=True)
+        return
+    cid = chat.id
+    if not await _ac_allowed(chat, q.from_user.id):
+        await q.answer(L.t("rg.admin_only", cid), show_alert=True)
+        return
+    act, arg = (parts[0] if parts else ""), (parts[1] if len(parts) == 2 else None)
+    num = _ac_num(arg, 0, 10 ** 7) if arg is not None else None
+    toast = None
+    if act in ("p", "q") and len(parts) == 1:               # "q" = opened from /help page 2: Back returns there
+        _rg_origin[(cid, q.message.message_id)] = act == "q"
+    back = "help:more" if _rg_origin.get((cid, q.message.message_id)) else "help:rules"
+    try:
+        if act in ("p", "q") and len(parts) == 1:
+            pass
+        elif act == "t" and len(parts) == 1:
+            on = not gate_on(cid)
+            await _rg_set_on(context.bot, chat, on)
+            toast = L.t("rg.t_on" if on else "rg.t_off", cid)
+        elif act == "m" and num in RG_TIMES:
+            D.set_setting(cid, RG_TIME_KEY, num)
+            toast = L.t("rg.t_time", cid, dur=extra.fmt_duration(num))
+        elif act == "x" and arg in RG_ACTIONS:
+            D.set_setting(cid, RG_ACTION_KEY, arg)
+            toast = L.t("rg.t_action", cid, action=L.t("rg.a_" + arg, cid))
+        else:
+            await q.answer(L.t("rg.invalid", cid), show_alert=True)
+            return
+        await q.answer(toast)
+        await _ac_edit(q, *await _rg_panel(chat, back=back))
+    except Exception:
+        log.exception("rules gate: panel action failed in %s", cid)
+        await q.answer(L.t("ac.db_problem", cid), show_alert=True)
+
+
+async def gate_cmd(update, context):
+    """/gate  |  on | off  |  10m  |  kick | mute | ban   (any of them together, like /gate on 10m kick)"""
+    if not await D.group_only(update):
+        return
+    chat, msg, notes = update.effective_chat, update.effective_message, []
+    for arg in (a.lower() for a in (context.args or [])):
+        if arg in ("on", "off"):
+            await _rg_set_on(context.bot, chat, arg == "on")
+            notes.append(L.t("rg.t_on" if arg == "on" else "rg.t_off", chat.id))
+        elif arg in RG_ACTIONS:
+            D.set_setting(chat.id, RG_ACTION_KEY, arg)
+            notes.append(L.t("rg.t_action", chat.id, action=L.t("rg.a_" + arg, chat.id)))
+        elif _parse_secs(arg, RG_TIME_MIN, RG_TIME_MAX):
+            secs = _parse_secs(arg, RG_TIME_MIN, RG_TIME_MAX)
+            D.set_setting(chat.id, RG_TIME_KEY, secs)
+            notes.append(L.t("rg.t_time", chat.id, dur=extra.fmt_duration(secs)))
+        else:
+            await msg.reply_html(L.t("rg.usage", chat.id))
+            return
+    text, markup = await _rg_panel(chat, "\n".join(notes))
+    await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+# ======================================================================================================
 # 3. CLEAN SERVICE + CLEAN COMMANDS
 # ======================================================================================================
 # Keeps a group tidy by deleting Telegram service messages and bot commands. Only admins change the settings.
@@ -3976,8 +4232,8 @@ MODULES = {
     "notes": {"keys": ("private_notes",), "notes": True},
     "pins": {"keys": ()},
     "raids": {"keys": ("auto_raid", "raid_time", "raid_action_time", "raid_mode", "raid_window")},
-    "reports": {"keys": ("reports_on",)},
-    "rules": {"keys": ("rules", "rules_private", "rules_button")},
+    "reports": {"keys": ("reports_on", "report_dest", "report_mute", "report_cooldown")},
+    "rules": {"keys": ("rules", "rules_private", "rules_button", "rules_gate", "gate_time", "gate_action")},
     "translations": {"keys": ()},
     "warns": {"keys": ("warn_limit", "warn_time", "warn_mode", "warn_ladder", "warn_ladder_on")},
 }
@@ -4785,6 +5041,8 @@ def register(app, deps):
     app.add_handler(CommandHandler("raidmode", raidmode_cmd))          # Raid Shield: ban / mute joiners / lock the group
     app.add_handler(CommandHandler("raidwindow", raidwindow_cmd))
     app.add_handler(CallbackQueryHandler(rd_callback, pattern=r"^rd:"))
+    app.add_handler(CommandHandler("gate", gate_cmd))                  # Rules gate: accept the rules before chatting
+    app.add_handler(CallbackQueryHandler(rg_callback, pattern=r"^rg:"))
     app.add_handler(CommandHandler("greet", greet_cmd))                # Greetings: extra buttons, delete-after
     app.add_handler(CommandHandler("wdel", wdel_cmd))
     app.add_handler(CommandHandler("gdel", gdel_cmd))

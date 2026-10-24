@@ -2820,6 +2820,7 @@ _NOTICE_TEXT = {
     "Mute lifted": "wn.pun_unmute", "Ban lifted": "wn.pun_unban", "All warnings cleared": "wn.pun_reset",
     "Nothing changed": "wn.pun_nochange",
     # Raid Shield rows (group.py 2f)
+    "Didn't accept the rules in time": "wn.why_rules",
     # Reports (group.py 2h)
     "Muted (report)": "wn.lbl_report_mute", "Message deleted (report)": "wn.lbl_report_del", "Reported by a member": "wn.why_report",
     "Joined during a raid": "wn.why_raid", "Temporary ban": "wn.pun_tban", "Muted until the raid ends": "wn.pun_raid_mute",

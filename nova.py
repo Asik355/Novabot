@@ -1004,6 +1004,7 @@ HELP_SECTIONS = {
             "/privaterules yes|no: Show rules through a button that opens them in private.",
             "/setrulesbutton text: Rename the rules button (also used by {rules} in welcome text).",
             "/resetrulesbutton: Put the button name back to Rules.",
+            "/gate on|off: New members must accept the rules before they can chat (/gate 10m, /gate kick|mute|ban).",
         ]),
     ),
     "notes": (
@@ -1615,7 +1616,11 @@ USAGE_GUIDES = {
         "• Remove: <code>/resetrules</code>\n\n"
         "<b>Rules in private</b>\n"
         "• <code>/privaterules yes</code>: /rules shows a button that opens the rules in the user's private chat\n"
-        "• Rename the button: <code>/setrulesbutton Read the rules</code>"),
+        "• Rename the button: <code>/setrulesbutton Read the rules</code>\n\n"
+        "<b>Rules gate</b>\n"
+        "• Open <b>📜 Rules Gate</b> on this page, or send <code>/gate on</code>\n"
+        "• New members are muted until they tap <b>✅ I accept</b> under the rules. Admins and members an admin added skip it.\n"
+        "• Time to accept: <code>/gate 10m</code>. If they don't: <code>/gate kick</code>, <code>/gate mute</code> or <code>/gate ban</code>"),
     "notes": (
         "<b>Save</b>\n"
         "• Text: <code>/save wifi The password is 12345</code>\n"
@@ -1824,13 +1829,15 @@ def help_main_keyboard(chat=None, user_id=None):
 MORE_FEATURES_TEXT = "<b>➡️ More Features</b>\n\nPick a category to see its commands."
 
 
-def help_more_keyboard():
-    """Page 2 of /help ("More Features"): 🗑 Delete and ✨ Extras, with a Back button to the front page."""
+def help_more_keyboard(chat=None):
+    """Page 2 of /help ("More Features"): 🗑 Delete and ✨ Extras, 🌐 Language and (in groups) 📜 Rules Gate, with a Back button to the front page."""
     fun_row = list(fun_systems.fun_help_row())  # [🎉 Fun, 🗑 Delete, placeholder]: Delete is the second button
     delete_btn = fun_row[1] if len(fun_row) >= 2 else InlineKeyboardButton("🗑 Delete", callback_data="help:delete")
     rows = [[delete_btn, InlineKeyboardButton("✨ Extras", callback_data="help:extras")],
             [InlineKeyboardButton("🌐 Language", callback_data="lang:m")],  # lang/ folder, opened by group.py's handlers
             [InlineKeyboardButton("⬅️ Back", callback_data="help:main")]]
+    if chat is not None and chat.type != "private":  # 📜 Rules Gate next to 🌐 Language (group.py 2j)
+        rows[1].append(group.gate_button(chat, from_more=True))
     return InlineKeyboardMarkup(style_help_buttons(rows))
 
 
@@ -1848,6 +1855,8 @@ def help_section_keyboard(key=None, chat=None):
                      InlineKeyboardButton("📤 Export", callback_data="ie:exp")])
     if key == "approval" and chat is not None and chat.type != "private":
         rows.append([InlineKeyboardButton("⚙️ Auto Approve", callback_data="jn:m")])
+    if key == "rules" and chat is not None and chat.type != "private":
+        rows.append([group.gate_button(chat)])  # 📜 new members must accept the rules before chatting
     if key == "greet" and chat is not None and chat.type != "private":
         rows.append([group.greet_button(chat)])  # 👋 extra buttons, delete-after, preview
     if key == "reports" and chat is not None and chat.type != "private":
@@ -1941,7 +1950,7 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
     if key == "more":  # ➡️ page 2: the whole menu changes to More Features (edited in place)
-        text, markup = MORE_FEATURES_TEXT, help_more_keyboard()
+        text, markup = MORE_FEATURES_TEXT, help_more_keyboard(update.effective_chat)
     elif key == "main" or key not in HELP_SECTIONS:
         text = f"<b>{html.escape(extra.bot_name())}</b>\n\n{HELP_INTRO}"
         markup = help_main_keyboard(update.effective_chat, update.effective_user.id if update.effective_user else None)
@@ -2719,6 +2728,9 @@ async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
         added_by_admin = adder_is_admin and adder.id != user.id
         if verify and not added_by_admin and not is_bot_owner(user.id) and not await is_admin(chat, user.id):
             await start_captcha(context, chat, user)
+        elif (group.gate_needed(chat.id) and not added_by_admin and not is_bot_owner(user.id) and not await is_admin(chat, user.id)
+              and await group.gate_start(context, chat, user)):
+            pass  # the rules gate (group.py 2j): they stay muted until they accept the rules, then the welcome is sent
         else:
             await send_welcome(context, chat, user,
                                reply_to=None if group.is_service_cleaned(chat.id, "join") else msg)
@@ -2730,6 +2742,7 @@ async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or user.is_bot:
         return
     await captcha_cleanup(context, chat.id, user.id)
+    await group.gate_cleanup(context.bot, chat.id, user.id)  # left while waiting to accept the rules
     if get_setting(chat.id, "goodbye_on", "False") != "True":
         return
     template = get_setting(chat.id, "goodbye", DEFAULT_GOODBYE)
@@ -3149,10 +3162,13 @@ async def captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if choice == answer:
         store.captcha_delete(chat.id, uid)
-        await restore_permissions(context, chat, uid)
+        gated = await group.gate_start(context, chat, q.from_user, after_captcha=True)  # rules gate next: they stay muted (group.py 2j)
+        if not gated:
+            await restore_permissions(context, chat, uid)
         await q.answer("Verified, welcome!")
         await try_delete(q.message)
-        await send_welcome(context, chat, q.from_user)
+        if not gated:
+            await send_welcome(context, chat, q.from_user)
         return
 
     attempts += 1
@@ -6614,6 +6630,7 @@ def main():
         is_bot_owner=is_bot_owner, owner_ids=OWNER_IDS, is_super_admin=is_super_admin,
         groups_source=_stats_refresh, active_warns=active_warns, get_target=get_target, raid_left=raid_left, add_warn=add_warn, do_action=do_action,
         render=render, template_markup=template_markup, safe_html=safe_html, DEFAULT_WELCOME=DEFAULT_WELCOME, DEFAULT_GOODBYE=DEFAULT_GOODBYE,
+        restore_permissions=restore_permissions, send_welcome=send_welcome, rules_button=rules_button, announce=announce,
         find_violation=find_violation, load_allow=load_allow, lock_exempt=lock_exempt, is_service_message=is_service_message))  # /autoclose, /night, /appeal, /cleanservice, /cleancommand, /export /import /reset, /lang
     msgcount.register(app, owner_ids=OWNER_IDS, groups_source=_stats_refresh)  # /rank /top /today /week /overall /me /radmin /resetrank + counter + 📊 menu
     app.add_handler(CallbackQueryHandler(wipe_callback, pattern=r"^wipe:"))  # /clearall and /stopall confirmation
