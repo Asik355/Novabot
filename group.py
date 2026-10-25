@@ -921,6 +921,33 @@ async def start_night(bot, chat_id, end_minutes):
     return True
 
 
+_NIGHT_MEDIA_ATTRS = ("photo", "video", "animation", "document", "audio", "voice", "video_note", "sticker", "poll")
+
+
+async def night_enforce(update, context):
+    """While Night Mode is ON: text only. A member's photo, video, file, voice, sticker, poll or link is deleted at once
+    (the permissions alone are not enough: links and some media types still get through). Admins, the bot owner and
+    bot staff are never touched. Runs before the other handlers; after deleting, nothing else handles that message."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if msg is None or user is None or chat is None or chat.type not in ("group", "supergroup"):
+        return
+    has_media = any(getattr(msg, a, None) for a in _NIGHT_MEDIA_ATTRS)
+    ents = list(msg.entities or []) + list(msg.caption_entities or [])
+    has_link = any(e.type in ("url", "text_link") for e in ents)
+    if not (has_media or has_link):
+        return
+    if D.get_setting(chat.id, NIGHT_STATE_KEY, "") != "on" or D.get_setting(chat.id, NIGHT_SAVED_KEY, "") == NIGHT_PASSIVE:
+        return
+    if D.is_bot_owner(user.id) or await D.is_admin(chat, user.id) or await asyncio.to_thread(D.is_super_admin, user.id):
+        return
+    try:
+        await msg.delete()
+    except TelegramError as e:                         # the bot needs the "Delete messages" admin right
+        log.warning("night: couldn't delete a message in %s: %s", chat.id, e)
+        return
+    raise ApplicationHandlerStop
+
+
 async def end_night(bot, chat_id):
     """Gives the saved permissions back and tells the group. While Auto Close has the group closed only the state is
     cleared (Auto Close keeps the real permissions and restores them when it opens)."""
@@ -5175,6 +5202,8 @@ def register(app, deps):
     app.add_handler(CallbackQueryHandler(help_night_callback, pattern=r"^help:night$"), group=-20)
     app.add_handler(CallbackQueryHandler(nmb_callback, pattern=r"^nmb:"))
     # appeal: /appeal, the /help > Appeal page, the Appeal deep link (/start appeal_...) and the reason in the private chat
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+                                   night_enforce), group=-26)       # Night Mode: text only (deletes media and links)
     app.add_handler(CommandHandler("appeal", appeal_cmd))
     app.add_handler(CallbackQueryHandler(help_appeal_callback, pattern=r"^help:appeal$"), group=-20)
     app.add_handler(CallbackQueryHandler(apb_callback, pattern=r"^apb:"))
