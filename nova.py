@@ -514,6 +514,19 @@ async def add_warn(chat, user_id, mention, reason, by=None):
                reason=html.escape(why))
 
 
+async def lift_warn_action(bot, chat, uid):
+    """After a warning is removed: take the action it caused back too (unmute if muted, unban if banned)."""
+    try:
+        member = await bot.get_chat_member(chat.id, uid)
+        if member.status == "kicked":
+            await chat.unban_member(uid, only_if_banned=True)
+        elif member.status == "restricted" and not getattr(member, "can_send_messages", True):
+            perms = (await bot.get_chat(chat.id)).permissions or DEFAULT_PERMS
+            await chat.restrict_member(uid, perms)
+    except TelegramError as e:
+        logging.warning("Couldn't lift the action after removing a warning in %s: %s", chat.id, e)
+
+
 async def enforce(chat, user_id, mention, mode, reason, category=None):
     """Apply a feature's configured action. Returns text to announce, or None."""
     kind = mode.partition(":")[0]
@@ -1919,6 +1932,7 @@ async def action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = active_warns(chat.id, uid)
         if rows:
             store.warn_delete(rows[-1][0])
+            await lift_warn_action(context.bot, chat, uid)
             await q.answer(L.t("wn.t_removed", chat.id))
             await group.record_undo(chat.id, uid, str(uid), "unwarn", q.from_user.mention_html())
             await q.edit_message_text(q.message.text_html + "\n" + L.t("wn.a_removed", chat.id), parse_mode="HTML")
@@ -2485,6 +2499,7 @@ async def rmwarn(update, context):
         await msg.reply_html(L.t("wn.none", chat.id, name=name))
         return
     store.warn_delete(rows[-1][0])
+    await lift_warn_action(context.bot, chat, uid)
     limit = int(get_setting(chat.id, "warn_limit", 3))
     await msg.reply_html(L.t("wn.removed", chat.id, name=name, n=len(rows) - 1, limit=limit))
     await group.record_undo(chat.id, uid, name, "unwarn", update.effective_user.mention_html())
@@ -2502,6 +2517,7 @@ async def resetwarns(update, context):
     uid, name, _ = await target_and_rest(update, context)
     if uid:
         store.warn_clear(update.effective_chat.id, uid)
+        await lift_warn_action(context.bot, update.effective_chat, uid)
         await update.effective_message.reply_html(L.t("wn.reset", update.effective_chat.id, name=name))
         await group.record_undo(update.effective_chat.id, uid, name, "reset", update.effective_user.mention_html())
         await log_action(update.effective_chat, "warn", f"🗑 {update.effective_user.mention_html()} reset warnings for {name}.")

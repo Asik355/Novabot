@@ -837,7 +837,27 @@ def _night_variant(perms):
     d = dict(to_dict()) if to_dict else {}
     d.update({k: False for k in NIGHT_MEDIA_OFF})
     d["can_send_messages"] = True
-    return ChatPermissions(**d)
+    try:
+        return ChatPermissions(**d)
+    except TypeError:                                  # an older python-telegram-bot without some of these fields: drop the unknown ones
+        import inspect
+        ok = set(inspect.signature(ChatPermissions.__init__).parameters)
+        return ChatPermissions(**{k: v for k, v in d.items() if k in ok})
+
+
+NIGHT_PIN_KEY = "night_pin"   # id of the Night Mode start message this bot pinned
+
+
+async def _unpin_night_message(bot, chat_id):
+    """Unpins the start message this bot pinned (never any other pinned message)."""
+    raw = D.get_setting(chat_id, NIGHT_PIN_KEY, "") or ""
+    if not str(raw).isdigit():
+        return
+    try:
+        await bot.unpin_chat_message(chat_id, message_id=int(raw))
+    except TelegramError as e:
+        log.debug("night: couldn't unpin the start message in %s: %s", chat_id, e)
+    store.del_setting(chat_id, NIGHT_PIN_KEY)
 
 
 NIGHT_PASSIVE = "closed"      # night_saved value when the group was ALREADY closed (by an admin) as the window began: nothing to restore
@@ -883,14 +903,21 @@ async def start_night(bot, chat_id, end_minutes):
             return True
         D.set_setting(chat_id, NIGHT_SAVED_KEY, _saved_perms(chat))
         await _set_perms(bot, chat_id, _night_variant(perms))
-    except TelegramError as e:
+    except Exception as e:                             # not only TelegramError: any failure is logged and shown, never silent
+        log.exception("night: start failed in %s", chat_id)
+        store.del_setting(chat_id, NIGHT_SAVED_KEY)
         await _fail(bot, chat_id, "night", e)
         return False
     D.set_setting(chat_id, NIGHT_STATE_KEY, "on")
     try:
-        await bot.send_message(chat_id, L.t("night.start", chat_id, open_time=fmt_12h(end_minutes)), parse_mode="HTML")
+        sent = await bot.send_message(chat_id, L.t("night.start", chat_id, open_time=fmt_12h(end_minutes)), parse_mode="HTML")
     except TelegramError:
-        pass
+        return True
+    try:                                               # pinned quietly (no notification), unpinned when Night Mode ends
+        await bot.pin_chat_message(chat_id, sent.message_id, disable_notification=True)
+        D.set_setting(chat_id, NIGHT_PIN_KEY, str(sent.message_id))
+    except TelegramError as e:                         # no "Pin messages" right: Night Mode is still on
+        log.debug("night: couldn't pin the start message in %s: %s", chat_id, e)
     return True
 
 
@@ -902,11 +929,13 @@ async def end_night(bot, chat_id):
     if not closed and not passive:
         try:
             await _set_perms(bot, chat_id, _night_saved_perms(chat_id))
-        except TelegramError as e:
+        except Exception as e:
+            log.exception("night: end failed in %s", chat_id)
             await _fail(bot, chat_id, "night-end", e)
             return False
     store.del_setting(chat_id, NIGHT_STATE_KEY)
     store.del_setting(chat_id, NIGHT_SAVED_KEY)
+    await _unpin_night_message(bot, chat_id)
     if not closed and not passive:
         try:
             await bot.send_message(chat_id, L.t("night.end", chat_id), parse_mode="HTML")
@@ -1283,8 +1312,40 @@ async def apb_callback(update, context):
         await q.answer(L.t("ac.db_problem", chat.id), show_alert=True)
 
 
+async def appeal_private(update, context):
+    """/appeal in the bot's private chat: lists the groups where this member is muted or has warnings, each with an
+    Appeal button (the same deep link as the notice button). Works for a permanent mute whose notice is long gone."""
+    msg, user, bot = update.effective_message, update.effective_user, context.bot
+    try:
+        groups = json.loads(D.get_setting(0, "stats_groups", "{}") or "{}")
+    except Exception:
+        groups = {}
+    rows = []
+    for cid_s, title in list(groups.items())[:60]:
+        try:
+            cid = int(cid_s)
+            if cid >= 0 or not appeal_on(cid):
+                continue
+            member = await bot.get_chat_member(cid, user.id)
+            muted = member.status == ChatMemberStatus.RESTRICTED and not getattr(member, "can_send_messages", True)
+            warned = bool(await asyncio.to_thread(D.active_warns, cid, user.id))
+        except Exception:
+            continue
+        for kind, on in (("m", muted), ("w", warned)):
+            if on and bot.username:
+                label = f"{'🔇 Mute' if kind == 'm' else '⚠️ Warning'}: {title or cid_s}"[:60]
+                rows.append([InlineKeyboardButton(label, url=f"https://t.me/{bot.username}?start=appeal_{abs(cid)}_{kind}")])
+    if not rows:
+        await msg.reply_html("You have no mute or warning to appeal in the groups I know (where Appeal is ON).")
+        return
+    await msg.reply_html("Choose what you want to appeal:", reply_markup=InlineKeyboardMarkup(rows))
+
+
 async def appeal_cmd(update, context):
     """/appeal  |  /appeal on|off  |  /appeal group|log"""
+    if update.effective_chat.type == "private":
+        await appeal_private(update, context)
+        return
     if not await D.group_only(update):
         return
     chat, msg = update.effective_chat, update.effective_message
@@ -1493,6 +1554,14 @@ async def _apl_undo(bot, row):
         await bot.restrict_chat_member(chat_id, user_id, perms)
     elif any(w[0] == row["ref"] for w in await asyncio.to_thread(D.active_warns, chat_id, user_id)):
         await asyncio.to_thread(store.warn_delete, row["ref"])
+        try:                                               # the warning's mute / ban goes too
+            m = await bot.get_chat_member(chat_id, user_id)
+            if m.status == ChatMemberStatus.BANNED:
+                await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+            elif m.status == ChatMemberStatus.RESTRICTED and not getattr(m, "can_send_messages", True):
+                await bot.restrict_chat_member(chat_id, user_id, (await bot.get_chat(chat_id)).permissions or D.default_perms)
+        except TelegramError:
+            pass
 
 
 # ======================================================================================================
