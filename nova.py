@@ -501,7 +501,7 @@ async def add_warn(chat, user_id, mention, reason, by=None):
         await extra.record_action(chat.id, user_id, mention, label, why, punish, by, "warn")
         return extra.action_notice(mention, label, why, punish, by, chat_id=chat.id)
 
-    store.warn_clear(chat.id, user_id)
+    # Warnings are kept after the limit action (like Miss Rose): only /resetwarns, the Remove warning button or /warntime expiry remove them.
     done = await do_action(chat, user_id, mode)
     if done:
         kind, secs = extra.mode_kind(mode)
@@ -2423,9 +2423,15 @@ async def _warn_cmd(update, context, delete_replied=False):
         await try_delete(msg.reply_to_message)
     text = await add_warn(chat, uid, name, reason[:200], update.effective_user.mention_html())
     kb = None
-    if warn_summary(chat.id, uid).split("/")[0] != "0":
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton(L.t("wn.btn_rmwarn", chat.id), callback_data=f"rmwarn:{uid}")]])
-        kb = group.appeal_markup(chat.id, uid, "warn", kb)  # adds 📩 Appeal when Appeal is ON
+    rows = []
+    muted_now = time.time() - _recent_mutes.get((chat.id, uid), 0) < 15   # warn ladder just muted them
+    if muted_now:
+        rows.append([InlineKeyboardButton(L.t("wn.btn_unmute", chat.id), callback_data=f"unmute:{uid}")])
+    if warn_summary(chat.id, uid).split("/")[0] != "0":                   # warn still on record
+        rows.append([InlineKeyboardButton(L.t("wn.btn_rmwarn", chat.id), callback_data=f"rmwarn:{uid}")])
+    if rows:
+        kb = InlineKeyboardMarkup(rows)
+        kb = group.appeal_markup(chat.id, uid, "mute" if muted_now else "warn", kb)  # adds 📩 Appeal when Appeal is ON
     await extra.track_notice(await msg.reply_html(text, reply_markup=kb))
     await log_action(chat, "warn", f"⚠️ {update.effective_user.mention_html()} warned {name}. {text}")
 

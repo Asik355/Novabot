@@ -1622,8 +1622,7 @@ async def ladder_warn(chat, user_id, mention, why, by, count, do_action):
         punish = f"Warning {count}: no action yet. At {nxt[0]} warns the action is {_wl_mode_en(nxt)}"
         await extra.record_action(chat.id, user_id, mention, label, why, punish, by, "warn")
         return extra.action_notice(mention, label, why, punish, by, chat_id=chat.id)
-    if step == steps[-1]:                             # the last step: the member starts again from 0
-        await asyncio.to_thread(store.warn_clear, chat.id, user_id)
+    # Warnings are kept after a step (like Miss Rose): the count keeps growing, expires with /warntime, or is cleared by /resetwarns.
     done = await do_action(chat, user_id, _wl_mode(step[1], step[2]))
     if done:
         kind, secs = extra.mode_kind(_wl_mode(step[1], step[2]))
