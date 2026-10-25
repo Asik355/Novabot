@@ -1830,14 +1830,14 @@ MORE_FEATURES_TEXT = "<b>➡️ More Features</b>\n\nPick a category to see its 
 
 
 def help_more_keyboard(chat=None):
-    """Page 2 of /help ("More Features"): 🗑 Delete and ✨ Extras, 🌐 Language and (in groups) 📜 Rules Gate, with a Back button to the front page."""
+    """Page 2 of /help ("More Features"), laid out like page 1: a grid of three buttons per line from the top. First the panels of the
+    newer features (groups only, group.more_buttons), then 🌐 Language, 🗑 Delete and ✨ Extras, and a Back button to the front page."""
     fun_row = list(fun_systems.fun_help_row())  # [🎉 Fun, 🗑 Delete, placeholder]: Delete is the second button
     delete_btn = fun_row[1] if len(fun_row) >= 2 else InlineKeyboardButton("🗑 Delete", callback_data="help:delete")
-    rows = [[delete_btn, InlineKeyboardButton("✨ Extras", callback_data="help:extras")],
-            [InlineKeyboardButton("🌐 Language", callback_data="lang:m")],  # lang/ folder, opened by group.py's handlers
-            [InlineKeyboardButton("⬅️ Back", callback_data="help:main")]]
-    if chat is not None and chat.type != "private":  # 📜 Rules Gate next to 🌐 Language (group.py 2j)
-        rows[1].append(group.gate_button(chat, from_more=True))
+    buttons = group.more_buttons(chat) + [InlineKeyboardButton("🌐 Language", callback_data="lang:m"),  # lang/ folder, group.py's handlers
+                                          delete_btn, InlineKeyboardButton("✨ Extras", callback_data="help:extras")]
+    rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="help:main")])
     return InlineKeyboardMarkup(style_help_buttons(rows))
 
 
@@ -2864,6 +2864,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Hi! I'm {extra.bot_name()}. Add me to your group as an admin and use /help."
         )
         return
+    await extra.refresh_identity(context.bot)  # the /start card shows the bot's current name
     await update.effective_message.reply_text(
         start_text(update.effective_user),
         parse_mode="HTML",
@@ -2878,7 +2879,14 @@ CHANNEL_URL = os.environ.get("CHANNEL_URL", "").strip()
 START_ADMIN_RIGHTS = "delete_messages+restrict_members+pin_messages+invite_users+change_info"
 
 
-START_BOT_NAME = "ALBEDO"
+START_BOT_NAME = "ALBEDO"  # only used until the bot's real name is known (see start_name)
+
+
+def start_name():
+    """The bot's name on the /start cards: its live Telegram name, so a rename shows up at once (it used to be fixed text).
+    Until the name is known the old fixed name is used."""
+    name = extra.bot_name().strip()
+    return START_BOT_NAME if not name or name == "this bot" else name
 
 
 _SMALL_CAPS = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ")
@@ -2900,7 +2908,7 @@ def sc_html(text):
 
 def start_text(user, bot_name=None):
     who = html.escape(small_caps(((user.first_name if user else "") or "there").lower()))
-    name = small_caps(START_BOT_NAME.lower())
+    name = html.escape(small_caps((bot_name or start_name()).lower()))
     return (
         f"🌸 {small_caps('hey')}, {who}! {small_caps('welcome to')} {name} ✨\n"
         f"{small_caps('my name is')} {name} 💗\n"
@@ -2921,9 +2929,11 @@ def start_text(user, bot_name=None):
 
 
 def start_about_text():
+    name = start_name()
+    shown = html.escape(name.title() if name == START_BOT_NAME else name)  # a live name is shown as the owner wrote it
     return sc_html(
-        f"💜 <b>ABOUT {START_BOT_NAME}</b>\n\n"
-        f"Hi, I'm <b>{START_BOT_NAME.title()}</b>, your group's smart helper. I keep your chat clean and safe, "
+        f"💜 <b>ABOUT {html.escape(name.upper())}</b>\n\n"
+        f"Hi, I'm <b>{shown}</b>, your group's smart helper. I keep your chat clean and safe, "
         "and I also bring AI tools and fun games, so your members have a good time.\n\n"
         "🚀 <b>HOW TO GET STARTED</b>\n"
         "<blockquote>1️⃣ Tap <b>➕ Add Me to Group</b> and pick your group\n"
@@ -2956,6 +2966,7 @@ async def start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Details page of the private /start card, with a Back button (and the Channel link if CHANNEL_URL is set)."""
     q = update.callback_query
     await q.answer()
+    await extra.refresh_identity(context.bot)
     if q.data == "start:home":
         text, markup = start_text(update.effective_user), await start_keyboard(context)
     else:
@@ -5805,20 +5816,29 @@ async def on_error(update, context):
             pass
 
 
+async def _sync_saved_bot_name(app):
+    """The name saved by Bot Edit is only a note of the last rename done here. If Telegram's name is different at start, someone
+    renamed the bot later (BotFather, or another Bot Edit): that newer name wins and becomes the saved one. The old code pushed the
+    saved name back on every start, so a restart brought the PREVIOUS name back. Nothing here ever changes the name on Telegram."""
+    saved = get_setting(0, _bkey("bot_name"))
+    if not saved:
+        return
+    try:
+        current = (await app.bot.get_my_name()).name
+    except TelegramError as e:
+        logging.warning("Couldn't read the bot name from Telegram: %s", e)
+        return
+    if current and current != saved:
+        set_setting(0, _bkey("bot_name"), current)
+        logging.info("The bot was renamed outside Bot Edit (%r -> %r): keeping the new name.", saved, current)
+
+
 async def _startup_sync(app):
     """Slow one-off Telegram housekeeping (profile text, command lists). Runs in the BACKGROUND
     so the bot answers messages immediately instead of after dozens of sequential API calls."""
     try:
-        # Only an owner edit (Bot Edit) may change the Telegram name. The old code pushed the generic
-        # BOT_NAME default on every start, undoing a rename done in BotFather.
-        target_name = get_setting(0, _bkey("bot_name"))
-        if target_name:
-            try:
-                current = await app.bot.get_my_name()
-                if current.name != target_name:  # name changes are rate-limited, so only when needed
-                    await app.bot.set_my_name(target_name)
-            except TelegramError as e:
-                logging.warning("Couldn't re-apply the saved bot name: %s", e)
+        # Only an owner edit (Bot Edit) may change the Telegram name; a restart never does (see _sync_saved_bot_name).
+        await _sync_saved_bot_name(app)
         await extra.refresh_identity(app.bot, force=True)
         # Same rule as the name: the saved text (Bot Edit > Bio / Description) is re-applied on every start, and the
         # generic default is used only while Telegram has no text at all, so it never replaces one you set yourself.

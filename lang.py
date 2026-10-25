@@ -62,6 +62,10 @@ EN = {
     "night.note": "<b>Note:</b> The bot must be an admin with the \"Ban users\" right. <b>Auto Close comes first:</b> while it has the group closed, Night Mode waits.",
     "night.btn_set": "⏰ Set Time",
     "night.btn_off": "🔴 Turn OFF",
+    "night.btn_cmd": "⌨️ Command",
+    "night.cmd_page": "<b>⌨️ Night Mode: Command</b>\n\nPrefer typing? Use these commands in the group (admins only):\n\n1. /night 10pm 6am: Text only every day from 10:00 PM to 6:00 AM.\n2. /night 10:30pm 5:45am: The same, with minutes: starts at 10:30 PM and ends at 5:45 AM.\n3. /night 22:00-06:15: The same, written with a 24-hour clock.\n4. /night off: Turn Night Mode off. The group's permissions come back.\n5. /night: Show the schedule and whether Night Mode is active right now.\n\n<b>Note:</b> The bot must be an admin with the \"Ban users\" right. Auto Close comes first. Times use {tz}.",
+    "night.now_wait": "waiting ⏳ (Auto Close has the group closed)",
+    "night.now_pending": "not started yet ⏳ (I check every 30 seconds. If this stays, make sure I'm an admin with the \"Ban users\" right)",
     "night.private": "Open /help inside a group to set up Night Mode for that group.",
     "night.status_off": "Status: <b>OFF ❌</b>",
     "night.status_on": "Status: <b>ON ✅</b> ({tz})\nStarts at <b>{start}</b> and ends at <b>{end}</b>, every day.\nNight Mode is {now} right now.",
@@ -876,6 +880,14 @@ EN = {
     "rg.admin_only": "Admins only.",
     "rg.private": "This works in groups only.",
     "rg.invalid": "This button is no longer valid.",
+    # ---- /help page 2 buttons (group.py 2k)
+    "mo.b_wl": "🪜 Warn Ladder",
+    "mo.b_ml": "📜 Mod Log",
+    "mo.b_rd": "🛡 Raid Shield",
+    "mo.b_pb": "🆕 Probation",
+    "mo.b_rp": "🚨 Report Panel",
+    "mo.b_gr": "👋 Greetings",
+    "mo.b_rg": "📜 Rules Gate",
     "wn.why_rules": "Didn't accept the rules in time",
 }
 
@@ -918,6 +930,10 @@ HINGLISH = {
     "night.note": "<b>Note:</b> Bot ke paas \"Ban users\" right wala admin hona zaroori hai. <b>Auto Close pehle aata hai:</b> jab woh group band rakhe, tab Night Mode ruka rehta hai.",
     "night.btn_set": "⏰ Set Time",
     "night.btn_off": "🔴 Turn OFF",
+    "night.btn_cmd": "⌨️ Command",
+    "night.cmd_page": "<b>⌨️ Night Mode: Command</b>\n\nType karna pasand hai? Group mein yeh commands use karo (sirf admins):\n\n1. /night 10pm 6am: Roz raat 10:00 PM se subah 6:00 AM tak sirf text.\n2. /night 10:30pm 5:45am: Wahi, minute ke saath: 10:30 PM pe shuru aur 5:45 AM pe khatam.\n3. /night 22:00-06:15: Wahi, 24 ghante ki ghadi mein likha hua.\n4. /night off: Night Mode band karo. Group ki permissions wapas aa jaati hain.\n5. /night: Schedule dikhao aur batao ki Night Mode abhi chalu hai ya nahi.\n\n<b>Note:</b> Bot ke paas \"Ban users\" right wala admin hona zaroori hai. Auto Close pehle aata hai. Time {tz} mein hai.",
+    "night.now_wait": "ruka hua hai ⏳ (Auto Close ne group band kiya hai)",
+    "night.now_pending": "abhi shuru nahi hua ⏳ (main har 30 second mein check karta hoon. Agar yeh aise hi rahe, to check karo ki main \"Ban users\" right wala admin hoon)",
     "night.private": "Kisi group ke liye Night Mode set karne ke liye us group mein /help kholo.",
     "night.status_off": "Status: <b>OFF ❌</b>",
     "night.status_on": "Status: <b>ON ✅</b> ({tz})\nRoz <b>{start}</b> pe shuru hota hai aur <b>{end}</b> pe khatam.\nNight Mode abhi {now}.",
@@ -1732,6 +1748,14 @@ HINGLISH = {
     "rg.admin_only": "Sirf admins.",
     "rg.private": "Yeh sirf groups mein chalta hai.",
     "rg.invalid": "Yeh button ab valid nahi hai.",
+    # ---- /help page 2 buttons (group.py 2k)
+    "mo.b_wl": "🪜 Warn Ladder",
+    "mo.b_ml": "📜 Mod Log",
+    "mo.b_rd": "🛡 Raid Shield",
+    "mo.b_pb": "🆕 Probation",
+    "mo.b_rp": "🚨 Report Panel",
+    "mo.b_gr": "👋 Greetings",
+    "mo.b_rg": "📜 Rules Gate",
     "wn.why_rules": "Time par rules accept nahi kiye",
 }
 

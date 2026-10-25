@@ -270,6 +270,8 @@ async def close_group(bot, chat_id, until_minutes=None):
         chat = await bot.get_chat(chat_id)
         current = _saved_perms(chat)
         night_saved = D.get_setting(chat_id, NIGHT_STATE_KEY, "") == "on" and D.get_setting(chat_id, NIGHT_SAVED_KEY, "")
+        if night_saved == NIGHT_PASSIVE:
+            night_saved = ""
         if night_saved:                                            # Night Mode is on: keep the REAL permissions it saved,
             D.set_setting(chat_id, SAVED_KEY, night_saved)         # not the media-off ones the group has right now
         elif getattr(getattr(chat, "permissions", None), "can_send_messages", True) is not False and current:
@@ -334,11 +336,19 @@ def _scheduled_groups(key=AUTOCLOSE_KEY):
 
 
 async def run_once(bot):
+    """One pass of the 30-second loop. Every job runs on its own: one that fails (a database hiccup, one odd group) is logged and
+    never stops the others, so Night Mode keeps working even when something else in the loop is broken."""
     now = _now_minutes()
-    await _auto_close_round(bot, now)
-    await _night_round(bot, now)                       # Night Mode (section 2b) uses the same loop
-    await _raid_round(bot)                             # Raid Shield (section 2f): lifts the lock when the raid is over
-    await _gate_round(bot)                             # Rules gate (section 2j): members who didn't accept in time
+    for name, job in (("auto close", _auto_close_round(bot, now)),
+                      ("night mode", _night_round(bot, now)),       # Night Mode (section 2b) uses the same loop
+                      ("raid shield", _raid_round(bot)),            # Raid Shield (section 2f): lifts the lock when the raid is over
+                      ("rules gate", _gate_round(bot))):            # Rules gate (section 2j): members who didn't accept in time
+        try:
+            await job
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("scheduler: the %s round failed", name)
 
 
 async def _auto_close_round(bot, now):
@@ -349,12 +359,15 @@ async def _auto_close_round(bot, now):
         close, open_ = sched
         want_closed = is_closed_at(now, close, open_)
         is_closed = D.get_setting(chat_id, STATE_KEY, "open") == "closed"
-        if want_closed and not is_closed:
-            if time.monotonic() >= _retry_at.get((chat_id, "close"), 0):
-                await close_group(bot, chat_id, open_)
-        elif not want_closed and is_closed:
-            if time.monotonic() >= _retry_at.get((chat_id, "open"), 0):
-                await open_group(bot, chat_id)
+        try:                                             # one group failing never skips the groups after it
+            if want_closed and not is_closed:
+                if time.monotonic() >= _retry_at.get((chat_id, "close"), 0):
+                    await close_group(bot, chat_id, open_)
+            elif not want_closed and is_closed:
+                if time.monotonic() >= _retry_at.get((chat_id, "open"), 0):
+                    await open_group(bot, chat_id)
+        except Exception:
+            log.exception("autoclose: the round failed for %s", chat_id)
 
 
 async def sweeper(app):
@@ -827,8 +840,23 @@ def _night_variant(perms):
     return ChatPermissions(**d)
 
 
+NIGHT_PASSIVE = "closed"      # night_saved value when the group was ALREADY closed (by an admin) as the window began: nothing to restore
+
+
+async def _set_perms(bot, chat_id, perms):
+    """set_chat_permissions with the permissions treated INDEPENDENTLY. Without that Telegram lets "can send stickers/GIFs" or
+    "link previews" imply the photo / video / file / voice permissions, so a Night Mode that switches media off could be
+    silently undone. (Older python-telegram-bot versions don't have the option: then the plain call is used.)"""
+    try:
+        await bot.set_chat_permissions(chat_id, perms, use_independent_chat_permissions=True)
+    except TypeError:
+        await bot.set_chat_permissions(chat_id, perms)
+
+
 def _night_saved_perms(chat_id):
     raw = D.get_setting(chat_id, NIGHT_SAVED_KEY, "") or ""
+    if raw == NIGHT_PASSIVE:
+        raw = ""
     try:
         perms = ChatPermissions(**json.loads(raw)) if raw else None
     except (TypeError, ValueError):
@@ -843,11 +871,18 @@ async def start_night(bot, chat_id, end_minutes):
     try:
         chat = await bot.get_chat(chat_id)
         perms = getattr(chat, "permissions", None)
-        if perms is None or getattr(perms, "can_send_messages", True) is False:
-            _retry_at[(chat_id, "night")] = time.monotonic() + RETRY_AFTER   # closed by hand: look again later
+        if perms is None:                                  # can't read the group's permissions: look again later
+            log.warning("night: can't read the permissions of %s", chat_id)
+            _retry_at[(chat_id, "night")] = time.monotonic() + RETRY_AFTER
             return False
+        if getattr(perms, "can_send_messages", True) is False:
+            # Closed by an admin: nobody can send anything anyway. Night Mode counts as active (so the status is right and the
+            # window ends cleanly) but touches nothing, says nothing, and never opens the group.
+            D.set_setting(chat_id, NIGHT_SAVED_KEY, NIGHT_PASSIVE)
+            D.set_setting(chat_id, NIGHT_STATE_KEY, "on")
+            return True
         D.set_setting(chat_id, NIGHT_SAVED_KEY, _saved_perms(chat))
-        await bot.set_chat_permissions(chat_id, _night_variant(perms))
+        await _set_perms(bot, chat_id, _night_variant(perms))
     except TelegramError as e:
         await _fail(bot, chat_id, "night", e)
         return False
@@ -863,15 +898,16 @@ async def end_night(bot, chat_id):
     """Gives the saved permissions back and tells the group. While Auto Close has the group closed only the state is
     cleared (Auto Close keeps the real permissions and restores them when it opens)."""
     closed = D.get_setting(chat_id, STATE_KEY, "open") == "closed"
-    if not closed:
+    passive = D.get_setting(chat_id, NIGHT_SAVED_KEY, "") == NIGHT_PASSIVE      # it began on a group an admin had closed
+    if not closed and not passive:
         try:
-            await bot.set_chat_permissions(chat_id, _night_saved_perms(chat_id))
+            await _set_perms(bot, chat_id, _night_saved_perms(chat_id))
         except TelegramError as e:
             await _fail(bot, chat_id, "night-end", e)
             return False
     store.del_setting(chat_id, NIGHT_STATE_KEY)
     store.del_setting(chat_id, NIGHT_SAVED_KEY)
-    if not closed:
+    if not closed and not passive:
         try:
             await bot.send_message(chat_id, L.t("night.end", chat_id), parse_mode="HTML")
         except TelegramError:
@@ -896,14 +932,17 @@ async def _night_round(bot, now):
         start, end = sched
         want = is_closed_at(now, start, end)             # "inside the window", same maths as Auto Close
         active = D.get_setting(chat_id, NIGHT_STATE_KEY, "") == "on"
-        if want and not active:
-            if D.get_setting(chat_id, STATE_KEY, "open") == "closed":
-                continue                                 # Auto Close comes first
-            if time.monotonic() >= _retry_at.get((chat_id, "night"), 0):
-                await start_night(bot, chat_id, end)
-        elif not want and active:
-            if time.monotonic() >= _retry_at.get((chat_id, "night-end"), 0):
-                await end_night(bot, chat_id)
+        try:                                             # one group failing never skips the groups after it
+            if want and not active:
+                if D.get_setting(chat_id, STATE_KEY, "open") == "closed":
+                    continue                             # Auto Close comes first
+                if time.monotonic() >= _retry_at.get((chat_id, "night"), 0):
+                    await start_night(bot, chat_id, end)
+            elif not want and active:
+                if time.monotonic() >= _retry_at.get((chat_id, "night-end"), 0):
+                    await end_night(bot, chat_id)
+        except Exception:
+            log.exception("night: the round failed for %s", chat_id)
 
 
 # ------------------------------------------------------------------ the /help > Night Mode page and /night
@@ -917,9 +956,19 @@ def _nm_status(chat):
     sched = load_schedule(D.get_setting(chat.id, NIGHT_KEY, "") or "")
     if not sched:
         return L.t("night.status_off", chat.id)
-    active = D.get_setting(chat.id, NIGHT_STATE_KEY, "") == "on"
     return L.t("night.status_on", chat.id, tz=html.escape(BOT_TIMEZONE), start=fmt_12h(sched[0]), end=fmt_12h(sched[1]),
-               now=L.t("night.now_active" if active else "night.now_idle", chat.id))
+               now=_nm_now(chat.id, sched))
+
+
+def _nm_now(chat_id, sched):
+    """'active' / 'not active' / why it is not active although the clock is inside the window."""
+    if D.get_setting(chat_id, NIGHT_STATE_KEY, "") == "on":
+        return L.t("night.now_active", chat_id)
+    if not is_closed_at(_now_minutes(), sched[0], sched[1]):
+        return L.t("night.now_idle", chat_id)
+    if D.get_setting(chat_id, STATE_KEY, "open") == "closed":
+        return L.t("night.now_wait", chat_id)                 # Auto Close has the group closed: Night Mode waits
+    return L.t("night.now_pending", chat_id)                  # inside the window, the loop hasn't applied it (yet)
 
 
 def _nm_panel(chat, note=""):
@@ -928,11 +977,19 @@ def _nm_panel(chat, note=""):
     sched = load_schedule(D.get_setting(chat.id, NIGHT_KEY, "") or "") if chat is not None and chat.type != "private" else None
     text = (L.t("night.title", chat_id) + "\n\n" + (note + "\n\n" if note else "") + L.t("night.intro", chat_id) +
             "\n\n" + _nm_status(chat) + "\n\n" + L.t("night.tap", chat_id) + "\n\n" + L.t("night.note", chat_id))
-    rows = [[InlineKeyboardButton(L.t("night.btn_set", chat_id), callback_data="acb:H:nc:-")]]
+    rows = [[InlineKeyboardButton(L.t("night.btn_set", chat_id), callback_data="acb:H:nc:-"),
+             InlineKeyboardButton(L.t("night.btn_cmd", chat_id), callback_data="nmb:c")]]       # ⌨️ Command, like Auto Close
     if sched:
         rows.append([InlineKeyboardButton(L.t("night.btn_off", chat_id), callback_data="nmb:off")])
     rows.append([InlineKeyboardButton(L.t("pick.back", chat_id), callback_data="help:main")])
     return text, InlineKeyboardMarkup(rows)
+
+
+def _nm_command_page(chat=None):
+    """⌨️ Command: every Night Mode command (information only)."""
+    cid = getattr(chat, "id", None)
+    return (L.t("night.cmd_page", cid, tz=_tz_label(cid)),
+            InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="nmb:a")]]))
 
 
 async def help_night_callback(update, context):
@@ -957,6 +1014,11 @@ async def nmb_callback(update, context):
         return
     if await extra.menu_not_owner(q):
         return
+    act = (q.data or "").split(":")[1:2]
+    if act == ["c"]:                                   # the Command page is only information: anyone may read it
+        await q.answer()
+        await _ac_edit(q, *_nm_command_page(chat))
+        return
     if chat.type == "private":
         await q.answer(L.t("night.private"), show_alert=True)
         return
@@ -964,7 +1026,6 @@ async def nmb_callback(update, context):
         await q.answer(L.t("night.admin_only", chat.id), show_alert=True)
         return
     _ac_pending.pop((chat.id, q.from_user.id), None)
-    act = (q.data or "").split(":")[1:2]
     if act == ["a"]:
         await q.answer()
         await _ac_edit(q, *_nm_panel(chat))
@@ -996,9 +1057,8 @@ async def night_cmd(update, context):
         if not sched:
             await msg.reply_text(L.t("night.cmd_off", chat.id) + "\n\n" + usage)
         else:
-            active = D.get_setting(chat.id, NIGHT_STATE_KEY, "") == "on"
             await msg.reply_text(L.t("night.cmd_on", chat.id, tz=BOT_TIMEZONE, start=fmt_12h(sched[0]), end=fmt_12h(sched[1]),
-                                     now=L.t("night.now_active" if active else "night.now_idle", chat.id)))
+                                     now=_nm_now(chat.id, sched)))
         return
     if args[0] in ("off", "no", "stop", "disable", "0"):
         ok, was = await night_off(context.bot, chat.id)
@@ -1989,7 +2049,8 @@ async def raid_lock(bot, chat_id):
             chat = await bot.get_chat(chat_id)
             perms = getattr(chat, "permissions", None)
             if perms is None or getattr(perms, "can_send_messages", True) is not False:   # not closed by hand either
-                saved = "night" if D.get_setting(chat_id, NIGHT_STATE_KEY, "") == "on" else (_saved_perms(chat) or "default")
+                night_on = D.get_setting(chat_id, NIGHT_STATE_KEY, "") == "on"
+                saved = "night" if night_on else (_saved_perms(chat) or "default")
                 await bot.set_chat_permissions(chat_id, CLOSED_PERMS)
     except TelegramError as e:
         await _raid_fail(bot, chat_id, "lock", e)
@@ -2006,7 +2067,7 @@ async def raid_unlock(bot, chat_id):
     saved = D.get_setting(chat_id, RAID_LOCK_SAVED_KEY, "") or ""
     perms = None
     if saved == "night":                                                  # Night Mode was on: media stays off
-        perms = _night_variant(_night_saved_perms(chat_id))
+        perms = None if D.get_setting(chat_id, NIGHT_SAVED_KEY, "") == NIGHT_PASSIVE else _night_variant(_night_saved_perms(chat_id))
     elif saved == "default":
         perms = D.default_perms
     elif saved:
@@ -2018,7 +2079,7 @@ async def raid_unlock(bot, chat_id):
             perms = D.default_perms
     if perms is not None:
         try:
-            await bot.set_chat_permissions(chat_id, perms)
+            await _set_perms(bot, chat_id, perms)
         except TelegramError as e:
             await _raid_fail(bot, chat_id, "raid-end", e)
             return False                                                  # the state stays on: the loop tries again
@@ -3615,6 +3676,23 @@ async def gate_cmd(update, context):
             return
     text, markup = await _rg_panel(chat, "\n".join(notes))
     await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+# ======================================================================================================
+# 2k. /help PAGE 2 ("More Features")
+# ======================================================================================================
+# Page 2 is a grid like page 1 (three buttons in a line, from the top): one short button for every panel built in sections
+# 2d-2j, then nova's own 🌐 Language, 🗑 Delete and ✨ Extras. Groups only for these panels (they need a group). Each button
+# opens the panel through the same callback its own help page uses, so there is one panel per feature, not a copy.
+MORE_PANELS = (("wl", "wl:m"), ("ml", "ml:a:0:0"), ("rd", "rd:m"), ("pb", "pb:p"), ("rp", "rp:p"), ("gr", "gr:m"), ("rg", "rg:q"))
+
+
+def more_buttons(chat):
+    """The panel buttons for /help page 2, in order (empty in private chats)."""
+    if chat is None or getattr(chat, "type", "private") == "private":
+        return []
+    cid = getattr(chat, "id", None)
+    return [InlineKeyboardButton(L.t("mo.b_" + key, cid), callback_data=data) for key, data in MORE_PANELS]
 
 
 # ======================================================================================================
