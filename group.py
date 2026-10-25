@@ -1170,6 +1170,28 @@ def appeal_dest(chat_id):
     return "log" if D.get_setting(chat_id, APPEAL_DEST_KEY, "group") == "log" else "group"
 
 
+_apl_dm_sent = {}                    # (chat_id, user_id, kind) -> monotonic time of the last private offer (no duplicates)
+
+
+async def _apl_dm_offer(chat_id, user_id, kind):
+    """Sends the member a private message with an Appeal button right when they are muted / warned.
+    Works only if they have started the bot before (Telegram's rule): otherwise it is skipped quietly."""
+    try:
+        bot = _app.bot
+        if not bot.username:
+            return
+        title = html.escape((await bot.get_chat(chat_id)).title or "the group")
+        what = "muted" if kind == "mute" else "warned"
+        url = f"https://t.me/{bot.username}?start=appeal_{abs(chat_id)}_{'m' if kind == 'mute' else 'w'}"
+        await bot.send_message(user_id, f"You were {what} in <b>{title}</b>.\nIf you think it was a mistake, you can appeal.",
+                               parse_mode="HTML",
+                               reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(L.t("apl.btn", chat_id), url=url)]]))
+    except TelegramError as e:                                   # never started the bot, or blocked it
+        log.debug("appeal: couldn't DM %s: %s", user_id, e)
+    except Exception:
+        log.exception("appeal: private offer failed for %s", user_id)
+
+
 def appeal_markup(chat_id, user_id, kind, kb=None):
     """`kb` (nova's Unmute / Remove warning markup, or None) with a 📩 Appeal row added when Appeal is ON in this group.
     kind is "mute" or "warn". Returns `kb` unchanged when Appeal is OFF, so it is safe to call everywhere."""
@@ -1182,6 +1204,13 @@ def appeal_markup(chat_id, user_id, kind, kb=None):
         url = f"https://t.me/{username}?start=appeal_{abs(chat_id)}_{'m' if kind == 'mute' else 'w'}"
         rows = [list(r) for r in kb.inline_keyboard] if kb else []
         rows.append([InlineKeyboardButton(L.t("apl.btn", chat_id), url=url)])
+        key, now = (chat_id, user_id, kind), time.monotonic()
+        if now - _apl_dm_sent.get(key, -999) > 60:               # also offer the appeal in the member's private chat
+            _apl_dm_sent[key] = now
+            try:
+                asyncio.get_running_loop().create_task(_apl_dm_offer(chat_id, user_id, kind))
+            except RuntimeError:
+                pass
         return InlineKeyboardMarkup(rows)
     except Exception:
         log.exception("appeal: couldn't add the Appeal button in %s", chat_id)
