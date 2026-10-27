@@ -387,6 +387,23 @@ def _board_page_sync(chat_id, kind, page):
     return {"rows": rows, "total": total, "pages": pages, "page": max(page, 0), "size": size}
 
 
+def top_between_sync(chat_id, lo, hi, limit=10):
+    """The most active members between two IST calendar days (inclusive, 'YYYY-MM-DD' strings), for the weekly shout-out
+    (group.py 2l): ([(user_id, name, messages)], members who chatted, all their messages). Same data as /week and /today."""
+    c = M.col(COUNTS)
+    match = {"$match": {"chat_id": chat_id, "scope": "day", "p": {"$gte": lo, "$lte": hi}}}
+    per_user = {"$group": {"_id": "$user_id", "n": {"$sum": "$count"}}}
+    rows = list(c.aggregate([match, per_user, {"$sort": {"n": -1, "_id": 1}}, {"$limit": max(1, int(limit))}]))
+    tot = list(c.aggregate([match, per_user, {"$group": {"_id": None, "n": {"$sum": "$n"}, "people": {"$sum": 1}}}]))
+    names = {d["user_id"]: d.get("name") for d in
+             c.find({"chat_id": chat_id, "scope": "all", "user_id": {"$in": [r["_id"] for r in rows]}}, {"user_id": 1, "name": 1})}
+    return ([(r["_id"], names.get(r["_id"]), r["n"]) for r in rows], tot[0]["people"] if tot else 0, tot[0]["n"] if tot else 0)
+
+
+async def top_between(chat_id, lo, hi, limit=10):
+    return await asyncio.to_thread(top_between_sync, chat_id, lo, hi, limit)
+
+
 def _board_sync(chat_id, kind, page):
     """One leaderboard page plus this group's summary (shown above every leaderboard)."""
     data = _board_page_sync(chat_id, kind, page)
@@ -771,6 +788,7 @@ def _dash_kb(g):
         [B(_t("mc.b_overall_long", g), callback_data="mc:b:all:0")],
         [B(_t("mc.b_today", g), callback_data="mc:b:today:0"), B(_t("mc.b_week", g), callback_data="mc:b:week:0")],
         [B(_t("mc.b_full", g), callback_data="mc:b:full:0")],
+        [B(_t("mc.b_shout", g), callback_data="so:p")],          # 🏆 the weekly shout-out panel (group.py 2l)
         [B(_t("mc.b_settings", g), callback_data="mc:s")],
         [B(_t("mc.b_count_on" if on else "mc.b_count_off", g), callback_data=f"mc:t:{0 if on else 1}")],
         [B(_t("mc.b_back", g), callback_data="help:main")],

@@ -5,6 +5,7 @@ group.py: all group-management logic in ONE file (merged from autoclose.py, clea
                       (+ the 🕒 Auto Close and ⌨️ Command buttons on /help > Auto Close: hour, minute, AM/PM pickers)
   NIGHT MODE          /night 11pm 6am   /night off   /night   (text-only at night; /help > Night Mode page)
   APPEAL              /appeal [on|off|group|log|dm]   (📩 Appeal button on mute / warn notices; OFF by default)
+  SHOUT-OUT           /shout [on|off|sun 9pm|top 5|text <message>|reset|mention on|off|now]   (weekly top chatters, written by the admins)
   RULES GATE          /gate [on|off|<time>|kick|mute|ban]   (new members must accept the rules before they can chat)
   GREETINGS           /greet, /wdel <time|off>, /gdel, /wbtn <text> <link>, /gbtn   (extra buttons and delete-after for welcome / goodbye)
   REPORTS             /reportpanel, /reportmute <time>, /reportcooldown <time|off>   (the /report card: Mute / Warn / Delete message / Dismiss)
@@ -73,7 +74,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatMemberStatus
@@ -82,6 +83,10 @@ from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler, CommandHa
 
 import extra
 import migrate_to_mongo as store
+try:
+    import msgcount  # the message counts (nova.py registers it): the weekly shout-out (section 2l) reads them
+except ImportError:
+    msgcount = None
 try:
     from lang import lang as L      # the language system (lang/lang.py): L.t("key", chat_id, name=value)
 except ImportError:
@@ -342,7 +347,8 @@ async def run_once(bot):
     for name, job in (("auto close", _auto_close_round(bot, now)),
                       ("night mode", _night_round(bot, now)),       # Night Mode (section 2b) uses the same loop
                       ("raid shield", _raid_round(bot)),            # Raid Shield (section 2f): lifts the lock when the raid is over
-                      ("rules gate", _gate_round(bot))):            # Rules gate (section 2j): members who didn't accept in time
+                      ("rules gate", _gate_round(bot)),             # Rules gate (section 2j): members who didn't accept in time
+                      ("shout-out", _shout_round(bot))):            # Weekly shout-out (section 2l)
         try:
             await job
         except asyncio.CancelledError:
@@ -1602,6 +1608,30 @@ async def apl_callback(update, context):
         pass                                               # the member blocked the bot
 
 
+async def lift_warn_action(bot, chat_id, user_id):
+    """A warning was removed: take the mute / ban it caused back too (unban if banned, unmute if muted). One place for nova's /rmwarn,
+    /resetwarns, the Remove warning button and the Appeal."""
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        if member.status == ChatMemberStatus.BANNED:
+            await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+        elif member.status == ChatMemberStatus.RESTRICTED and not getattr(member, "can_send_messages", True):
+            await bot.restrict_chat_member(chat_id, user_id, (await bot.get_chat(chat_id)).permissions or D.default_perms)
+    except TelegramError as e:
+        log.warning("Couldn't lift the action after removing a warning in %s: %s", chat_id, e)
+
+
+def warn_markup(chat_id, user_id, muted_now, has_warn):
+    """The buttons under a /warn notice: Unmute (the warn ladder just muted them) and Remove warning, plus 📩 Appeal when Appeal is ON.
+    None when there is nothing to offer."""
+    rows = []
+    if muted_now:
+        rows.append([InlineKeyboardButton(L.t("wn.btn_unmute", chat_id), callback_data=f"unmute:{user_id}")])
+    if has_warn:
+        rows.append([InlineKeyboardButton(L.t("wn.btn_rmwarn", chat_id), callback_data=f"rmwarn:{user_id}")])
+    return appeal_markup(chat_id, user_id, "mute" if muted_now else "warn", InlineKeyboardMarkup(rows)) if rows else None
+
+
 async def _apl_undo(bot, row):
     """Takes the mute or the warning back, the same way nova's Unmute / Remove warning buttons do."""
     chat_id, user_id = row["chat_id"], row["user_id"]
@@ -1610,14 +1640,7 @@ async def _apl_undo(bot, row):
         await bot.restrict_chat_member(chat_id, user_id, perms)
     elif any(w[0] == row["ref"] for w in await asyncio.to_thread(D.active_warns, chat_id, user_id)):
         await asyncio.to_thread(store.warn_delete, row["ref"])
-        try:                                               # the warning's mute / ban goes too
-            m = await bot.get_chat_member(chat_id, user_id)
-            if m.status == ChatMemberStatus.BANNED:
-                await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
-            elif m.status == ChatMemberStatus.RESTRICTED and not getattr(m, "can_send_messages", True):
-                await bot.restrict_chat_member(chat_id, user_id, (await bot.get_chat(chat_id)).permissions or D.default_perms)
-        except TelegramError:
-            pass
+        await lift_warn_action(bot, chat_id, user_id)      # the warning's mute / ban goes too
 
 
 # ======================================================================================================
@@ -1628,9 +1651,9 @@ async def _apl_undo(bot, row):
 #     warn_ladder_on = "on" | "off" (default off).
 #   * OFF (or ON with no steps): nova.py's add_warn keeps using /warnlimit + /warnmode, exactly as before.
 #   * ON: when a member's active warnings reach a step's count, that step's action is applied. A count without a step
-#     gets the plain warning notice. The LAST step also resets the member's warn count, so the ladder starts again;
-#     earlier steps keep the count. A member who already has more warnings than the last step gets the last step on
-#     the next warning.
+#     gets the plain warning notice. Warnings are KEPT after every step (like Miss Rose): the count keeps growing, and a
+#     member who already has more warnings than the last step gets the last step again on every new warning. Warnings go
+#     away with /warntime (expiry), /resetwarns or the Remove warning button (which also lifts the mute / ban it caused).
 #   * A step is "mute" (permanent), "tmute" (with seconds), "kick" or "ban". Counts 1-50, at most WL_MAX_STEPS steps.
 #   * Adding the first step to an empty ladder switches it ON.
 #   * Customised from /help > Warnings > 🪜 Warn Ladder, or with /warnladder (see wl_usage in lang.py).
@@ -3803,12 +3826,385 @@ async def gate_cmd(update, context):
 
 
 # ======================================================================================================
+# 2l. WEEKLY SHOUT-OUT  (reads the message counts of msgcount.py)
+# ======================================================================================================
+# A weekly "top chatters" post that the admins write themselves. Settings (per group):
+#   shout_on "on"|"off" (default off) · shout_day 0-6 (Monday = 0, default Sunday) · shout_time minutes after midnight (default 9 PM,
+#   in BOT_TIMEZONE) · shout_top 1-10 members (default 3) · shout_mention "on"|"off" (default on: names are links that notify)
+#   · shout_text = the admins' own message (empty = the built-in one) · shout_last = Monday of the week already posted.
+# The week is the one /week shows (Monday to Sunday, IST): posted on a Sunday it is this week, on any other day the week that just
+# ended. One post per week; a week nobody chatted in posts nothing. The 30-second loop (run_once -> _shout_round) posts it.
+# Placeholders in the text: {group} {week} {list} {winner} {count} {total} {people} {top} and, per rank 1-10, {name1} {count1}
+# {mention1}. Unknown ones stay as typed; ranks nobody reached are empty. Admin HTML (<b>...</b>) works; broken markup falls back to plain.
+# Panel: 📊 Count > 🏆 Weekly Shout-out, or /help page 2 (callbacks "so:..."), or /shout:
+#   /shout  |  on | off  |  sun 9pm  |  top 5  |  text <message>  |  reset  |  mention on|off  |  now
+SO_KEY, SO_DAY_KEY, SO_TIME_KEY, SO_TOP_KEY = "shout_on", "shout_day", "shout_time", "shout_top"
+SO_TEXT_KEY, SO_MENTION_KEY, SO_LAST_KEY = "shout_text", "shout_mention", "shout_last"
+SO_DAY_DEFAULT, SO_TIME_DEFAULT, SO_TOP_DEFAULT = 6, 21 * 60, 3
+SO_TIMES = (540, 720, 1080, 1260, 1320)
+SO_TOPS = (1, 3, 5, 10)
+SO_MAX_TOP, SO_MAX_TEXT, SO_PREVIEW_SECS, SO_PENDING_SECS = 10, 1500, 60, 300
+SO_DAY_WORDS = {"mon": 0, "monday": 0, "tue": 1, "tues": 1, "tuesday": 1, "wed": 2, "wednesday": 2, "thu": 3, "thur": 3, "thurs": 3,
+                "thursday": 3, "fri": 4, "friday": 4, "sat": 5, "saturday": 5, "sun": 6, "sunday": 6}
+_SO_MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+_SO_TOKEN = re.compile(r"\{(group|week|list|winner|count|total|people|top|(?:name|count|mention)(?:10|[1-9]))\}")
+_so_pending = {}        # (chat_id, admin id) -> {"panel": (chat id, message id), "until": monotonic time}
+_so_origin = {}         # (chat_id, panel message id) -> True when the panel was opened from /help page 2 (Back goes there)
+
+
+def _now_weekday():
+    return datetime.now(_tz()).weekday()
+
+
+def so_on(chat_id):
+    return D.get_setting(chat_id, SO_KEY, "off") == "on"
+
+
+def so_day(chat_id):
+    day = _num_setting(chat_id, SO_DAY_KEY, SO_DAY_DEFAULT)
+    return day if 0 <= day <= 6 else SO_DAY_DEFAULT
+
+
+def so_time(chat_id):
+    mins = _num_setting(chat_id, SO_TIME_KEY, SO_TIME_DEFAULT)
+    return mins if 0 <= mins < 1440 else SO_TIME_DEFAULT
+
+
+def so_top(chat_id):
+    top = _num_setting(chat_id, SO_TOP_KEY, SO_TOP_DEFAULT)
+    return top if 1 <= top <= SO_MAX_TOP else SO_TOP_DEFAULT
+
+
+def so_mention(chat_id):
+    return D.get_setting(chat_id, SO_MENTION_KEY, "on") == "on"
+
+
+def so_text(chat_id):
+    return str(D.get_setting(chat_id, SO_TEXT_KEY, "") or "")[:SO_MAX_TEXT]
+
+
+def shout_week(day=SO_DAY_DEFAULT, now=None):
+    """(first day, last day) of the week the shout-out reports, as the IST day strings the message counts use."""
+    _, wk0, wk1 = msgcount.periods(now)
+    if day == 6:
+        return wk0, wk1
+    start = date.fromisoformat(wk0) - timedelta(days=7)
+    return start.isoformat(), (start + timedelta(days=6)).isoformat()
+
+
+def _so_week_text(lo, hi):
+    a, b = date.fromisoformat(lo), date.fromisoformat(hi)
+    return f"{a.day} {a.strftime('%b')} - {b.day} {b.strftime('%b')}"
+
+
+def so_render(chat_id, title, rows, people, total, lo, hi):
+    """The message: the admins' text (or the built-in one) with the placeholders filled in."""
+    link = so_mention(chat_id)
+
+    def name_of(uid, name):
+        return html.escape((name or "").strip()[:32] or L.t("mc.user_n", chat_id, uid=uid))
+
+    def who(uid, name, force=False):
+        return f'<a href="tg://user?id={uid}">{name_of(uid, name)}</a>' if (link or force) else name_of(uid, name)
+
+    vals = {"group": html.escape(title or ""), "week": _so_week_text(lo, hi), "total": f"{total:,}", "people": f"{people:,}",
+            "top": str(len(rows)), "winner": who(*rows[0][:2]) if rows else "", "count": f"{rows[0][2]:,}" if rows else ""}
+    lines = []
+    for i, (uid, name, n) in enumerate(rows, 1):
+        lines.append(f"{_SO_MEDALS.get(i, f'{i}.')} {who(uid, name)} - {L.t('so.messages', chat_id, n=f'{n:,}')}")
+        vals[f"name{i}"], vals[f"count{i}"], vals[f"mention{i}"] = name_of(uid, name), f"{n:,}", who(uid, name, force=True)
+    vals["list"] = "\n".join(lines)
+    return _SO_TOKEN.sub(lambda m: vals.get(m.group(1), ""), so_text(chat_id) or L.t("so.default", chat_id))
+
+
+async def shout_post(bot, chat_id, delete_after=None):
+    """Builds and posts this group's shout-out. Returns "sent", "empty" (nobody chatted that week) or "error"."""
+    if msgcount is None:
+        return "error"
+    lo, hi = shout_week(so_day(chat_id))
+    try:
+        rows, people, total = await msgcount.top_between(chat_id, lo, hi, so_top(chat_id))
+    except Exception:
+        log.exception("shout-out: couldn't read the message counts of %s", chat_id)
+        return "error"
+    if not rows:
+        return "empty"
+    try:
+        title = (await bot.get_chat(chat_id)).title
+    except TelegramError:
+        title = ""
+    try:
+        sent = await D.safe_html(functools.partial(bot.send_message, chat_id, disable_web_page_preview=True),
+                                 so_render(chat_id, title, rows, people, total, lo, hi))
+    except TelegramError as e:
+        log.warning("shout-out: couldn't post in %s: %s", chat_id, e)
+        return "error"
+    if delete_after and sent is not None:
+        await extra.track_notice(sent, delete_after)
+    return "sent"
+
+
+async def _shout_round(bot):
+    """Part of run_once (every 30 seconds): posts the week's shout-out once, on the chosen day after the chosen time."""
+    for chat_id, value in await asyncio.to_thread(_scheduled_groups, SO_KEY):
+        try:
+            if value != "on" or chat_id >= 0 or D.is_paused(chat_id):
+                continue
+            day = so_day(chat_id)
+            if _now_weekday() != day or _now_minutes() < so_time(chat_id):
+                continue
+            lo, _ = shout_week(day)
+            if D.get_setting(chat_id, SO_LAST_KEY, "") == lo or time.monotonic() < _retry_at.get((chat_id, "shout"), 0):
+                continue
+            if await shout_post(bot, chat_id) == "error":
+                _retry_at[(chat_id, "shout")] = time.monotonic() + RETRY_AFTER      # try again in a few minutes
+            else:
+                D.set_setting(chat_id, SO_LAST_KEY, lo)                             # "sent" or "empty": this week is done
+        except Exception:
+            log.exception("shout-out: the round failed for %s", chat_id)
+
+
+# ------------------------------------------------------------------ the panel
+def shout_button(chat):
+    return InlineKeyboardButton(L.t("mo.b_so", getattr(chat, "id", None)), callback_data="so:q")
+
+
+def _so_when(chat_id):
+    return L.t("so.when", chat_id, day=L.t(f"so.d_{so_day(chat_id)}", chat_id), time=fmt_12h(so_time(chat_id)), tz=_tz_label(chat_id))
+
+
+def _so_panel(chat, note="", back="mc:d"):
+    cid = getattr(chat, "id", None)
+    if chat is None or chat.type == "private":
+        return L.t("so.private", cid), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]])
+    on, day, when, top, link = so_on(cid), so_day(cid), so_time(cid), so_top(cid), so_mention(cid)
+    custom = so_text(cid)
+    text = (L.t("so.title", cid) + "\n\n" + (note + "\n\n" if note else "") + L.t("so.intro", cid) + "\n\n" +
+            L.t("so.status_on" if on else "so.status_off", cid) + "\n" + _so_when(cid) + "\n" + L.t("so.top_line", cid, n=top) + "\n" +
+            L.t("so.mention_on" if link else "so.mention_off", cid) + "\n" +
+            (L.t("so.text_custom", cid, n=len(custom)) if custom else L.t("so.text_default", cid)) + "\n\n" + L.t("so.note", cid))
+    mark = lambda cond: "✅ " if cond else ""
+    rows = _pairs([InlineKeyboardButton(L.t("so.btn_off" if on else "so.btn_on", cid), callback_data="so:t"),
+                   InlineKeyboardButton(L.t("so.btn_preview", cid), callback_data="so:v")])
+    rows += _pairs([InlineKeyboardButton(mark(d == day) + L.t(f"so.ds_{d}", cid), callback_data=f"so:d:{d}") for d in range(7)])
+    rows += _pairs([InlineKeyboardButton(mark(m == when) + "🕘 " + fmt_12h(m), callback_data=f"so:h:{m}") for m in SO_TIMES])
+    rows += _pairs([InlineKeyboardButton(mark(n == top) + L.t("so.b_top", cid, n=n), callback_data=f"so:n:{n}") for n in SO_TOPS])
+    rows += _pairs([InlineKeyboardButton(L.t("so.btn_mention_off" if link else "so.btn_mention_on", cid), callback_data="so:m"),
+                    InlineKeyboardButton(L.t("so.btn_text", cid), callback_data="so:x"),
+                    InlineKeyboardButton(L.t("so.btn_default", cid), callback_data="so:r"),
+                    InlineKeyboardButton(L.t("so.btn_now", cid), callback_data="so:g")])
+    rows.append([InlineKeyboardButton(L.t("so.btn_cmd", cid), callback_data="so:c")])
+    rows.append([InlineKeyboardButton(L.t("pick.back", cid), callback_data=back)])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _so_command_page(chat=None):
+    cid = getattr(chat, "id", None)
+    return (L.t("so.cmd_page", cid, tz=_tz_label(cid)), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="so:p")]]))
+
+
+def _so_result_note(chat_id, result):
+    return L.t({"sent": "so.t_sent", "empty": "so.t_empty"}.get(result, "so.t_error"), chat_id)
+
+
+async def so_callback(update, context):
+    """\"so:p\" panel (\"so:q\": opened from /help page 2), \"so:t\" on/off, \"so:d:<0-6>\" day, \"so:h:<minutes>\" time, \"so:n:<members>\", \"so:m\" mentions,
+    \"so:v\" preview, \"so:g\" post now, \"so:x\" write the text, \"so:r\" built-in text, \"so:c\" commands. Admins only (\"so:c\" is just information)."""
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    if chat is None:
+        await q.answer()
+        return
+    if await extra.menu_not_owner(q):
+        return
+    parts = (q.data or "").split(":")[1:]
+    act, arg = (parts[0] if parts else ""), (parts[1] if len(parts) == 2 else None)
+    if parts == ["c"]:
+        await q.answer()
+        await _ac_edit(q, *_so_command_page(chat))
+        return
+    if chat.type == "private":
+        await q.answer(L.t("so.private"), show_alert=True)
+        return
+    cid = chat.id
+    if not await _ac_allowed(chat, q.from_user.id):
+        await q.answer(L.t("so.admin_only", cid), show_alert=True)
+        return
+    if parts in (["p"], ["q"]):
+        _so_origin[(cid, q.message.message_id)] = parts == ["q"]
+    back = "help:more" if _so_origin.get((cid, q.message.message_id)) else "mc:d"
+    num = _ac_num(arg, 0, 10 ** 7) if arg is not None else None
+    toast = None
+    try:
+        if parts in (["p"], ["q"]):
+            pass
+        elif parts == ["t"]:
+            on = not so_on(cid)
+            D.set_setting(cid, SO_KEY, "on" if on else "off")
+            toast = L.t("so.t_on" if on else "so.t_off", cid)
+        elif act == "d" and num is not None and 0 <= num <= 6 and arg is not None:
+            D.set_setting(cid, SO_DAY_KEY, num)
+            toast = L.t("so.t_when", cid, when=_so_when_text(num, so_time(cid), cid))
+        elif act == "h" and num in SO_TIMES:
+            D.set_setting(cid, SO_TIME_KEY, num)
+            toast = L.t("so.t_when", cid, when=_so_when_text(so_day(cid), num, cid))
+        elif act == "n" and num in SO_TOPS:
+            D.set_setting(cid, SO_TOP_KEY, num)
+            toast = L.t("so.t_top", cid, n=num)
+        elif parts == ["m"]:
+            link = not so_mention(cid)
+            D.set_setting(cid, SO_MENTION_KEY, "on" if link else "off")
+            toast = L.t("so.t_mention_on" if link else "so.t_mention_off", cid)
+        elif parts == ["r"]:
+            D.set_setting(cid, SO_TEXT_KEY, "")
+            toast = L.t("so.t_reset", cid)
+        elif parts == ["v"] or parts == ["g"]:
+            result = await shout_post(context.bot, cid, delete_after=SO_PREVIEW_SECS if parts == ["v"] else None)
+            await q.answer(_so_result_note(cid, result), show_alert=result != "sent")
+            return
+        elif parts == ["x"]:
+            _so_pending[(cid, q.from_user.id)] = {"panel": (cid, q.message.message_id), "until": time.monotonic() + SO_PENDING_SECS}
+            await q.answer(L.t("so.t_ask", cid))
+            await chat.send_message(L.t("so.ask", cid, user=q.from_user.mention_html(), max=SO_MAX_TEXT), parse_mode="HTML")
+            return
+        else:
+            await q.answer(L.t("so.invalid", cid), show_alert=True)
+            return
+        await q.answer(toast)
+        await _ac_edit(q, *_so_panel(chat, back=back))
+    except Exception:
+        log.exception("shout-out: panel action failed in %s", cid)
+        await q.answer(L.t("ac.db_problem", cid), show_alert=True)
+
+
+def _so_when_text(day, mins, chat_id):
+    return L.t("so.when_short", chat_id, day=L.t(f"so.d_{day}", chat_id), time=fmt_12h(mins))
+
+
+async def so_input(update, context):
+    """group=-12, cheap: only acts when the admin tapped ✏️ Text and now sends the message (or "cancel" / "default")."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user or not _so_pending:
+        return
+    key = (chat.id, user.id)
+    pending = _so_pending.get(key)
+    if pending is None:
+        return
+    if time.monotonic() > pending["until"] or not await D.is_admin(chat, user.id):
+        _so_pending.pop(key, None)
+        return
+    text = (msg.text or "").strip()
+    if text.lower() in ("cancel", "stop"):
+        _so_pending.pop(key, None)
+        await _rp_note(msg, "so.t_cancel", 10)
+        raise ApplicationHandlerStop
+    if len(text) > SO_MAX_TEXT:
+        await _rp_note(msg, "so.err_long", 15, max=SO_MAX_TEXT)
+        raise ApplicationHandlerStop
+    _so_pending.pop(key, None)
+    D.set_setting(chat.id, SO_TEXT_KEY, "" if text.lower() == "default" else text)
+    try:
+        await msg.delete()
+    except TelegramError:
+        pass
+    try:
+        panel_chat, panel_id = pending["panel"]
+        screen, kb = _so_panel(chat, L.t("so.t_saved", chat.id), back="help:more" if _so_origin.get(pending["panel"]) else "mc:d")
+        await context.bot.edit_message_text(screen, chat_id=panel_chat, message_id=panel_id, parse_mode="HTML", reply_markup=kb,
+                                            disable_web_page_preview=True)
+    except TelegramError:
+        await _rp_note(msg, "so.t_saved", 10)
+    raise ApplicationHandlerStop
+
+
+def _so_parse_when(tokens):
+    """Day names and a time in any order ('sun 9pm', '9 pm monday', '21:00') -> (day or None, minutes or None, ok)."""
+    day = mins = None
+    tokens = [t.lower() for t in tokens]
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t in SO_DAY_WORDS and day is None:
+            day = SO_DAY_WORDS[t]
+        else:
+            if i + 1 < len(tokens) and tokens[i + 1] in ("am", "pm"):
+                t, i = t + tokens[i + 1], i + 1
+            parsed = parse_time(t)
+            if parsed is None or mins is not None:
+                return None, None, False
+            mins = parsed
+        i += 1
+    return day, mins, True
+
+
+async def shout_cmd(update, context):
+    """/shout  |  on | off  |  sun 9pm  |  top 5  |  text <message>  |  reset  |  mention on|off  |  now"""
+    if not await D.group_only(update):
+        return
+    chat, msg, args, note = update.effective_chat, update.effective_message, list(context.args or []), ""
+    cid, first = chat.id, (args[0].lower() if args else "")
+    if not args:
+        pass
+    elif first in ("on", "off") and len(args) == 1:
+        D.set_setting(cid, SO_KEY, first)
+        note = L.t("so.t_on" if first == "on" else "so.t_off", cid)
+    elif first == "reset" and len(args) == 1:
+        D.set_setting(cid, SO_TEXT_KEY, "")
+        note = L.t("so.t_reset", cid)
+    elif first == "now" and len(args) == 1:
+        note = _so_result_note(cid, await shout_post(context.bot, cid))
+    elif first == "top" and len(args) == 2:
+        n = _ac_num(args[1], 1, SO_MAX_TOP)
+        if n is None:
+            await msg.reply_html(L.t("so.usage", cid))
+            return
+        D.set_setting(cid, SO_TOP_KEY, n)
+        note = L.t("so.t_top", cid, n=n)
+    elif first == "mention" and len(args) == 2 and args[1].lower() in ("on", "off"):
+        D.set_setting(cid, SO_MENTION_KEY, args[1].lower())
+        note = L.t("so.t_mention_on" if args[1].lower() == "on" else "so.t_mention_off", cid)
+    elif first == "text":
+        raw = (msg.text or "").split(None, 2)                 # keeps the admin's line breaks
+        value = raw[2].strip() if len(raw) == 3 else ""
+        if not value:
+            await msg.reply_html(L.t("so.usage", cid))
+            return
+        if len(value) > SO_MAX_TEXT:
+            await msg.reply_html(L.t("so.err_long", cid, max=SO_MAX_TEXT))
+            return
+        D.set_setting(cid, SO_TEXT_KEY, value)
+        note = L.t("so.t_saved", cid)
+    else:
+        day, mins, ok = _so_parse_when(args)
+        if not ok or (day is None and mins is None):
+            await msg.reply_html(L.t("so.usage", cid))
+            return
+        if day is not None:
+            D.set_setting(cid, SO_DAY_KEY, day)
+        if mins is not None:
+            D.set_setting(cid, SO_TIME_KEY, mins)
+        note = L.t("so.t_when", cid, when=_so_when_text(so_day(cid), so_time(cid), cid))
+    text, markup = _so_panel(chat, note)
+    await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+# ======================================================================================================
 # 2k. /help PAGE 2 ("More Features")
 # ======================================================================================================
 # Page 2 is a grid like page 1 (three buttons in a line, from the top): one short button for every panel built in sections
 # 2d-2j, then nova's own 🌐 Language, 🗑 Delete and ✨ Extras. Groups only for these panels (they need a group). Each button
 # opens the panel through the same callback its own help page uses, so there is one panel per feature, not a copy.
-MORE_PANELS = (("wl", "wl:m"), ("ml", "ml:a:0:0"), ("rd", "rd:m"), ("pb", "pb:p"), ("rp", "rp:p"), ("gr", "gr:m"), ("rg", "rg:q"))
+MORE_PANELS = (("wl", "wl:m"), ("ml", "ml:a:0:0"), ("rd", "rd:m"), ("pb", "pb:p"), ("rp", "rp:p"), ("gr", "gr:m"), ("rg", "rg:q"), ("so", "so:q"))
+
+
+_HELP_PAGE_BUTTONS = {"warn": warn_ladder_button, "flood": raid_button, "locks": probation_button, "reports": report_button,
+                      "greet": greet_button, "rules": gate_button, "log": modlog_button}   # /help page -> the panel button on it
+
+
+def help_buttons(key, chat):
+    """Rows of the newer features' panel buttons that belong on /help page `key` (groups only). nova's help_section_keyboard calls this once."""
+    make = _HELP_PAGE_BUTTONS.get(key)
+    return [[make(chat)]] if make and chat is not None and getattr(chat, "type", "private") != "private" else []
 
 
 def more_buttons(chat):
@@ -4436,6 +4832,7 @@ MODULES = {
     "raids": {"keys": ("auto_raid", "raid_time", "raid_action_time", "raid_mode", "raid_window")},
     "reports": {"keys": ("reports_on", "report_dest", "report_mute", "report_cooldown")},
     "rules": {"keys": ("rules", "rules_private", "rules_button", "rules_gate", "gate_time", "gate_action")},
+    "shoutout": {"keys": ("shout_on", "shout_day", "shout_time", "shout_top", "shout_text", "shout_mention")},
     "translations": {"keys": ()},
     "warns": {"keys": ("warn_limit", "warn_time", "warn_mode", "warn_ladder", "warn_ladder_on")},
 }
@@ -5245,6 +5642,9 @@ def register(app, deps):
     app.add_handler(CommandHandler("raidmode", raidmode_cmd))          # Raid Shield: ban / mute joiners / lock the group
     app.add_handler(CommandHandler("raidwindow", raidwindow_cmd))
     app.add_handler(CallbackQueryHandler(rd_callback, pattern=r"^rd:"))
+    app.add_handler(CommandHandler("shout", shout_cmd))                # Weekly shout-out (top chatters of the week)
+    app.add_handler(CallbackQueryHandler(so_callback, pattern=r"^so:"))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, so_input), group=-12)   # ✏️ Text: the next message
     app.add_handler(CommandHandler("gate", gate_cmd))                  # Rules gate: accept the rules before chatting
     app.add_handler(CallbackQueryHandler(rg_callback, pattern=r"^rg:"))
     app.add_handler(CommandHandler("greet", greet_cmd))                # Greetings: extra buttons, delete-after
