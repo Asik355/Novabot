@@ -113,7 +113,7 @@ UNIQUE_INDEXES = {
     "settings": ["chat_id", "key"], "notes": ["chat_id", "name"], "filters": ["chat_id", "keyword"],
     "blocklist": ["chat_id", "word"], "approved": ["chat_id", "user_id"],
     "allowlist": ["chat_id", "kind", "value"], "captcha_pending": ["chat_id", "user_id"],
-    "rules_gate": ["chat_id", "user_id"], "setlog_pending": ["channel_id"], "super_admins": ["user_id"], "warn_log": ["id"],
+    "rules_gate": ["chat_id", "user_id"], "member_since": ["chat_id", "user_id"], "setlog_pending": ["channel_id"], "super_admins": ["user_id"], "warn_log": ["id"],
     "roast_profiles": ["chat_id", "user_id"], "roast_battles": ["id"], "roast_results": ["id"],
     "roast_votes": ["battle_id", "voter_id"], "court_cases": ["id"],
     "court_votes": ["case_id", "voter_id"], "court_verdicts": ["id"],
@@ -125,7 +125,7 @@ UNIQUE_INDEXES = {
 EXTRA_UNIQUE_INDEXES = {"fun_commands": [["name"]], "fun_gifs": [["command_id", "file_unique_id"]],
                         "fun_aliases": [["name"]]}
 PLAIN_INDEXES = {
-    "warn_log": [["chat_id", "user_id"]], "captcha_pending": [["expires"]], "rules_gate": [["expires"]],
+    "warn_log": [["chat_id", "user_id"]], "captcha_pending": [["expires"]], "rules_gate": [["expires"]], "member_since": [["chat_id", "md"]],
     "roast_battles": [["chat_id"]], "roast_profiles": [["chat_id", "points"]],
     "court_cases": [["chat_id", "case_no"], ["chat_id", "defendant_id"]], "court_verdicts": [["case_id"]],
     "modlog": [["chat_id", "id"]], "notice_pending": [["delete_at"]],
@@ -549,6 +549,34 @@ def gate_take_expired(now):
     return out
 
 
+# ------------------------------------------------------------------ join anniversaries (group.py 2m): when each member joined a group
+def since_put_join(chat_id, user_id, ts, name, md, y):
+    """A member joined: the date is set (a rejoin starts the count again). md = 'MM-DD', y = the year, in the bot's time zone."""
+    col("member_since").update_one({"chat_id": int(chat_id), "user_id": int(user_id)},
+                                   {"$set": {"ts": int(ts), "md": md, "y": int(y), "name": (name or "")[:60], "src": "join"}}, upsert=True)
+
+
+def since_put_seen(chat_id, user_id, ts, name, md, y):
+    """A member the bot had never seen wrote something: that day counts as their date, but only when there is no date yet."""
+    col("member_since").update_one({"chat_id": int(chat_id), "user_id": int(user_id)},
+                                   {"$setOnInsert": {"ts": int(ts), "md": md, "y": int(y), "name": (name or "")[:60], "src": "seen"}}, upsert=True)
+
+
+def since_delete(chat_id, user_id):
+    col("member_since").delete_one({"chat_id": int(chat_id), "user_id": int(user_id)})
+
+
+def since_on_day(chat_id, mds, before_year, limit=30):
+    """[(user_id, name, year)] of the members whose join day is one of `mds` ('MM-DD' strings) in an earlier year, longest members first."""
+    rows = col("member_since").find({"chat_id": int(chat_id), "md": {"$in": list(mds)}, "y": {"$lt": int(before_year)}},
+                                    sort=[("y", 1), ("ts", 1)], limit=max(1, int(limit)))
+    return [(r["user_id"], r.get("name") or "", r["y"]) for r in rows]
+
+
+def since_count(chat_id):
+    return col("member_since").count_documents({"chat_id": int(chat_id)})
+
+
 # ------------------------------------------------------------------ log-channel handshake
 def setlog_put(channel_id, message_id, ts):
     channel_id = int(channel_id)
@@ -953,7 +981,7 @@ def probation_total(chat_id):
 # ------------------------------------------------------------------ group -> supergroup migration
 CHAT_COLLECTIONS = ("settings", "warn_log", "notes", "filters", "blocklist", "approved", "allowlist",
                     "captcha_pending", "roast_profiles", "roast_battles", "roast_results", "roast_votes",
-                    "court_cases", "court_votes", "court_verdicts", "modlog", "probation", "rules_gate")
+                    "court_cases", "court_votes", "court_verdicts", "modlog", "probation", "rules_gate", "member_since")
 
 
 def migrate_chat(old_id, new_id):

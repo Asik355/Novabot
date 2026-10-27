@@ -5,6 +5,7 @@ group.py: all group-management logic in ONE file (merged from autoclose.py, clea
                       (+ the 🕒 Auto Close and ⌨️ Command buttons on /help > Auto Close: hour, minute, AM/PM pickers)
   NIGHT MODE          /night 11pm 6am   /night off   /night   (text-only at night; /help > Night Mode page)
   APPEAL              /appeal [on|off|group|log|dm]   (📩 Appeal button on mute / warn notices; OFF by default)
+  ANNIVERSARY         /anniv [on|off|9am|text <message>|reset|old on|off|now]   (join anniversaries; birthdays stay in fun_systems.py)
   SHOUT-OUT           /shout [on|off|sun 9pm|top 5|text <message>|reset|mention on|off|now]   (weekly top chatters, written by the admins)
   RULES GATE          /gate [on|off|<time>|kick|mute|ban]   (new members must accept the rules before they can chat)
   GREETINGS           /greet, /wdel <time|off>, /gdel, /wbtn <text> <link>, /gbtn   (extra buttons and delete-after for welcome / goodbye)
@@ -348,7 +349,8 @@ async def run_once(bot):
                       ("night mode", _night_round(bot, now)),       # Night Mode (section 2b) uses the same loop
                       ("raid shield", _raid_round(bot)),            # Raid Shield (section 2f): lifts the lock when the raid is over
                       ("rules gate", _gate_round(bot)),             # Rules gate (section 2j): members who didn't accept in time
-                      ("shout-out", _shout_round(bot))):            # Weekly shout-out (section 2l)
+                      ("shout-out", _shout_round(bot)),             # Weekly shout-out (section 2l)
+                      ("anniversaries", _anniv_round(bot))):        # Join anniversaries (section 2m)
         try:
             await job
         except asyncio.CancelledError:
@@ -4189,12 +4191,353 @@ async def shout_cmd(update, context):
 
 
 # ======================================================================================================
+# 2m. JOIN ANNIVERSARIES  (birthdays already have their own system in fun_systems.py: 🎂 Birthday)
+# ======================================================================================================
+# On the day a member joined (every year after the first) the bot posts ONE short thank-you for everybody who has an anniversary
+# that day, in the admins' own words. Where the date comes from (collection "member_since", store.since_*):
+#   * every join the bot sees (handler group 106) sets the date (leaving deletes it, a rejoin starts again);
+#   * people who were already here have no join date: with `anniv_seen` ON (default) the first message the bot sees from them
+#     (handler group 107, checked once per member per run) counts as their date. A join date is never replaced by a seen date.
+# Settings: anniv_on "on"|"off" (default off) · anniv_time minutes after midnight in BOT_TIMEZONE (default 9 AM) · anniv_text (own text,
+# empty = built-in) · anniv_seen "on"|"off" · anniv_last = the day already posted. The 30-second loop (run_once -> _anniv_round) posts it.
+# Text placeholders: {group} {date} {count} {list} (one line per member: mention and years). A 29 Feb join is celebrated on 28 Feb
+# in years that have no 29 Feb. Panel: /help page 2 > 🎖 Anniversary (callbacks "an:..."), or /anniv:
+#   /anniv  |  on | off  |  9am  |  text <message>  |  reset  |  old on|off  |  now
+AN_KEY, AN_TIME_KEY, AN_TEXT_KEY, AN_SEEN_KEY, AN_LAST_KEY = "anniv_on", "anniv_time", "anniv_text", "anniv_seen", "anniv_last"
+AN_TIME_DEFAULT = 9 * 60
+AN_TIMES = (540, 720, 1080, 1260)
+AN_MAX_TEXT, AN_MAX_LINES, AN_PREVIEW_SECS, AN_PENDING_SECS, AN_KNOWN_MAX = 1500, 20, 60, 300, 50000
+_AN_TOKEN = re.compile(r"\{(group|date|count|list)\}")
+_an_known = set()       # (chat_id, user_id) whose join / first-seen date was already written during this run
+_an_pending = {}        # (chat_id, admin id) -> {"panel": (chat id, message id), "until": monotonic time}
+_an_origin = {}         # (chat_id, panel message id) -> True: opened from /help page 2 (the only way in, so Back goes there)
+
+
+def _local_today():
+    return datetime.now(_tz()).date()
+
+
+def an_on(chat_id):
+    return D.get_setting(chat_id, AN_KEY, "off") == "on"
+
+
+def an_time(chat_id):
+    mins = _num_setting(chat_id, AN_TIME_KEY, AN_TIME_DEFAULT)
+    return mins if 0 <= mins < 1440 else AN_TIME_DEFAULT
+
+
+def an_seen_on(chat_id):
+    return D.get_setting(chat_id, AN_SEEN_KEY, "on") == "on"
+
+
+def an_text(chat_id):
+    return str(D.get_setting(chat_id, AN_TEXT_KEY, "") or "")[:AN_MAX_TEXT]
+
+
+def _an_md_y(ts):
+    d = datetime.fromtimestamp(ts, _tz())
+    return f"{d.month:02d}-{d.day:02d}", d.year
+
+
+def _an_mds(today):
+    """The 'MM-DD' join days celebrated on `today` (29 Feb joiners on 28 Feb in years without a 29 Feb)."""
+    leap = today.year % 4 == 0 and (today.year % 100 != 0 or today.year % 400 == 0)
+    return ["02-28", "02-29"] if (today.month, today.day) == (2, 28) and not leap else [f"{today.month:02d}-{today.day:02d}"]
+
+
+def _an_name(user):
+    return (getattr(user, "full_name", None) or getattr(user, "first_name", None) or "")[:60]
+
+
+# ------------------------------------------------------------------ recording the dates
+async def anniv_members(update, context):
+    """group=106: a member joined (their date is set) or left (their date is deleted)."""
+    msg, chat = update.effective_message, update.effective_chat
+    if not msg or chat.type == "private":
+        return
+    now = int(time.time())
+    for user in msg.new_chat_members or []:
+        if not user.is_bot:
+            md, year = _an_md_y(now)
+            await asyncio.to_thread(store.since_put_join, chat.id, user.id, now, _an_name(user), md, year)
+            _an_known.add((chat.id, user.id))
+    left = getattr(msg, "left_chat_member", None)
+    if left is not None and not left.is_bot:
+        await asyncio.to_thread(store.since_delete, chat.id, left.id)
+        _an_known.discard((chat.id, left.id))
+
+
+async def anniv_seen(update, context):
+    """group=107, cheap: the first message of a member the bot has no date for gives them one (only where Anniversary is ON)."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user or user.is_bot or chat.type == "private" or not an_on(chat.id) or not an_seen_on(chat.id):
+        return
+    key = (chat.id, user.id)
+    if key in _an_known:
+        return
+    if len(_an_known) > AN_KNOWN_MAX:
+        _an_known.clear()
+    _an_known.add(key)
+    now = int(time.time())
+    md, year = _an_md_y(now)
+    await asyncio.to_thread(store.since_put_seen, chat.id, user.id, now, _an_name(user), md, year)
+
+
+# ------------------------------------------------------------------ the post
+def an_render(chat_id, title, people, today):
+    """people: [(user_id, name, years)], longest members first."""
+    def years_text(n):
+        return L.t("an.year_1" if n == 1 else "an.year_n", chat_id, n=n)
+
+    lines = [f'🎖 <a href="tg://user?id={uid}">{html.escape((name or "").strip()[:32] or L.t("mc.user_n", chat_id, uid=uid))}</a> - {years_text(years)}'
+             for uid, name, years in people[:AN_MAX_LINES]]
+    if len(people) > AN_MAX_LINES:
+        lines.append(L.t("an.more", chat_id, n=len(people) - AN_MAX_LINES))
+    vals = {"group": html.escape(title or ""), "date": f"{today.day} {today.strftime('%b')}", "count": str(len(people)), "list": "\n".join(lines)}
+    return _AN_TOKEN.sub(lambda m: vals[m.group(1)], an_text(chat_id) or L.t("an.default", chat_id))
+
+
+async def anniv_post(bot, chat_id, today=None, sample_user=None, delete_after=None):
+    """Posts today's anniversaries. Returns "sent", "empty" (none today), "sample" (none today, an example was posted for `sample_user`) or "error"."""
+    today = today or _local_today()
+    try:
+        rows = await asyncio.to_thread(store.since_on_day, chat_id, _an_mds(today), today.year, AN_MAX_LINES + 10)
+    except Exception:
+        log.exception("anniversary: couldn't read the dates of %s", chat_id)
+        return "error"
+    people = []
+    for uid, name, year in rows:
+        try:
+            member = await bot.get_chat_member(chat_id, uid)
+            if member.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+                await asyncio.to_thread(store.since_delete, chat_id, uid)          # not in the group any more
+                continue
+            name = _an_name(getattr(member, "user", None)) or name
+        except TelegramError:
+            pass                                                                    # can't check: keep them
+        people.append((uid, name, today.year - year))
+    sample = False
+    if not people:
+        if sample_user is None:
+            return "empty"
+        people, sample = [(sample_user.id, _an_name(sample_user), 2)], True
+    try:
+        title = (await bot.get_chat(chat_id)).title
+    except TelegramError:
+        title = ""
+    try:
+        sent = await D.safe_html(functools.partial(bot.send_message, chat_id, disable_web_page_preview=True), an_render(chat_id, title, people, today))
+    except TelegramError as e:
+        log.warning("anniversary: couldn't post in %s: %s", chat_id, e)
+        return "error"
+    if delete_after and sent is not None:
+        await extra.track_notice(sent, delete_after)
+    return "sample" if sample else "sent"
+
+
+async def _anniv_round(bot):
+    """Part of run_once (every 30 seconds): posts today's anniversaries once, after the chosen time."""
+    for chat_id, value in await asyncio.to_thread(_scheduled_groups, AN_KEY):
+        try:
+            if value != "on" or chat_id >= 0 or D.is_paused(chat_id):
+                continue
+            today = _local_today()
+            if _now_minutes() < an_time(chat_id) or D.get_setting(chat_id, AN_LAST_KEY, "") == today.isoformat():
+                continue
+            if time.monotonic() < _retry_at.get((chat_id, "anniv"), 0):
+                continue
+            if await anniv_post(bot, chat_id, today) == "error":
+                _retry_at[(chat_id, "anniv")] = time.monotonic() + RETRY_AFTER      # try again in a few minutes
+            else:
+                D.set_setting(chat_id, AN_LAST_KEY, today.isoformat())              # "sent" or "empty": today is done
+        except Exception:
+            log.exception("anniversary: the round failed for %s", chat_id)
+
+
+# ------------------------------------------------------------------ the panel
+def anniv_button(chat):
+    return InlineKeyboardButton(L.t("mo.b_an", getattr(chat, "id", None)), callback_data="an:q")
+
+
+def _an_panel(chat, note=""):
+    cid = getattr(chat, "id", None)
+    if chat is None or chat.type == "private":
+        return L.t("an.private", cid), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]])
+    on, when, seen, custom = an_on(cid), an_time(cid), an_seen_on(cid), an_text(cid)
+    try:
+        known = store.since_count(cid)
+    except Exception:
+        known = 0
+    text = (L.t("an.title", cid) + "\n\n" + (note + "\n\n" if note else "") + L.t("an.intro", cid) + "\n\n" +
+            L.t("an.status_on" if on else "an.status_off", cid) + "\n" + L.t("an.when", cid, time=fmt_12h(when), tz=_tz_label(cid)) + "\n" +
+            L.t("an.known", cid, n=known) + "\n" + L.t("an.seen_on" if seen else "an.seen_off", cid) + "\n" +
+            (L.t("an.text_custom", cid, n=len(custom)) if custom else L.t("an.text_default", cid)) + "\n\n" + L.t("an.note", cid))
+    mark = lambda cond: "✅ " if cond else ""
+    rows = _pairs([InlineKeyboardButton(L.t("an.btn_off" if on else "an.btn_on", cid), callback_data="an:t"),
+                   InlineKeyboardButton(L.t("an.btn_preview", cid), callback_data="an:v")])
+    rows += _pairs([InlineKeyboardButton(mark(m == when) + "🕘 " + fmt_12h(m), callback_data=f"an:h:{m}") for m in AN_TIMES])
+    rows += _pairs([InlineKeyboardButton(L.t("an.btn_text", cid), callback_data="an:x"), InlineKeyboardButton(L.t("an.btn_default", cid), callback_data="an:r"),
+                    InlineKeyboardButton(L.t("an.btn_seen_off" if seen else "an.btn_seen_on", cid), callback_data="an:s"),
+                    InlineKeyboardButton(L.t("an.btn_now", cid), callback_data="an:g")])
+    rows.append([InlineKeyboardButton(L.t("an.btn_cmd", cid), callback_data="an:c")])
+    rows.append([InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:more")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _an_command_page(chat=None):
+    cid = getattr(chat, "id", None)
+    return (L.t("an.cmd_page", cid, tz=_tz_label(cid)), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="an:q")]]))
+
+
+def _an_result_note(chat_id, result):
+    return L.t({"sent": "an.t_sent", "sample": "an.t_sample", "empty": "an.t_empty"}.get(result, "an.t_error"), chat_id)
+
+
+async def an_callback(update, context):
+    """\"an:q\" panel, \"an:t\" on/off, \"an:h:<minutes>\" time, \"an:s\" count people who were here before, \"an:v\" preview, \"an:g\" post today's now,
+    \"an:x\" write the text, \"an:r\" built-in text, \"an:c\" commands. Admins only (\"an:c\" is just information)."""
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    if chat is None:
+        await q.answer()
+        return
+    if await extra.menu_not_owner(q):
+        return
+    parts = (q.data or "").split(":")[1:]
+    act, arg = (parts[0] if parts else ""), (parts[1] if len(parts) == 2 else None)
+    if parts == ["c"]:
+        await q.answer()
+        await _ac_edit(q, *_an_command_page(chat))
+        return
+    if chat.type == "private":
+        await q.answer(L.t("an.private"), show_alert=True)
+        return
+    cid = chat.id
+    if not await _ac_allowed(chat, q.from_user.id):
+        await q.answer(L.t("an.admin_only", cid), show_alert=True)
+        return
+    num = _ac_num(arg, 0, 10 ** 7) if arg is not None else None
+    toast = None
+    try:
+        if parts in (["p"], ["q"]):
+            pass
+        elif parts == ["t"]:
+            on = not an_on(cid)
+            D.set_setting(cid, AN_KEY, "on" if on else "off")
+            toast = L.t("an.t_on" if on else "an.t_off", cid)
+        elif act == "h" and num in AN_TIMES:
+            D.set_setting(cid, AN_TIME_KEY, num)
+            toast = L.t("an.t_time", cid, time=fmt_12h(num))
+        elif parts == ["s"]:
+            seen = not an_seen_on(cid)
+            D.set_setting(cid, AN_SEEN_KEY, "on" if seen else "off")
+            toast = L.t("an.t_seen_on" if seen else "an.t_seen_off", cid)
+        elif parts == ["r"]:
+            D.set_setting(cid, AN_TEXT_KEY, "")
+            toast = L.t("an.t_reset", cid)
+        elif parts in (["v"], ["g"]):
+            preview = parts == ["v"]
+            result = await anniv_post(context.bot, cid, sample_user=q.from_user if preview else None, delete_after=AN_PREVIEW_SECS if preview else None)
+            await q.answer(_an_result_note(cid, result), show_alert=result in ("empty", "error", "sample"))
+            return
+        elif parts == ["x"]:
+            _an_pending[(cid, q.from_user.id)] = {"panel": (cid, q.message.message_id), "until": time.monotonic() + AN_PENDING_SECS}
+            await q.answer(L.t("an.t_ask", cid))
+            await chat.send_message(L.t("an.ask", cid, user=q.from_user.mention_html(), max=AN_MAX_TEXT), parse_mode="HTML")
+            return
+        else:
+            await q.answer(L.t("an.invalid", cid), show_alert=True)
+            return
+        await q.answer(toast)
+        await _ac_edit(q, *_an_panel(chat))
+    except Exception:
+        log.exception("anniversary: panel action failed in %s", cid)
+        await q.answer(L.t("ac.db_problem", cid), show_alert=True)
+
+
+async def an_input(update, context):
+    """group=-13, cheap: only acts when the admin tapped ✏️ Text and now sends the message (or "cancel" / "default")."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user or not _an_pending:
+        return
+    key = (chat.id, user.id)
+    pending = _an_pending.get(key)
+    if pending is None:
+        return
+    if time.monotonic() > pending["until"] or not await D.is_admin(chat, user.id):
+        _an_pending.pop(key, None)
+        return
+    text = (msg.text or "").strip()
+    if text.lower() in ("cancel", "stop"):
+        _an_pending.pop(key, None)
+        await _rp_note(msg, "an.t_cancel", 10)
+        raise ApplicationHandlerStop
+    if len(text) > AN_MAX_TEXT:
+        await _rp_note(msg, "an.err_long", 15, max=AN_MAX_TEXT)
+        raise ApplicationHandlerStop
+    _an_pending.pop(key, None)
+    D.set_setting(chat.id, AN_TEXT_KEY, "" if text.lower() == "default" else text)
+    try:
+        await msg.delete()
+    except TelegramError:
+        pass
+    try:
+        panel_chat, panel_id = pending["panel"]
+        screen, kb = _an_panel(chat, L.t("an.t_saved", chat.id))
+        await context.bot.edit_message_text(screen, chat_id=panel_chat, message_id=panel_id, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+    except TelegramError:
+        await _rp_note(msg, "an.t_saved", 10)
+    raise ApplicationHandlerStop
+
+
+async def anniv_cmd(update, context):
+    """/anniv  |  on | off  |  9am  |  text <message>  |  reset  |  old on|off  |  now"""
+    if not await D.group_only(update):
+        return
+    chat, msg, args, note = update.effective_chat, update.effective_message, list(context.args or []), ""
+    cid, first = chat.id, (args[0].lower() if args else "")
+    if not args:
+        pass
+    elif first in ("on", "off") and len(args) == 1:
+        D.set_setting(cid, AN_KEY, first)
+        note = L.t("an.t_on" if first == "on" else "an.t_off", cid)
+    elif first == "reset" and len(args) == 1:
+        D.set_setting(cid, AN_TEXT_KEY, "")
+        note = L.t("an.t_reset", cid)
+    elif first == "now" and len(args) == 1:
+        note = _an_result_note(cid, await anniv_post(context.bot, cid))
+    elif first == "old" and len(args) == 2 and args[1].lower() in ("on", "off"):
+        D.set_setting(cid, AN_SEEN_KEY, args[1].lower())
+        note = L.t("an.t_seen_on" if args[1].lower() == "on" else "an.t_seen_off", cid)
+    elif first == "text":
+        raw = (msg.text or "").split(None, 2)                 # keeps the admin's line breaks
+        value = raw[2].strip() if len(raw) == 3 else ""
+        if not value:
+            await msg.reply_html(L.t("an.usage", cid))
+            return
+        if len(value) > AN_MAX_TEXT:
+            await msg.reply_html(L.t("an.err_long", cid, max=AN_MAX_TEXT))
+            return
+        D.set_setting(cid, AN_TEXT_KEY, value)
+        note = L.t("an.t_saved", cid)
+    else:
+        day, mins, ok = _so_parse_when(args)
+        if not ok or day is not None or mins is None:
+            await msg.reply_html(L.t("an.usage", cid))
+            return
+        D.set_setting(cid, AN_TIME_KEY, mins)
+        note = L.t("an.t_time", cid, time=fmt_12h(mins))
+    text, markup = _an_panel(chat, note)
+    await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+# ======================================================================================================
 # 2k. /help PAGE 2 ("More Features")
 # ======================================================================================================
 # Page 2 is a grid like page 1 (three buttons in a line, from the top): one short button for every panel built in sections
 # 2d-2j, then nova's own 🌐 Language, 🗑 Delete and ✨ Extras. Groups only for these panels (they need a group). Each button
 # opens the panel through the same callback its own help page uses, so there is one panel per feature, not a copy.
-MORE_PANELS = (("wl", "wl:m"), ("ml", "ml:a:0:0"), ("rd", "rd:m"), ("pb", "pb:p"), ("rp", "rp:p"), ("gr", "gr:m"), ("rg", "rg:q"), ("so", "so:q"))
+MORE_PANELS = (("wl", "wl:m"), ("ml", "ml:a:0:0"), ("rd", "rd:m"), ("pb", "pb:p"), ("rp", "rp:p"), ("gr", "gr:m"), ("rg", "rg:q"), ("so", "so:q"), ("an", "an:q"))
 
 
 _HELP_PAGE_BUTTONS = {"warn": warn_ladder_button, "flood": raid_button, "locks": probation_button, "reports": report_button,
@@ -4833,6 +5176,7 @@ MODULES = {
     "reports": {"keys": ("reports_on", "report_dest", "report_mute", "report_cooldown")},
     "rules": {"keys": ("rules", "rules_private", "rules_button", "rules_gate", "gate_time", "gate_action")},
     "shoutout": {"keys": ("shout_on", "shout_day", "shout_time", "shout_top", "shout_text", "shout_mention")},
+    "anniversary": {"keys": ("anniv_on", "anniv_time", "anniv_text", "anniv_seen")},
     "translations": {"keys": ()},
     "warns": {"keys": ("warn_limit", "warn_time", "warn_mode", "warn_ladder", "warn_ladder_on")},
 }
@@ -5642,6 +5986,11 @@ def register(app, deps):
     app.add_handler(CommandHandler("raidmode", raidmode_cmd))          # Raid Shield: ban / mute joiners / lock the group
     app.add_handler(CommandHandler("raidwindow", raidwindow_cmd))
     app.add_handler(CallbackQueryHandler(rd_callback, pattern=r"^rd:"))
+    app.add_handler(CommandHandler("anniv", anniv_cmd))                # Join anniversaries
+    app.add_handler(CallbackQueryHandler(an_callback, pattern=r"^an:"))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, an_input), group=-13)    # ✏️ Text: the next message
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.StatusUpdate.LEFT_CHAT_MEMBER, anniv_members), group=106)   # join date
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, anniv_seen), group=107)        # first message of people already here
     app.add_handler(CommandHandler("shout", shout_cmd))                # Weekly shout-out (top chatters of the week)
     app.add_handler(CallbackQueryHandler(so_callback, pattern=r"^so:"))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, so_input), group=-12)   # ✏️ Text: the next message
