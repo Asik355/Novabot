@@ -88,6 +88,9 @@ _busy: set = set()
 _ops: dict = {}                          # token -> pending confirm
 _inputs: dict = {}                       # user id -> what the bot waits for next
 _auto_pick: dict = {}                    # user id -> files found for a directly uploaded file (waiting for a tap)
+_sel: dict = {}                          # user id -> "owner/repo" the person is working inside (/gitrepo)
+SEL_MAX = 2000
+GET_MAX = 10                             # files sent at once by /gitget
 
 
 class GitError(Exception):
@@ -337,6 +340,12 @@ def api_tree(token: str, o: str, n: str, branch: str) -> tuple:
     return {t["path"]: t["sha"] for t in j.get("tree", []) if t.get("type") == "blob"}, bool(j.get("truncated"))
 
 
+def api_tree_sizes(token: str, o: str, n: str, branch: str) -> tuple:
+    """({path: size in bytes}, truncated) of the branch."""
+    j = _call(token, "GET", f"/repos/{o}/{n}/git/trees/{_q(branch)}", params={"recursive": "1"}).json()
+    return {t["path"]: int(t.get("size") or 0) for t in j.get("tree", []) if t.get("type") == "blob"}, bool(j.get("truncated"))
+
+
 def api_push_files(token: str, o: str, n: str, branch: str, files: dict, message: str) -> str:
     """One commit with all `files` ({path: bytes}) on top of `branch` (Git Data API). Returns the commit sha."""
     base = f"/repos/{o}/{n}/git"
@@ -428,6 +437,34 @@ def plan_push(files: dict, remote: dict, truncated: bool) -> tuple:
         else:
             changed.append(path)
     return new, changed, same
+
+
+def render_tree(full: str, branch: str, sizes: dict, folder: str = "", truncated: bool = False) -> str:
+    """The text of the file-list document: folders first, files with their size."""
+    base = folder.strip("/")
+    items = {p: s for p, s in sizes.items() if not base or p.startswith(base + "/")}
+    root: dict = {}
+    for p, s in items.items():
+        parts = (p[len(base) + 1:] if base else p).split("/")
+        node = root
+        for part in parts[:-1]:
+            node = node.setdefault(part + "/", {})
+        node[parts[-1]] = s
+    lines = [f"{full} (branch {branch})" + (f" / {base}" if base else ""),
+             f"{len(items)} files, {_fmt_size(sum(items.values()))}", ""]
+
+    def walk(node: dict, indent: str) -> None:
+        for k in sorted(node, key=lambda x: (not x.endswith("/"), x.lower())):
+            v = node[k]
+            if isinstance(v, dict):
+                lines.append(f"{indent}\U0001F4C1 {k}")
+                walk(v, indent + "    ")
+            else:
+                lines.append(f"{indent}\U0001F4C4 {k} ({_fmt_size(v)})")
+    walk(root, "")
+    if truncated:
+        lines += ["", "(GitHub cut this list short, so some files are not shown.)"]
+    return "\n".join(lines)
 
 
 def diff_summary(old: str, new: str, max_lines: int = 24, max_chars: int = 1500) -> tuple:
@@ -550,6 +587,31 @@ def _args_repo(context, n: int = 1) -> Optional[tuple]:
     return (*rp, *a[1:]) if rp and len(a) >= n else None
 
 
+def _sel_set(uid: int, full: str) -> None:
+    if uid not in _sel and len(_sel) >= SEL_MAX:
+        _sel.pop(next(iter(_sel)))
+    _sel[uid] = full
+
+
+def _inrepo(uid: int, cid: Any) -> str:
+    """'You are inside owner/repo' line for the top of a reply (empty when no repo is open)."""
+    full = _sel.get(uid)
+    return _t("gt.in_repo", cid, repo=html.escape(full)) + "\n\n" if full else ""
+
+
+def _target(uid: int, args: list) -> Optional[tuple]:
+    """(owner, repo, rest, inside) from 'owner/repo rest...' or, inside an opened repo, from the file names alone.
+    A first word like src/nova.py counts as a repo only when no repo is open or its owner is the owner of the open repo."""
+    sel = _sel.get(uid)
+    rp = parse_repo(args[0]) if args else None
+    if rp and (not sel or rp[0].lower() == sel.split("/")[0].lower()):
+        return rp[0], rp[1], list(args[1:]), False
+    if sel:
+        o, n = sel.split("/")
+        return o, n, list(args), True
+    return None
+
+
 async def _download_tg(bot, doc, limit: int) -> bytes:
     if (getattr(doc, "file_size", 0) or 0) > limit:
         raise GitError("gt.tg_big", mb=limit // MB)
@@ -638,6 +700,7 @@ async def removegittoken_cmd(update, context):
     msg, uid, _ = g
     had = bool(_D.get_setting(uid, TOKEN_KEY, ""))
     forget_token(uid)
+    _sel.pop(uid, None)
     _inputs.pop(uid, None)
     for t in [t for t, p in _ops.items() if p["uid"] == uid]:
         _ops.pop(t, None)
@@ -682,10 +745,22 @@ async def gitrepoinfo_cmd(update, context):
     if not g:
         return
     msg, uid, token = g
-    a = _args_repo(context)
-    if not a:
+    args = context.args or []
+    sel = _sel.get(uid)
+    rp = parse_repo(args[0]) if args else (parse_repo(sel) if sel else None)
+    if args and not rp:                                         # /gitinfo novabot: find the repo by its name
+        hits = _pick_repos(await _run(api_all_repos, token), args[0][:100])
+        if len(hits) > 1:
+            await _say(msg, _t("gt.rp_many", msg.chat.id, list=_code_list(r["name"] for r in hits)))
+            return
+        rp = parse_repo(hits[0].get("full_name", "")) if hits else None
+        if not rp:
+            await _say(msg, _t("gt.rp_none", msg.chat.id, q=html.escape(args[0][:100])))
+            return
+    if not rp:
         await _say(msg, _t("gt.use_repoinfo", msg.chat.id))
         return
+    a = rp
     r = await _run(api_repo, token, a[0], a[1])
     lic = (r.get("license") or {}).get("spdx_id") or "-"
     await _say(msg, _t("gt.repoinfo", msg.chat.id, name=html.escape(r.get("full_name", "?")),
@@ -702,24 +777,20 @@ async def gitrepofiles_cmd(update, context):
     if not g:
         return
     msg, uid, token = g
-    a = _args_repo(context)
-    if not a:
-        await _say(msg, _t("gt.use_repofiles", msg.chat.id))
-        return
-    path = safe_path(a[2], allow_empty=True) if len(a) > 2 else ""
-    if path is None:
-        await _say(msg, _t("gt.bad_path", msg.chat.id))
-        return
-    items = await _run(api_contents, token, a[0], a[1], path)
     cid = msg.chat.id
-    if isinstance(items, dict):
-        await _say(msg, _t("gt.is_file", cid, path=html.escape(path), size=_fmt_size(int(items.get("size", 0)))))
+    tgt = _target(uid, context.args or [])
+    if not tgt:                                                 # /gitls alone: pick a repo first
+        await _ask_repo(msg, uid, token, "ls")
         return
-    items = sorted(items, key=lambda x: (x.get("type") != "dir", x.get("name", "").lower()))
-    lines = [("📁 " if x.get("type") == "dir" else "📄 ") + html.escape(x.get("name", "?")) +
-             ("" if x.get("type") == "dir" else f" ({_fmt_size(int(x.get('size', 0)))})") for x in items[:60]]
-    more = _t("gt.more_items", cid, n=len(items) - 60) if len(items) > 60 else ""
-    await _say(msg, _t("gt.files_head", cid, repo=f"{a[0]}/{a[1]}", path=html.escape(path or "/")) + "\n\n" + "\n".join(lines) + more)
+    o, n, rest, inside = tgt
+    path = safe_path(rest[0], allow_empty=True) if rest else ""
+    if path is None:
+        await _say(msg, _t("gt.bad_path", cid))
+        return
+    full = f"{o}/{n}"
+    if not inside:
+        _sel_set(uid, full)                                     # typing the repo opens it, so the buttons below work
+    await _send_filelist(context.bot, cid, token, full, folder=path)
 
 
 @_guarded
@@ -759,6 +830,217 @@ async def gitdeleterepo_cmd(update, context):
     await _say(msg, _t("gt.delrepo_ask", cid, name=html.escape(full), secs=DELETE_SECS))
 
 
+# ================================================================== B2. open a repo once, then work with file names only
+async def _repo_files(token: str, o: str, n: str) -> tuple:
+    """({path: sha}, truncated) of the default branch; an empty repo gives an empty tree."""
+    info = await _run(api_repo, token, o, n)
+    try:
+        return await _run(api_tree, token, o, n, info.get("default_branch") or "main")
+    except GitError as e:
+        if e.key not in ("gt.e_404", "gt.e_409"):
+            raise
+        return {}, False
+
+
+async def _send_filelist(bot, cid, token: str, full: str, branch: str = "", folder: str = "") -> tuple:
+    """Sends the file list of a repo (or one folder) as a .txt document with download buttons. Returns (sorted paths, branch)."""
+    o, n = full.split("/")
+    if not branch:
+        branch = (await _run(api_repo, token, o, n)).get("default_branch") or "main"
+    try:
+        sizes, cut = await _run(api_tree_sizes, token, o, n, branch)
+    except GitError as e:
+        if e.key not in ("gt.e_404", "gt.e_409"):               # an empty repo has no tree yet
+            raise
+        sizes, cut = {}, False
+    files = sorted(sizes, key=str.lower)
+    name = html.escape(full)
+    if folder and folder in sizes:
+        await bot.send_message(cid, _t("gt.is_file", cid, path=html.escape(folder), size=_fmt_size(sizes[folder])), parse_mode="HTML")
+        return files, branch
+    shown = [p for p in files if not folder or p.startswith(folder + "/")]
+    if not shown:
+        await bot.send_message(cid, _t("gt.ls_none", cid, repo=name, path=html.escape(folder or "/")), parse_mode="HTML")
+        return files, branch
+    buf = io.BytesIO(render_tree(full, branch, sizes, folder, cut).encode("utf-8"))
+    buf.name = f"{n}-files.txt"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(_t("gt.btn_dlfile", cid), callback_data="gt:dl")],
+                               [InlineKeyboardButton(_t("gt.btn_dlzip", cid), callback_data="gt:dz")]])
+    await bot.send_document(cid, buf, filename=buf.name, caption=_t("gt.ls_cap", cid, repo=name, n=len(shown))[:1000],
+                            parse_mode="HTML", reply_markup=kb)
+    return files, branch
+
+
+async def _enter_repo(msg, bot, uid, token, repo: dict, then: str = "") -> None:
+    """Opens the repo for this person, says where they are, sends the file list, then starts the step that asked for it."""
+    cid = msg.chat.id
+    rp = parse_repo(repo.get("full_name", ""))
+    if rp is None:
+        raise GitError("gt.e_404")
+    full = f"{rp[0]}/{rp[1]}"
+    _inputs.pop(uid, None)
+    _sel_set(uid, full)
+    await _say(msg, _t("gt.in_now", cid, repo=html.escape(full)))
+    if then == "zip":
+        await _send_zip(bot, cid, uid, token, rp[0], rp[1])
+        return
+    files, _branch = await _send_filelist(bot, cid, token, full, repo.get("default_branch") or "")
+    if then == "push":
+        _wait_for(uid, "pushzip", repo=full, branch="", update=False)
+        await _say(msg, _t("gt.push_wait", cid, repo=html.escape(full), mb=MAX_TG_DOWNLOAD // MB))
+    elif then == "put":
+        _wait_for(uid, "pickfile", repo=full, files=files)
+        await _say(msg, _t("gt.put_ask", cid))
+    elif then == "get":
+        _wait_for(uid, "getfiles", repo=full)
+        await _say(msg, _t("gt.get_ask", cid, max=GET_MAX))
+
+
+async def _choose_sel(msg, bot, uid, token, q: str, then: str = "") -> None:
+    """The person typed a repo name: open it, or ask again when there are none or several."""
+    cid = msg.chat.id
+    repos = await _run(api_all_repos, token)
+    hits = _pick_repos(repos, q)
+    if len(hits) == 1:
+        await _enter_repo(msg, bot, uid, token, hits[0], then)
+        return
+    _wait_for(uid, "selrepo", then=then)
+    if hits:
+        await _say(msg, _t("gt.rp_many", cid, list=_code_list(r["name"] for r in hits)))
+        return
+    names = {r.get("name", "").lower(): r.get("name", "") for r in repos}
+    close = [names[c] for c in difflib.get_close_matches(q.lower(), list(names), n=3, cutoff=0.5)]
+    hint = _t("gt.rp_hint", cid, list=_code_list(close or names.values(), 10)) if names else ""
+    await _say(msg, _t("gt.rp_none", cid, q=html.escape(q)) + hint)
+
+
+async def _ask_repo(msg, uid, token, then: str = "") -> None:
+    """Shows the person's repos and waits for the name of the one to open."""
+    cid = msg.chat.id
+    repos = await _run(api_all_repos, token)
+    if not repos:
+        await _say(msg, _t("gt.repos_empty", cid))
+        return
+    _wait_for(uid, "selrepo", then=then)
+    more = _t("gt.sel_more", cid, n=len(repos) - 25) if len(repos) > 25 else ""
+    await _say(msg, _t("gt.sel_ask", cid, list="\n".join(_repo_line(r) for r in repos[:25]), more=more))
+
+
+@_guarded
+async def gitselect_cmd(update, context):
+    g = await _gate(update)
+    if not g:
+        return
+    msg, uid, token = g
+    q = " ".join(context.args or []).strip()[:100]
+    if q:
+        await _choose_sel(msg, context.bot, uid, token, q)
+        return
+    sel = _sel.get(uid)
+    if sel:
+        await _say(msg, _t("gt.in_cur", msg.chat.id, repo=html.escape(sel)))
+        return
+    await _ask_repo(msg, uid, token)
+
+
+def _panel_markup(cid) -> InlineKeyboardMarkup:
+    btn = lambda key, data: InlineKeyboardButton(_t(key, cid), callback_data=data)
+    return InlineKeyboardMarkup([
+        [btn("gt.btn_guide", "gt:g"), btn("gt.btn_cmds", "gt:c")], [btn("gt.btn_repos", "gt:rp:1"), btn("gt.btn_status", "gt:s")],
+        [btn("gt.btn_token", "gt:t"), btn("gt.btn_perms", "gt:p")], [btn("gt.btn_pick", "gt:sr")],
+        [btn("gt.btn_replace", "gt:rf"), btn("gt.btn_vis", "gt:vs")], [btn("pick.back", "gt:m")]])
+
+
+@_guarded
+async def gitpanel_cmd(update, context):
+    """/git and /github: the GitHub menu, without going through /help first."""
+    g = await _gate(update, need_token=False)
+    if not g:
+        return
+    msg, uid, _ = g
+    cid = msg.chat.id
+    await _say(msg, _inrepo(uid, cid) + _t("gt.panel", cid), _panel_markup(cid))
+
+
+async def _pick_path(msg, token: str, o: str, n: str, text: str) -> Optional[str]:
+    """A typed name -> the one file it points to in the repo (full path, file name, or name without extension).
+    Tells the person when nothing or several files match, and returns None."""
+    cid = msg.chat.id
+    path = safe_path(text)
+    if path is None:
+        await _say(msg, _t("gt.bad_path", cid))
+        return None
+    tree, cut = await _repo_files(token, o, n)
+    if path in tree:
+        return path
+    hits = _match_file(list(tree), text)
+    if len(hits) == 1:
+        return safe_path(hits[0])
+    if len(hits) > 1:
+        await _say(msg, _t("gt.fl_many", cid, list=_code_list(hits)))
+        return None
+    if cut:                                                     # GitHub cut the list short: trust the typed path
+        return path
+    await _say(msg, _t("gt.nofile", cid, q=html.escape(text[:100]), repo=html.escape(f"{o}/{n}")))
+    return None
+
+
+async def _send_files(bot, cid, token: str, o: str, n: str, names: list) -> None:
+    """Sends each named file as a Telegram document (up to GET_MAX). A name can be a path, a file name, or a name without its extension."""
+    full = f"{o}/{n}"
+    many = len(names) > GET_MAX
+    tree, cut = await _repo_files(token, o, n)
+    files, bad = list(tree), []
+    for name in names[:GET_MAX]:
+        path = safe_path(name)
+        if path is None:
+            bad.append(name[:80])
+            continue
+        if path not in tree:
+            hits = _match_file(files, name)
+            if len(hits) == 1:
+                path = hits[0]
+            elif len(hits) > 1 or not cut:
+                bad.append(name[:80])
+                continue
+        try:
+            _meta, data = await _run(api_file, token, o, n, path)
+        except GitError:
+            bad.append(path[:80])
+            continue
+        buf = io.BytesIO(data)
+        buf.name = path.rsplit("/", 1)[-1]
+        await bot.send_document(cid, buf, filename=buf.name,
+                                caption=_t("gt.file_cap", cid, repo=full, path=path, size=_fmt_size(len(data)))[:1000])
+    if bad:
+        await bot.send_message(cid, _t("gt.get_problems", cid, list=_code_list(bad)), parse_mode="HTML")
+    if many:
+        await bot.send_message(cid, _t("gt.get_many", cid, max=GET_MAX), parse_mode="HTML")
+
+
+async def _send_zip(bot, cid, uid: int, token: str, o: str, n: str, ref: str = "") -> None:
+    """The whole repo (or one branch) as a ZIP document."""
+    left = _zip_wait(uid)
+    if left:
+        raise GitError("gt.zip_wait", secs=left)
+    if uid in _busy:
+        raise GitError("gt.busy")
+    _busy.add(uid)
+    try:
+        _zip_last[uid] = time.monotonic()
+        await bot.send_message(cid, _t("gt.downloading", cid), parse_mode="HTML")
+        data = await _run(api_zip, token, o, n, ref)
+        buf = io.BytesIO(data)
+        buf.name = f"{n}{'-' + ref.replace('/', '_') if ref else ''}.zip"
+        await bot.send_document(cid, buf, filename=buf.name, caption=_t("gt.zip_cap", cid, repo=f"{o}/{n}", size=_fmt_size(len(data))))
+    except GitError as e:
+        if e.key == "gt.too_big":
+            raise GitError("gt.repo_too_big", mb=MAX_SEND // MB)
+        raise
+    finally:
+        _busy.discard(uid)
+
+
 # ================================================================== C. files
 @_guarded
 async def gitgetfile_cmd(update, context):
@@ -767,16 +1049,21 @@ async def gitgetfile_cmd(update, context):
         return
     msg, uid, token = g
     cid = msg.chat.id
-    a = _args_repo(context, 2)
-    path = safe_path(a[2]) if a else None
-    if not a or path is None:
-        await _say(msg, _t("gt.use_getfile", cid) if not a else _t("gt.bad_path", cid))
+    tgt = _target(uid, context.args or [])
+    if not tgt:
+        await _ask_repo(msg, uid, token, "get")
         return
-    meta, data = await _run(api_file, token, a[0], a[1], path)
-    buf = io.BytesIO(data)
-    buf.name = path.rsplit("/", 1)[-1]
-    await context.bot.send_document(cid, buf, filename=buf.name, caption=_t("gt.file_cap", cid, repo=f"{a[0]}/{a[1]}", path=path,
-                                                                           size=_fmt_size(len(data)))[:1000])
+    o, n, names, inside = tgt
+    full = f"{o}/{n}"
+    if not names:
+        if not inside:
+            await _choose_sel(msg, context.bot, uid, token, full, "get")
+            return
+        await _send_filelist(context.bot, cid, token, full)
+        _wait_for(uid, "getfiles", repo=full)
+        await _say(msg, _t("gt.get_ask", cid, max=GET_MAX))
+        return
+    await _send_files(context.bot, cid, token, o, n, names)
 
 
 @_guarded
@@ -786,16 +1073,25 @@ async def gitdeletefile_cmd(update, context):
         return
     msg, uid, token = g
     cid = msg.chat.id
-    a = _args_repo(context, 2)
-    path = safe_path(a[2]) if a else None
-    if not a or path is None:
-        await _say(msg, _t("gt.use_deletefile", cid) if not a else _t("gt.bad_path", cid))
+    tgt = _target(uid, context.args or [])
+    if not tgt or not tgt[2]:
+        await _say(msg, _t("gt.use_deletefile", cid))
         return
-    meta = await _run(api_contents, token, a[0], a[1], path)
+    o, n, rest, inside = tgt
+    if inside:
+        path = await _pick_path(msg, token, o, n, rest[0])
+        if path is None:
+            return
+    else:
+        path = safe_path(rest[0])
+        if path is None:
+            await _say(msg, _t("gt.bad_path", cid))
+            return
+    meta = await _run(api_contents, token, o, n, path)
     if isinstance(meta, list) or meta.get("type") != "file":
         raise GitError("gt.not_file")
-    t = _new_op(uid, "delfile", repo=f"{a[0]}/{a[1]}", path=path, sha=meta["sha"])
-    await _say(msg, _t("gt.delfile_ask", cid, repo=f"{a[0]}/{a[1]}", path=html.escape(path), size=_fmt_size(int(meta.get("size", 0)))),
+    t = _new_op(uid, "delfile", repo=f"{o}/{n}", path=path, sha=meta["sha"])
+    await _say(msg, _t("gt.delfile_ask", cid, repo=f"{o}/{n}", path=html.escape(path), size=_fmt_size(int(meta.get("size", 0)))),
                _confirm_markup(uid, t, cid, "gt.btn_delete"))
 
 
@@ -806,12 +1102,21 @@ async def giteditfile_cmd(update, context):
         return
     msg, uid, token = g
     cid = msg.chat.id
-    a = _args_repo(context, 2)
-    path = safe_path(a[2]) if a else None
-    if not a or path is None:
-        await _say(msg, _t("gt.use_editfile", cid) if not a else _t("gt.bad_path", cid))
+    tgt = _target(uid, context.args or [])
+    if not tgt or not tgt[2]:
+        await _say(msg, _t("gt.use_editfile", cid))
         return
-    meta, data = await _run(api_file, token, a[0], a[1], path, "", MAX_EDIT)
+    o, n, rest, inside = tgt
+    if inside:
+        path = await _pick_path(msg, token, o, n, rest[0])
+        if path is None:
+            return
+    else:
+        path = safe_path(rest[0])
+        if path is None:
+            await _say(msg, _t("gt.bad_path", cid))
+            return
+    meta, data = await _run(api_file, token, o, n, path, "", MAX_EDIT)
     try:
         data.decode("utf-8")
     except UnicodeDecodeError:
@@ -819,7 +1124,7 @@ async def giteditfile_cmd(update, context):
     buf = io.BytesIO(data)
     buf.name = path.rsplit("/", 1)[-1]
     await context.bot.send_document(cid, buf, filename=buf.name)
-    _wait_for(uid, "edit", repo=f"{a[0]}/{a[1]}", path=path, sha=meta["sha"])
+    _wait_for(uid, "edit", repo=f"{o}/{n}", path=path, sha=meta["sha"])
     await _say(msg, _t("gt.edit_ask", cid, path=html.escape(path), max=MAX_TEXT_INPUT))
 
 
@@ -831,19 +1136,37 @@ async def gituploadfile_cmd(update, context):
     msg, uid, token = g
     cid = msg.chat.id
     args = context.args or []
-    if len(args) <= 1 and (not args or "/" not in args[0]):          # /gitput alone, or /gitput nova: ask step by step
+    tgt = _target(uid, args)
+    if not tgt:                                                 # no repo open yet: pick one first
         if args:
-            await _choose_repo(msg, uid, token, args[0][:100])
+            await _choose_sel(msg, context.bot, uid, token, args[0][:100], "put")
         else:
-            _wait_for(uid, "pickrepo")
-            await _say(msg, _t("gt.rp_ask", cid))
+            await _ask_repo(msg, uid, token, "put")
         return
-    a = _args_repo(context, 2)
-    path = safe_path(a[2]) if a else None
-    if not a or path is None:
-        await _say(msg, _t("gt.use_uploadfile", cid) if not a else _t("gt.bad_path", cid))
+    o, n, rest, inside = tgt
+    full = f"{o}/{n}"
+    if not rest:
+        if not inside:
+            await _choose_sel(msg, context.bot, uid, token, full, "put")
+            return
+        files, _ = await _send_filelist(context.bot, cid, token, full)
+        _wait_for(uid, "pickfile", repo=full, files=files)
+        await _say(msg, _t("gt.put_ask", cid))
         return
-    _wait_for(uid, "upload", repo=f"{a[0]}/{a[1]}", path=path)
+    text = rest[0]
+    if inside and not text.startswith("+"):                     # a file name: the one file it points to, else a new file
+        tree, _cut = await _repo_files(token, o, n)
+        hits = _match_file(list(tree), text)
+        if len(hits) > 1:
+            await _say(msg, _t("gt.fl_many", cid, list=_code_list(hits)))
+            return
+        path = safe_path(hits[0] if hits else text)
+    else:
+        path = safe_path(text[1:].strip() if text.startswith("+") else text)
+    if path is None:
+        await _say(msg, _t("gt.bad_path", cid))
+        return
+    _wait_for(uid, "upload", repo=full, path=path)
     await _say(msg, _t("gt.upload_ask", cid, path=html.escape(path), mb=MAX_SINGLE // MB))
 
 
@@ -901,10 +1224,13 @@ async def gitreplace_cmd(update, context):
     msg, uid, token = g
     q = " ".join(context.args or []).strip()[:100]
     if not q:
-        _wait_for(uid, "pickrepo")
-        await _say(msg, _t("gt.rp_ask", msg.chat.id))
+        sel = _sel.get(uid)
+        if sel:
+            await _choose_sel(msg, context.bot, uid, token, sel, "put")
+        else:
+            await _ask_repo(msg, uid, token, "put")
         return
-    await _choose_repo(msg, uid, token, q)
+    await _choose_sel(msg, context.bot, uid, token, q, "put")
 
 
 async def _choose_repo(msg, uid, token, q: str, kind: str = "pickrepo", target=None):
@@ -1026,30 +1352,41 @@ async def _flush_batch(uid, bot):
         return
     msg = b["msg"]
     try:
-        await _auto_replace(msg, bot, uid, b["docs"])
+        await _auto_replace(msg, bot, uid, b["docs"], _sel.get(uid))
     except GitError as e:
         await _say(msg, _show_error(e, msg.chat.id))
     except Exception as e:
         log.error("git: direct upload failed: %s %s", type(e).__name__, scrub(e)[:200])
 
 
-async def _auto_replace(msg, bot, uid, docs):
+async def _auto_replace(msg, bot, uid, docs, only: Optional[str] = None):
     """Looks each file name up in the person's repos. One file: replace it (a choice when it is in several places).
     Several files: ONE question for all of them, then ONE commit per repo. Silent when nothing matches."""
     token, _ = token_for(uid)
     if not token or not _rate_ok(uid):
         return
     cid = msg.chat.id
-    repos = await _run(api_all_repos, token)
-    cands = [r for r in repos if (r.get("permissions") or {}).get("push")][:AUTO_REPOS]
-    trees = await asyncio.gather(*[_run(_tree_paths, token, r) for r in cands])
+    if only:                                                   # inside a repo: look only there
+        rp = parse_repo(only)
+        if rp is None:
+            return
+        info = await _run(api_repo, token, rp[0], rp[1])
+        if not (info.get("permissions") or {}).get("push"):
+            raise GitError("gt.no_push")
+        cands = [info]
+        trees = [await _run(_tree_paths, token, info)]
+    else:
+        repos = await _run(api_all_repos, token)
+        cands = [r for r in repos if (r.get("permissions") or {}).get("push")][:AUTO_REPOS]
+        trees = await asyncio.gather(*[_run(_tree_paths, token, r) for r in cands])
     plan, skipped, several = {}, [], []
     for name, fid, size in docs:
         if not name or "/" in name or size > MAX_SINGLE:
             skipped.append(name or "?")
             continue
         low = name.lower()
-        hits = [(r["full_name"], p) for r, paths in zip(cands, trees) for p in paths if p.rsplit("/", 1)[-1].lower() == low][:8]
+        pairs = [(r["full_name"], p) for r, paths in zip(cands, trees) for p in paths]
+        hits = ([h for h in pairs if h[1].rsplit("/", 1)[-1] == name] or [h for h in pairs if h[1].rsplit("/", 1)[-1].lower() == low])[:8]
         if len(docs) == 1 and len(hits) > 1:                       # a single file in several places: let the person choose
             _auto_pick[uid] = {"hits": hits, "file_id": fid, "until": time.monotonic() + PENDING_SECS}
             rows = [[InlineKeyboardButton(f"{r}: {p}"[:60], callback_data=f"gt:ap:{i}")] for i, (r, p) in enumerate(hits)]
@@ -1062,7 +1399,9 @@ async def _auto_replace(msg, bot, uid, docs):
         else:
             plan[pick] = fid                                       # the same target twice: the last file wins
     if not plan:
-        if several:
+        if only and (skipped or several):
+            await _say(msg, _inrepo(uid, cid) + _t("gt.sel_nomatch", cid, list=_code_list(skipped + several)))
+        elif several:
             await _say(msg, _t("gt.mb_several", cid, list=_code_list(several)))
         return
     if len(docs) == 1:
@@ -1074,8 +1413,9 @@ async def _auto_replace(msg, bot, uid, docs):
     lines = "\n".join(f"• <code>{html.escape(i['path'][:60])}</code> → {html.escape(i['repo'])}" for i in items)
     extra = ""
     if skipped or several:
-        extra = _t("gt.mb_skip", cid, list=_code_list(skipped + several))
-    await _say(msg, _t("gt.mb_head", cid, n=len(items), lines=lines) + extra, _confirm_markup(uid, t, cid, "gt.btn_overwrite_all"))
+        extra = _t("gt.sel_skip" if only else "gt.mb_skip", cid, list=_code_list(skipped + several))
+    head = _inrepo(uid, cid) if only else ""
+    await _say(msg, head + _t("gt.mb_head", cid, n=len(items), lines=lines) + extra, _confirm_markup(uid, t, cid, "gt.btn_overwrite_all"))
 
 
 # ================================================================== C3. make a repo public / private
@@ -1140,32 +1480,16 @@ async def gitdownload_cmd(update, context):
         return
     msg, uid, token = g
     cid = msg.chat.id
-    a = _args_repo(context)
-    ref = (context.args[1] if len(context.args) > 1 else "") if a else ""
-    if not a or (ref and safe_ref(ref) is None):
+    tgt = _target(uid, context.args or [])
+    if not tgt:
+        await _ask_repo(msg, uid, token, "zip")
+        return
+    o, n, rest, _inside = tgt
+    ref = rest[0] if rest else ""
+    if ref and safe_ref(ref) is None:
         await _say(msg, _t("gt.use_download", cid))
         return
-    left = _zip_wait(uid)
-    if left:
-        await _say(msg, _t("gt.zip_wait", cid, secs=left))
-        return
-    if uid in _busy:
-        await _say(msg, _t("gt.busy", cid))
-        return
-    _busy.add(uid)
-    try:
-        _zip_last[uid] = time.monotonic()
-        note = await _say(msg, _t("gt.downloading", cid))
-        data = await _run(api_zip, token, a[0], a[1], ref)
-        buf = io.BytesIO(data)
-        buf.name = f"{a[1]}{'-' + ref.replace('/', '_') if ref else ''}.zip"
-        await context.bot.send_document(cid, buf, filename=buf.name, caption=_t("gt.zip_cap", cid, repo=f"{a[0]}/{a[1]}", size=_fmt_size(len(data))))
-    except GitError as e:
-        if e.key == "gt.too_big":
-            raise GitError("gt.repo_too_big", mb=MAX_SEND // MB)
-        raise
-    finally:
-        _busy.discard(uid)
+    await _send_zip(context.bot, cid, uid, token, o, n, ref)
 
 
 async def _push_preview(msg, uid: int, token: str, repo: str, branch: str, file_id: str, raw: bytes, update_mode: bool):
@@ -1200,17 +1524,23 @@ async def _start_push(update, context, repo: Optional[str], update_mode: bool):
         return
     msg, uid, token = g
     cid = msg.chat.id
-    a = context.args or []
-    branch = a[1] if len(a) > 1 and not update_mode else (a[0] if update_mode and a else "")
+    a = list(context.args or [])
+    if repo is None:
+        tgt = _target(uid, a)
+        if not tgt:                                             # no repo open yet: pick one (or the one typed) first
+            if a:
+                await _choose_sel(msg, context.bot, uid, token, a[0][:100], "push")
+            else:
+                await _ask_repo(msg, uid, token, "push")
+            return
+        o, n, rest, _inside = tgt
+        repo = f"{o}/{n}"
+        branch = rest[0] if rest else ""
+    else:
+        branch = a[0] if update_mode and a else ""
     if branch and safe_ref(branch) is None:
         await _say(msg, _t("gt.use_pushzip", cid))
         return
-    if repo is None:
-        rp = parse_repo(a[0]) if a else None
-        if not rp:
-            await _say(msg, _t("gt.use_pushzip", cid))
-            return
-        repo = f"{rp[0]}/{rp[1]}"
     reply_doc = msg.reply_to_message.document if msg.reply_to_message else None
     if reply_doc is not None:
         await _push_from_doc(msg, context.bot, uid, token, repo, branch, reply_doc, update_mode)
@@ -1260,6 +1590,8 @@ async def gitcancel_cmd(update, context):
     if not user or not msg:
         return
     had = _inputs.pop(user.id, None) is not None
+    if _sel.pop(user.id, None) is not None:
+        had = True
     for t in [t for t, p in _ops.items() if p["uid"] == user.id]:
         _ops.pop(t, None)
         had = True
@@ -1301,7 +1633,13 @@ async def git_input(update, context):
             await _choose_repo(msg, user.id, token, msg.text.strip()[:100], kind, want.get("target"))
         elif kind == "pickfile" and msg.text:
             await _got_pickfile(msg, user.id, want)
-        elif kind in ("pickrepo", "pickfile", "visrepo"):
+        elif kind == "selrepo" and msg.text:
+            await _choose_sel(msg, context.bot, user.id, token, msg.text.strip()[:100], want.get("then", ""))
+        elif kind == "getfiles" and msg.text:
+            _inputs.pop(user.id, None)
+            o, n = want["repo"].split("/")
+            await _send_files(context.bot, cid, token, o, n, msg.text.split())
+        elif kind in ("pickrepo", "pickfile", "visrepo", "selrepo", "getfiles"):
             await _say(msg, _t("gt.send_name", cid))
         elif kind in ("upload", "pushzip"):
             await _say(msg, _t("gt.send_file", cid))
@@ -1609,6 +1947,29 @@ async def git_callback(update, context):
         except GitError as e:
             await _say(q.message, _show_error(e, cid))
         return
+    if act in ("dl", "dz"):                                                   # buttons under the file-list document
+        if chat.type != "private" or not _rate_ok(user.id):
+            await q.answer(_t("gt.private" if chat.type != "private" else "gt.slow", cid), show_alert=True)
+            return
+        token, _ = token_for(user.id)
+        sel = _sel.get(user.id)
+        if not token or not sel:
+            await q.answer(_t("gt.no_token" if not token else "gt.sel_none", cid), show_alert=True)
+            return
+        await q.answer()
+        o, n = sel.split("/")
+        try:
+            if act == "dl":
+                _wait_for(user.id, "getfiles", repo=sel)
+                await context.bot.send_message(cid, _t("gt.get_ask", cid, max=GET_MAX), parse_mode="HTML")
+            else:
+                await _send_zip(context.bot, cid, user.id, token, o, n)
+        except GitError as e:
+            await context.bot.send_message(cid, _show_error(e, cid), parse_mode="HTML")
+        except TelegramError as e:
+            log.error("git: telegram error in a file-list button: %s", scrub(e))
+            await context.bot.send_message(cid, _t("gt.tg_fail", cid), parse_mode="HTML")
+        return
     if await _menu_blocked(q):
         return
     btn = lambda key, data: InlineKeyboardButton(_t(key, cid), callback_data=data)
@@ -1621,15 +1982,13 @@ async def git_callback(update, context):
             [btn("gt.btn_buttons", "gt:b"), btn("gt.btn_cmds", "gt:c")], [btn("pick.back", back)]]))
     elif act == "b":                                                          # every button of the Git panel
         await q.answer()
-        await _edit(q, _t("gt.panel", cid), InlineKeyboardMarkup([
-            [btn("gt.btn_guide", "gt:g"), btn("gt.btn_cmds", "gt:c")], [btn("gt.btn_repos", "gt:rp:1"), btn("gt.btn_status", "gt:s")],
-            [btn("gt.btn_token", "gt:t"), btn("gt.btn_perms", "gt:p")], [btn("gt.btn_replace", "gt:rf"), btn("gt.btn_vis", "gt:vs")], [btn("pick.back", "gt:m")]]))
+        await _edit(q, _inrepo(user.id, cid) + _t("gt.panel", cid), _panel_markup(cid))
     elif act in PAGES:                                                        # guide, commands, token guide, permissions
         await q.answer()
         key, side = PAGES[act]
         rows = ([[btn(side[0], side[1])]] if side else []) + [[btn("pick.back", "gt:m" if act == "c" else "gt:b")]]
         await _edit(q, _t(key, cid), InlineKeyboardMarkup(rows))
-    elif act in ("rf", "vs"):                                                 # 🔁 easy replace / 🔒 public-private flows
+    elif act in ("rf", "vs", "sr"):                                           # 🔁 easy replace / 🔒 public-private / 📂 open a repo
         if chat.type != "private" or not _rate_ok(user.id):
             await q.answer(_t("gt.private" if chat.type != "private" else "gt.slow", cid), show_alert=True)
             return
@@ -1637,7 +1996,13 @@ async def git_callback(update, context):
             await q.answer(_t("gt.no_token", cid), show_alert=True)
             return
         await q.answer()
-        _wait_for(user.id, "pickrepo" if act == "rf" else "visrepo", target=None)
+        if act in ("rf", "sr"):
+            try:
+                await _ask_repo(q.message, user.id, token_for(user.id)[0], "put" if act == "rf" else "")
+            except GitError as e:
+                await _say(q.message, _show_error(e, cid))
+            return
+        _wait_for(user.id, "visrepo", target=None)
         await context.bot.send_message(cid, _t("gt.rp_ask", cid), parse_mode="HTML")
     elif act == "s":
         if chat.type != "private" or not _rate_ok(user.id):
@@ -1716,15 +2081,17 @@ async def _confirm_button(q, context, chat, user, act, parts):
 
 # ================================================================== registration
 COMMANDS = (
+    (("git", "github"), gitpanel_cmd),
+    (("gitrepo", "gitselect"), gitselect_cmd),
     (("gittoken", "setgittoken"), setgittoken_cmd),
     (("gitstatus",), gitstatus_cmd),
     (("gitoff", "removegittoken"), removegittoken_cmd),
     (("gitrepos",), gitrepos_cmd),
     (("gitinfo", "gitrepoinfo"), gitrepoinfo_cmd),
-    (("gitls", "gitrepofiles"), gitrepofiles_cmd),
+    (("gitls", "gitfiles", "gitfile", "gitrepofiles"), gitrepofiles_cmd),
     (("gitnew", "gitcreaterepo"), gitcreaterepo_cmd),
     (("gitdelrepo", "gitdeleterepo"), gitdeleterepo_cmd),
-    (("gitget", "gitgetfile"), gitgetfile_cmd),
+    (("gitget", "gitdl", "gitgetfile"), gitgetfile_cmd),
     (("gitdel", "gitdeletefile"), gitdeletefile_cmd),
     (("gitedit", "giteditfile"), giteditfile_cmd),
     (("gitreplace", "gitchange"), gitreplace_cmd),
@@ -2109,4 +2476,69 @@ TEXTS_HI.update({
     "gt.mm_target": "✅ {name} ko isse replace karo",
     "gt.mm_alt": "📄 Isse {name} naam se save karo",
     "gt.mm_again": "🔁 Doosri file bhejo",
+})
+
+
+# ================================================================== texts for: open a repo once, file-list document, plain-words help
+TEXTS_EN.update({
+    "gt.in_repo": "📂 <b>You are inside {repo}</b>",
+    "gt.in_now": "📂 <b>You are now inside {repo}</b>\n\nSend a file name to work with it. Example: <code>/gitget nova.py</code>\nSend /gitls to see the files, or /gitrepo to switch to another repo.",
+    "gt.in_cur": "📂 <b>You are inside {repo}</b>\n\nTo switch, send <code>/gitrepo reponame</code>. To see all your repos, send /gitrepos. To leave this repo, send /gitcancel.",
+    "gt.sel_ask": "📚 <b>Your repos</b>\n\n{list}{more}\n\n✏️ Send the name of the repo you want to open, for example <code>novabot</code>. /gitcancel to stop.",
+    "gt.sel_more": "\n… and {n} more. Send a name and I will find it.",
+    "gt.ls_cap": "📂 <b>{repo}</b>\n{n} files. Open the document to see them all.\nUse the buttons below to download files.",
+    "gt.ls_none": "📂 <b>{repo}</b>\n\nNo files found in <code>{path}</code>. Send /gitls to see everything.",
+    "gt.btn_dlfile": "⬇️ Download a file",
+    "gt.btn_dlzip": "📦 Download all (ZIP)",
+    "gt.btn_pick": "📂 Open a repo",
+    "gt.get_ask": "⬇️ Send the names of the files you want, one per line. Example:\n<code>nova.py\nextra.py</code>\n\nUp to {max} files at a time. /gitcancel to stop.",
+    "gt.put_ask": "✏️ Send the name of the file you want to replace, for example <code>nova.py</code>.\nTo add a new file, send <code>+newfile.py</code>.\n/gitcancel to stop.",
+    "gt.get_problems": "⚠️ I could not send these:\n{list}\n\nThe name was not found, the file is too big, or the name matches more than one file (then send the full path, like <code>src/nova.py</code>). Send /gitls to see the names.",
+    "gt.get_many": "ℹ️ I sent the first {max} files. Send the rest again.",
+    "gt.nofile": "❌ No file like <code>{q}</code> in <b>{repo}</b>. Send /gitls to see the file names.",
+    "gt.sel_none": "📂 Open a repo first: send /gitrepo.",
+    "gt.sel_nomatch": "No file in this repo has exactly the same name as:\n{list}\n\nNothing was changed. To add a new file, use /gitput.",
+    "gt.sel_skip": "\n\n⏭ Skipped (no file with exactly this name in this repo, or the name is in several folders):\n{list}",
+    "gt.use_repoinfo": "ℹ️ <b>Repo details</b>\nSend the command and the repo name.\nExample: <code>/gitinfo novabot</code>\nNot sure of the name? Send /gitrepos.",
+    "gt.use_repofiles": "📂 <b>See the files in a repo</b>\nSend /gitls, then pick your repo.\nOr type it: <code>/gitls yourname/novabot</code>\nTo open a folder, add its name: <code>/gitls src</code>",
+    "gt.use_getfile": "⬇️ <b>Download files</b>\nOpen a repo with /gitrepo, then send the command and the file name.\nExample: <code>/gitget nova.py</code>",
+    "gt.use_deletefile": "🗑 <b>Delete a file</b>\nOpen a repo with /gitrepo, then send the command and the file name.\nExample: <code>/gitdel old.py</code>\nI always ask before deleting.",
+    "gt.use_editfile": "✏️ <b>Edit a text file</b>\nOpen a repo with /gitrepo, then send the command and the file name.\nExample: <code>/gitedit nova.py</code>",
+    "gt.use_uploadfile": "⬆️ <b>Upload or replace a file</b>\nSend /gitput, then pick your repo.\nOr type it: <code>/gitput nova.py</code>",
+    "gt.use_download": "📦 <b>Download a repo as a ZIP</b>\nSend /gitzip, then pick your repo.\nOr type it: <code>/gitzip yourname/novabot</code>\nFor another branch, add its name: <code>/gitzip yourname/novabot dev</code>",
+    "gt.use_pushzip": "⬆️ <b>Send a ZIP of your project to GitHub</b>\nSend /gitpush, then pick your repo, then send the ZIP.\nOr type it: <code>/gitpush yourname/novabot</code>\nFor another branch, add its name: <code>/gitpush yourname/novabot dev</code>",
+    "gt.update_unset": "⚠️ /gitupdate is not set up yet. The bot owner must set GIT_UPDATE_REPO on the server.",
+    "gt.how": "<b>📖 Guide</b>\n\n1️⃣ <b>Connect GitHub:</b> send <code>/gittoken yourtoken</code> (see the token guide).\n2️⃣ <b>Open a repo:</b> send /gitrepo, then the repo name. I remember it, and every reply shows 📂 where you are.\n3️⃣ <b>See the files:</b> send /gitls. You get a document with every file. The buttons under it download one file, or the whole repo as a ZIP.\n4️⃣ <b>Replace files:</b> just send me one or many files. A file with exactly the same name in the repo replaces the old one. I show a list and ask once.\n5️⃣ <b>More jobs inside the repo:</b> <code>/gitget nova.py</code> download, <code>/gitput nova.py</code> upload, <code>/gitedit nova.py</code> edit, <code>/gitdel nova.py</code> delete.\n6️⃣ <b>Send a whole project:</b> send /gitpush, then your ZIP.\n\n/gitcancel stops a step and leaves the repo.",
+    "gt.cmds": "<b>⌨️ All commands</b>\nTap a blue command to run it. Tap the grey example to copy it.\n\n<b>Start here</b>\n/git open this GitHub menu\n/gittoken <code>yourtoken</code> connect your GitHub\n/gitrepo open the repo you want to work in. After that you only type file names.\n\n<b>See your repos and files</b>\n/gitrepos your repos\n/gitls the files of your repo, as a document you can download\n/gitls <code>src</code> the files of one folder\n/gitinfo <code>novabot</code> details of a repo\n\n<b>Download</b>\n/gitget <code>nova.py</code> send a file here (many names: one per line)\n/gitzip send the whole repo as a ZIP\n\n<b>Change files</b>\n📎 Just send me one or many files: files with exactly the same name replace the old ones\n/gitput <code>nova.py</code> upload or replace one file\n/gitedit <code>nova.py</code> edit a text file\n/gitdel <code>nova.py</code> delete a file (I ask first)\n/gitpush send a ZIP of your project to GitHub\n\n<b>Repos</b>\n/gitnew <code>mybot</code> create a private repo (add <code>public</code> for a public one)\n/gitvis <code>novabot</code> make a repo public or private\n/gitdelrepo <code>yourname/novabot</code> delete a repo\n\n<b>Other</b>\n/gitstatus check your connection\n/gitoff disconnect your GitHub\n/gitcancel stop a step and leave the repo\n/gitupdate update the bot itself (bot owner only)",
+})
+TEXTS_HI.update({
+    "gt.in_repo": "📂 <b>Tum {repo} ke andar ho</b>",
+    "gt.in_now": "📂 <b>Ab tum {repo} ke andar ho</b>\n\nKaam karne ke liye bas file ka naam bhejo. Jaise: <code>/gitget nova.py</code>\nFiles dekhne ke liye /gitls bhejo, doosri repo ke liye /gitrepo.",
+    "gt.in_cur": "📂 <b>Tum {repo} ke andar ho</b>\n\nBadalne ke liye <code>/gitrepo reponame</code> bhejo. Saari repos dekhne ke liye /gitrepos. Is repo se bahar nikalne ke liye /gitcancel.",
+    "gt.sel_ask": "📚 <b>Tumhari repos</b>\n\n{list}{more}\n\n✏️ Jo repo kholni hai uska naam bhejo, jaise <code>novabot</code>. Rokne ke liye /gitcancel.",
+    "gt.sel_more": "\n… aur {n} repos. Naam bhejo, main dhoondh lunga.",
+    "gt.ls_cap": "📂 <b>{repo}</b>\n{n} files. Saari files dekhne ke liye document kholo.\nFiles download karne ke liye neeche ke buttons dabao.",
+    "gt.ls_none": "📂 <b>{repo}</b>\n\n<code>{path}</code> mein koi file nahi mili. Sab dekhne ke liye /gitls bhejo.",
+    "gt.btn_dlfile": "⬇️ File download karo",
+    "gt.btn_dlzip": "📦 Sab download karo (ZIP)",
+    "gt.btn_pick": "📂 Repo kholo",
+    "gt.get_ask": "⬇️ Jo files chahiye unke naam bhejo, ek line mein ek. Jaise:\n<code>nova.py\nextra.py</code>\n\nEk baar mein {max} files tak. Rokne ke liye /gitcancel.",
+    "gt.put_ask": "✏️ Jo file replace karni hai uska naam bhejo, jaise <code>nova.py</code>.\nNayi file jodne ke liye <code>+newfile.py</code> bhejo.\nRokne ke liye /gitcancel.",
+    "gt.get_problems": "⚠️ Yeh files nahi bhej paya:\n{list}\n\nNaam nahi mila, file bahut badi hai, ya naam ek se zyada files se milta hai (tab poora path bhejo, jaise <code>src/nova.py</code>). Naam dekhne ke liye /gitls bhejo.",
+    "gt.get_many": "ℹ️ Maine pehli {max} files bhej di. Baaki dobara bhejo.",
+    "gt.nofile": "❌ <b>{repo}</b> mein <code>{q}</code> jaisi file nahi mili. File ke naam dekhne ke liye /gitls bhejo.",
+    "gt.sel_none": "📂 Pehle repo kholo: /gitrepo bhejo.",
+    "gt.sel_nomatch": "Is repo mein in naamon ki bilkul same file nahi mili:\n{list}\n\nKuch nahi badla. Nayi file jodne ke liye /gitput use karo.",
+    "gt.sel_skip": "\n\n⏭ Chhod di (is repo mein bilkul same naam ki file nahi, ya naam kai folders mein hai):\n{list}",
+    "gt.use_repoinfo": "ℹ️ <b>Repo ki details</b>\nCommand ke saath repo ka naam bhejo.\nJaise: <code>/gitinfo novabot</code>\nNaam yaad nahi? /gitrepos bhejo.",
+    "gt.use_repofiles": "📂 <b>Repo ki files dekho</b>\n/gitls bhejo, phir apni repo chuno.\nYa likh ke: <code>/gitls yourname/novabot</code>\nFolder kholne ke liye uska naam jodo: <code>/gitls src</code>",
+    "gt.use_getfile": "⬇️ <b>Files download karo</b>\nPehle /gitrepo se repo kholo, phir command ke saath file ka naam bhejo.\nJaise: <code>/gitget nova.py</code>",
+    "gt.use_deletefile": "🗑 <b>File delete karo</b>\nPehle /gitrepo se repo kholo, phir command ke saath file ka naam bhejo.\nJaise: <code>/gitdel old.py</code>\nDelete se pehle main hamesha poochta hoon.",
+    "gt.use_editfile": "✏️ <b>Text file edit karo</b>\nPehle /gitrepo se repo kholo, phir command ke saath file ka naam bhejo.\nJaise: <code>/gitedit nova.py</code>",
+    "gt.use_uploadfile": "⬆️ <b>File upload ya replace karo</b>\n/gitput bhejo, phir apni repo chuno.\nYa likh ke: <code>/gitput nova.py</code>",
+    "gt.use_download": "📦 <b>Repo ko ZIP mein download karo</b>\n/gitzip bhejo, phir apni repo chuno.\nYa likh ke: <code>/gitzip yourname/novabot</code>\nDoosri branch ke liye uska naam jodo: <code>/gitzip yourname/novabot dev</code>",
+    "gt.use_pushzip": "⬆️ <b>Apne project ka ZIP GitHub par bhejo</b>\n/gitpush bhejo, phir apni repo chuno, phir ZIP bhejo.\nYa likh ke: <code>/gitpush yourname/novabot</code>\nDoosri branch ke liye uska naam jodo: <code>/gitpush yourname/novabot dev</code>",
+    "gt.update_unset": "⚠️ /gitupdate abhi set up nahi hai. Bot owner ko server par GIT_UPDATE_REPO set karna hoga.",
+    "gt.how": "<b>📖 Guide</b>\n\n1️⃣ <b>GitHub jodo:</b> <code>/gittoken yourtoken</code> bhejo (token guide dekho).\n2️⃣ <b>Repo kholo:</b> /gitrepo bhejo, phir repo ka naam. Main yaad rakhta hoon, aur har reply mein 📂 dikhta hai ki tum kahan ho.\n3️⃣ <b>Files dekho:</b> /gitls bhejo. Saari files ka document milega. Neeche ke buttons se ek file ya poori repo ZIP mein download karo.\n4️⃣ <b>Files replace karo:</b> bas ek ya kai files bhej do. Repo mein bilkul same naam ki file purani ko replace karti hai. Main list dikhakar ek baar poochta hoon.\n5️⃣ <b>Repo ke andar aur kaam:</b> <code>/gitget nova.py</code> download, <code>/gitput nova.py</code> upload, <code>/gitedit nova.py</code> edit, <code>/gitdel nova.py</code> delete.\n6️⃣ <b>Poora project bhejo:</b> /gitpush bhejo, phir ZIP.\n\n/gitcancel kisi bhi step ko rokta hai aur repo se bahar nikalta hai.",
+    "gt.cmds": "<b>⌨️ Saari commands</b>\nNeeli command dabao to chalegi. Grey example dabao to copy hoga.\n\n<b>Yahan se shuru karo</b>\n/git yeh GitHub menu kholo\n/gittoken <code>yourtoken</code> apna GitHub jodo\n/gitrepo wo repo kholo jisme kaam karna hai. Uske baad sirf file ka naam likhna hai.\n\n<b>Repos aur files dekho</b>\n/gitrepos tumhari repos\n/gitls repo ki files, document mein jo download ho sakta hai\n/gitls <code>src</code> ek folder ki files\n/gitinfo <code>novabot</code> repo ki details\n\n<b>Download</b>\n/gitget <code>nova.py</code> file yahan bhejo (kai naam: ek line mein ek)\n/gitzip poori repo ZIP mein\n\n<b>Files badlo</b>\n📎 Bas ek ya kai files bhej do: bilkul same naam ki files purani ko replace karti hain\n/gitput <code>nova.py</code> ek file upload ya replace\n/gitedit <code>nova.py</code> text file edit\n/gitdel <code>nova.py</code> file delete (pehle poochta hoon)\n/gitpush apne project ka ZIP GitHub par bhejo\n\n<b>Repos</b>\n/gitnew <code>mybot</code> private repo banao (public ke liye <code>public</code> jodo)\n/gitvis <code>novabot</code> repo public ya private karo\n/gitdelrepo <code>yourname/novabot</code> repo delete karo\n\n<b>Aur</b>\n/gitstatus connection check karo\n/gitoff apna GitHub hatao\n/gitcancel step rokho aur repo se bahar niklo\n/gitupdate bot ko update karo (sirf bot owner)",
 })
