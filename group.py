@@ -5,6 +5,7 @@ group.py: all group-management logic in ONE file (merged from autoclose.py, clea
                       (+ the 🕒 Auto Close and ⌨️ Command buttons on /help > Auto Close: hour, minute, AM/PM pickers)
   NIGHT MODE          /night 11pm 6am   /night off   /night   (text-only at night; /help > Night Mode page)
   APPEAL              /appeal [on|off|group|log|dm]   (📩 Appeal button on mute / warn notices; OFF by default)
+  SCHEDULED MESSAGES  /sched [add 9am <text>|del 2|on 2|off 2|time 2 8pm|days 2 mon wed|text 2 <text>|pin 2 on|now 2]   (posts at a set time)
   ANNIVERSARY         /anniv [on|off|9am|text <message>|reset|old on|off|now]   (join anniversaries; birthdays stay in fun_systems.py)
   SHOUT-OUT           /shout [on|off|sun 9pm|top 5|text <message>|reset|mention on|off|now]   (weekly top chatters, written by the admins)
   RULES GATE          /gate [on|off|<time>|kick|mute|ban]   (new members must accept the rules before they can chat)
@@ -350,7 +351,8 @@ async def run_once(bot):
                       ("raid shield", _raid_round(bot)),            # Raid Shield (section 2f): lifts the lock when the raid is over
                       ("rules gate", _gate_round(bot)),             # Rules gate (section 2j): members who didn't accept in time
                       ("shout-out", _shout_round(bot)),             # Weekly shout-out (section 2l)
-                      ("anniversaries", _anniv_round(bot))):        # Join anniversaries (section 2m)
+                      ("anniversaries", _anniv_round(bot)),         # Join anniversaries (section 2m)
+                      ("scheduled messages", _sched_round(bot))):   # Scheduled messages (section 2n)
         try:
             await job
         except asyncio.CancelledError:
@@ -4532,12 +4534,449 @@ async def anniv_cmd(update, context):
 
 
 # ======================================================================================================
+# 2n. SCHEDULED MESSAGES
+# ======================================================================================================
+# Up to SC_MAX_MSGS messages per group that the bot posts by itself at a set time, on the chosen days (default every day), in the
+# admins' own words. Saved as JSON in the setting `sched_msgs` (a list of {id, text, time, days, on, pin}); the days already posted
+# live in `sched_last` ({id: day}) and are NOT part of the export. The 30-second loop (run_once -> _sched_round) posts them:
+#   * once per message per day, after its time, on its days (weekdays 0-6, Monday = 0), in BOT_TIMEZONE;
+#   * not later than SC_GRACE minutes after its time (a bot that was down at 9:00 doesn't announce "good morning" at 3 PM): that day is skipped;
+#   * a failed send is retried every few minutes inside that window; pin = the post is pinned quietly.
+# Text placeholders: {group} {date} {day}. Admin HTML works; broken markup falls back to plain text.
+# Panel: /help page 2 > 🗓 Scheduled (callbacks "sc:..."), or /sched (short commands, see sc.usage):
+#   /sched  |  add 9am Good morning  |  del 2  |  on 2  |  off 2  |  time 2 8pm  |  days 2 mon wed fri  |  text 2 New text  |  pin 2 on  |  now 2
+SC_KEY, SC_LAST_KEY = "sched_msgs", "sched_last"
+SC_MAX_MSGS, SC_MAX_TEXT, SC_GRACE, SC_PENDING_SECS, SC_PREVIEW_CHARS = 10, 1500, 120, 300, 600
+SC_TIMES = (360, 540, 720, 1080, 1260, 1380)
+SC_DEFAULT_TIME = 9 * 60
+_SC_TOKEN = re.compile(r"\{(group|date|day)\}")
+_sc_pending = {}        # (chat_id, admin id) -> {"id": message id or None (a new one), "panel": (chat id, message id), "until": monotonic time}
+
+
+def sc_load(chat_id):
+    """The group's scheduled messages, sorted by id. Anything unreadable is ignored."""
+    try:
+        raw = json.loads(D.get_setting(chat_id, SC_KEY, "") or "[]")
+    except (TypeError, ValueError):
+        return []
+    out = {}
+    for it in raw if isinstance(raw, list) else []:
+        try:
+            mid, text, mins = int(it["id"]), str(it["text"]), int(it["time"])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        days = set()
+        for d in it.get("days") or []:                                        # a bad day is ignored, never the whole message
+            try:
+                days.add(int(d)) if 0 <= int(d) <= 6 else None
+            except (TypeError, ValueError):
+                pass
+        days = sorted(days) or list(range(7))
+        if 1 <= mid <= 99 and text.strip() and 0 <= mins < 1440:
+            out[mid] = {"id": mid, "text": text[:SC_MAX_TEXT], "time": mins, "days": days, "on": bool(it.get("on", True)), "pin": bool(it.get("pin", False))}
+    return [out[k] for k in sorted(out)][:SC_MAX_MSGS]
+
+
+def sc_save(chat_id, items):
+    D.set_setting(chat_id, SC_KEY, json.dumps(items, ensure_ascii=False) if items else "")
+
+
+def sc_get(chat_id, mid):
+    return next((it for it in sc_load(chat_id) if it["id"] == mid), None)
+
+
+def sc_add(chat_id, text, mins=SC_DEFAULT_TIME):
+    """Adds a message (every day). Returns (item, None) or (None, "full" | "text")."""
+    text = str(text).strip()
+    if not text or len(text) > SC_MAX_TEXT:
+        return None, "text"
+    items = sc_load(chat_id)
+    if len(items) >= SC_MAX_MSGS:
+        return None, "full"
+    mid = next(i for i in range(1, 100) if i not in {it["id"] for it in items})
+    item = {"id": mid, "text": text, "time": mins, "days": list(range(7)), "on": True, "pin": False}
+    sc_save(chat_id, items + [item])
+    return item, None
+
+
+def sc_update(chat_id, mid, **fields):
+    """Changes fields of one message (text, time, days, on, pin). Returns the new item or None when there is no such message."""
+    items = sc_load(chat_id)
+    for it in items:
+        if it["id"] == mid:
+            it.update(fields)
+            sc_save(chat_id, items)
+            return it
+    return None
+
+
+def sc_delete(chat_id, mid):
+    items = sc_load(chat_id)
+    if not any(it["id"] == mid for it in items):
+        return False
+    sc_save(chat_id, [it for it in items if it["id"] != mid])
+    last = _sc_last(chat_id)
+    if str(mid) in last:
+        last.pop(str(mid))
+        D.set_setting(chat_id, SC_LAST_KEY, json.dumps(last))
+    return True
+
+
+def _sc_last(chat_id):
+    try:
+        last = json.loads(D.get_setting(chat_id, SC_LAST_KEY, "") or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return {str(k): str(v) for k, v in last.items()} if isinstance(last, dict) else {}
+
+
+def _sc_days_text(days, chat_id):
+    if len(days) == 7:
+        return L.t("sc.every_day", chat_id)
+    return ", ".join(L.t(f"so.ds_{d}", chat_id) for d in days)
+
+
+def sc_render(chat_id, title, text, today):
+    vals = {"group": html.escape(title or ""), "date": f"{today.day} {today.strftime('%b')}", "day": L.t(f"so.d_{today.weekday()}", chat_id)}
+    return _SC_TOKEN.sub(lambda m: vals[m.group(1)], text)
+
+
+async def sched_send(bot, chat_id, item, today=None):
+    """Posts one scheduled message now. Returns "sent" or "error"."""
+    today = today or _local_today()
+    try:
+        title = (await bot.get_chat(chat_id)).title
+    except TelegramError:
+        title = ""
+    try:
+        sent = await D.safe_html(functools.partial(bot.send_message, chat_id, disable_web_page_preview=True), sc_render(chat_id, title, item["text"], today))
+    except TelegramError as e:
+        log.warning("scheduled message %s: couldn't post in %s: %s", item["id"], chat_id, e)
+        return "error"
+    if item.get("pin") and sent is not None:
+        try:
+            await bot.pin_chat_message(chat_id, sent.message_id, disable_notification=True)
+        except TelegramError:
+            pass                                                       # no "Pin messages" right: the post itself went out
+    return "sent"
+
+
+async def _sched_round(bot):
+    """Part of run_once (every 30 seconds): posts the messages that are due."""
+    for chat_id, value in await asyncio.to_thread(_scheduled_groups, SC_KEY):
+        try:
+            if not value or chat_id >= 0 or D.is_paused(chat_id):
+                continue
+            items = sc_load(chat_id)
+            if not items:
+                continue
+            today, weekday, now, last, changed = _local_today(), _now_weekday(), _now_minutes(), _sc_last(chat_id), False
+            for it in items:
+                key = str(it["id"])
+                if not it["on"] or weekday not in it["days"] or now < it["time"] or last.get(key) == today.isoformat():
+                    continue
+                if time.monotonic() < _retry_at.get((chat_id, "sched" + key), 0):
+                    continue
+                if now - it["time"] > SC_GRACE:                        # the bot was away too long: skip today
+                    last[key], changed = today.isoformat(), True
+                    continue
+                if await sched_send(bot, chat_id, it, today) == "error":
+                    _retry_at[(chat_id, "sched" + key)] = time.monotonic() + RETRY_AFTER
+                else:
+                    last[key], changed = today.isoformat(), True
+            if changed:
+                D.set_setting(chat_id, SC_LAST_KEY, json.dumps({k: v for k, v in last.items() if int(k) in {it["id"] for it in items}}))
+        except Exception:
+            log.exception("scheduled messages: the round failed for %s", chat_id)
+
+
+# ------------------------------------------------------------------ the panel
+def sched_button(chat):
+    return InlineKeyboardButton(L.t("mo.b_sc", getattr(chat, "id", None)), callback_data="sc:q")
+
+
+def _sc_short(text, n=40):
+    one = " ".join(text.split())
+    return html.escape(one[:n] + ("…" if len(one) > n else ""))
+
+
+def _sc_list_panel(chat, note=""):
+    cid = getattr(chat, "id", None)
+    if chat is None or chat.type == "private":
+        return L.t("sc.private", cid), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:main")]])
+    items = sc_load(cid)
+    lines = [f"{'🟢' if it['on'] else '⏸'} {it['id']}. {fmt_12h(it['time'])} · {_sc_days_text(it['days'], cid)}\n    {_sc_short(it['text'])}" for it in items]
+    text = (L.t("sc.title", cid) + "\n\n" + (note + "\n\n" if note else "") + L.t("sc.intro", cid, tz=_tz_label(cid)) + "\n\n" +
+            ("\n".join(lines) if lines else L.t("sc.none", cid)) + "\n\n" + L.t("sc.count", cid, n=len(items), max=SC_MAX_MSGS))
+    rows = _pairs([InlineKeyboardButton(f"{'🟢' if it['on'] else '⏸'} {it['id']} · {fmt_12h(it['time'])}", callback_data=f"sc:o:{it['id']}") for it in items])
+    if len(items) < SC_MAX_MSGS:
+        rows.append([InlineKeyboardButton(L.t("sc.btn_add", cid), callback_data="sc:a")])
+    rows.append([InlineKeyboardButton(L.t("sc.btn_cmd", cid), callback_data="sc:c")])
+    rows.append([InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:more")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _sc_detail_panel(chat, mid, note=""):
+    cid = chat.id
+    it = sc_get(cid, mid)
+    if it is None:
+        return _sc_list_panel(chat, note)
+    preview = html.escape(it["text"][:SC_PREVIEW_CHARS] + ("…" if len(it["text"]) > SC_PREVIEW_CHARS else ""))
+    text = (L.t("sc.d_title", cid, id=mid) + "\n\n" + (note + "\n\n" if note else "") + L.t("sc.d_status_on" if it["on"] else "sc.d_status_off", cid) + "\n" +
+            L.t("sc.d_when", cid, time=fmt_12h(it["time"]), tz=_tz_label(cid)) + "\n" + L.t("sc.d_days", cid, days=_sc_days_text(it["days"], cid)) + "\n" +
+            L.t("sc.d_pin_on" if it["pin"] else "sc.d_pin_off", cid) + "\n\n" + L.t("sc.d_text", cid) + "\n" + preview)
+    mark = lambda cond: "✅ " if cond else ""
+    rows = _pairs([InlineKeyboardButton(L.t("sc.btn_pause" if it["on"] else "sc.btn_resume", cid), callback_data=f"sc:t:{mid}"),
+                   InlineKeyboardButton(L.t("sc.btn_now", cid), callback_data=f"sc:g:{mid}")])
+    rows += _pairs([InlineKeyboardButton(mark(m == it["time"]) + "🕘 " + fmt_12h(m), callback_data=f"sc:h:{mid}:{m}") for m in SC_TIMES])
+    rows += _pairs([InlineKeyboardButton(mark(d in it["days"]) + L.t(f"so.ds_{d}", cid), callback_data=f"sc:d:{mid}:{d}") for d in range(7)])
+    rows += _pairs([InlineKeyboardButton(L.t("sc.btn_pin_off" if it["pin"] else "sc.btn_pin_on", cid), callback_data=f"sc:n:{mid}"),
+                    InlineKeyboardButton(L.t("sc.btn_text", cid), callback_data=f"sc:x:{mid}"),
+                    InlineKeyboardButton(L.t("sc.btn_delete", cid), callback_data=f"sc:r:{mid}")])
+    rows.append([InlineKeyboardButton(L.t("pick.back", cid), callback_data="sc:p")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _sc_confirm_panel(chat, mid):
+    cid = chat.id
+    it = sc_get(cid, mid)
+    if it is None:
+        return _sc_list_panel(chat)
+    return (L.t("sc.confirm", cid, id=mid, text=_sc_short(it["text"], 80)),
+            InlineKeyboardMarkup([[InlineKeyboardButton(L.t("sc.btn_yes", cid), callback_data=f"sc:y:{mid}"), InlineKeyboardButton(L.t("sc.btn_no", cid), callback_data=f"sc:o:{mid}")]]))
+
+
+def _sc_command_page(chat=None):
+    cid = getattr(chat, "id", None)
+    return (L.t("sc.cmd_page", cid, tz=_tz_label(cid)), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="sc:p")]]))
+
+
+async def sc_callback(update, context):
+    """\"sc:q\"/\"sc:p\" list, \"sc:o:<id>\" open, \"sc:t:<id>\" pause/resume, \"sc:g:<id>\" send now, \"sc:h:<id>:<minutes>\" time, \"sc:d:<id>:<0-6>\" day,
+    \"sc:n:<id>\" pin, \"sc:x:<id>\" write the text, \"sc:a\" add one, \"sc:r:<id>\" delete (asks first), \"sc:y:<id>\" delete for sure, \"sc:c\" commands.
+    Admins only (\"sc:c\" is just information)."""
+    q = update.callback_query
+    chat = q.message.chat if q.message else None
+    if chat is None:
+        await q.answer()
+        return
+    if await extra.menu_not_owner(q):
+        return
+    parts = (q.data or "").split(":")[1:]
+    if parts == ["c"]:
+        await q.answer()
+        await _ac_edit(q, *_sc_command_page(chat))
+        return
+    if chat.type == "private":
+        await q.answer(L.t("sc.private"), show_alert=True)
+        return
+    cid = chat.id
+    if not await _ac_allowed(chat, q.from_user.id):
+        await q.answer(L.t("sc.admin_only", cid), show_alert=True)
+        return
+    act = parts[0] if parts else ""
+    mid = _ac_num(parts[1], 1, 99) if len(parts) >= 2 else None
+    arg = _ac_num(parts[2], 0, 10 ** 5) if len(parts) == 3 else None
+    shape_ok = (parts in (["p"], ["q"], ["a"]) or (act in ("o", "t", "g", "n", "x", "r", "y") and len(parts) == 2 and mid is not None)
+                or (act in ("h", "d") and len(parts) == 3 and mid is not None and arg is not None))
+    if not shape_ok:
+        await q.answer(L.t("sc.invalid", cid), show_alert=True)
+        return
+    try:
+        it = sc_get(cid, mid) if mid else None
+        if mid and it is None:
+            await q.answer(L.t("sc.gone", cid), show_alert=True)
+            await _ac_edit(q, *_sc_list_panel(chat))
+            return
+        toast, screen = None, None
+        if parts in (["p"], ["q"]):
+            screen = _sc_list_panel(chat)
+        elif act == "o":
+            screen = _sc_detail_panel(chat, mid)
+        elif act == "t":
+            sc_update(cid, mid, on=not it["on"])
+            toast = L.t("sc.t_paused" if it["on"] else "sc.t_resumed", cid)
+        elif act == "h" and arg in SC_TIMES:
+            sc_update(cid, mid, time=arg)
+            toast = L.t("sc.t_time", cid, time=fmt_12h(arg))
+        elif act == "d" and 0 <= arg <= 6:
+            days = sorted(set(it["days"]) ^ {arg})
+            if not days:
+                await q.answer(L.t("sc.t_keep_day", cid), show_alert=True)
+                return
+            sc_update(cid, mid, days=days)
+            toast = L.t("sc.t_days", cid, days=_sc_days_text(days, cid))
+        elif act == "n":
+            sc_update(cid, mid, pin=not it["pin"])
+            toast = L.t("sc.t_pin_off" if it["pin"] else "sc.t_pin_on", cid)
+        elif act == "g":
+            result = await sched_send(context.bot, cid, it)
+            await q.answer(L.t("sc.t_sent" if result == "sent" else "sc.t_error", cid), show_alert=result != "sent")
+            return
+        elif act == "r":
+            screen = _sc_confirm_panel(chat, mid)
+        elif act == "y":
+            sc_delete(cid, mid)
+            screen, toast = _sc_list_panel(chat), L.t("sc.t_deleted", cid)
+        elif act in ("x", "a"):
+            if act == "a" and len(sc_load(cid)) >= SC_MAX_MSGS:
+                await q.answer(L.t("sc.err_full", cid, max=SC_MAX_MSGS), show_alert=True)
+                return
+            _sc_pending[(cid, q.from_user.id)] = {"id": mid if act == "x" else None, "panel": (cid, q.message.message_id), "until": time.monotonic() + SC_PENDING_SECS}
+            await q.answer(L.t("sc.t_ask", cid))
+            await chat.send_message(L.t("sc.ask_edit" if act == "x" else "sc.ask_new", cid, user=q.from_user.mention_html(), max=SC_MAX_TEXT), parse_mode="HTML")
+            return
+        await q.answer(toast)
+        await _ac_edit(q, *(screen or _sc_detail_panel(chat, mid)))
+    except Exception:
+        log.exception("scheduled messages: panel action failed in %s", cid)
+        await q.answer(L.t("ac.db_problem", cid), show_alert=True)
+
+
+async def sc_input(update, context):
+    """group=-14, cheap: only acts when the admin tapped ➕ Add / ✏️ Text and now sends the message (or "cancel")."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user or not _sc_pending:
+        return
+    key = (chat.id, user.id)
+    pending = _sc_pending.get(key)
+    if pending is None:
+        return
+    if time.monotonic() > pending["until"] or not await D.is_admin(chat, user.id):
+        _sc_pending.pop(key, None)
+        return
+    text = (msg.text or "").strip()
+    if text.lower() in ("cancel", "stop"):
+        _sc_pending.pop(key, None)
+        await _rp_note(msg, "sc.t_cancel", 10)
+        raise ApplicationHandlerStop
+    if len(text) > SC_MAX_TEXT:
+        await _rp_note(msg, "sc.err_long", 15, max=SC_MAX_TEXT)
+        raise ApplicationHandlerStop
+    _sc_pending.pop(key, None)
+    if pending["id"] is None:
+        item, err = sc_add(chat.id, text)
+        mid, note = (item["id"], L.t("sc.t_added", chat.id, id=item["id"])) if item else (None, L.t("sc.err_full", chat.id, max=SC_MAX_MSGS))
+    else:
+        mid, note = pending["id"], L.t("sc.t_saved", chat.id)
+        if sc_update(chat.id, mid, text=text) is None:
+            mid, note = None, L.t("sc.gone", chat.id)
+    try:
+        await msg.delete()
+    except TelegramError:
+        pass
+    try:
+        panel_chat, panel_id = pending["panel"]
+        screen, kb = _sc_detail_panel(chat, mid, note) if mid else _sc_list_panel(chat, note)
+        await context.bot.edit_message_text(screen, chat_id=panel_chat, message_id=panel_id, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+    except TelegramError:
+        await _rp_note(msg, "sc.t_saved", 10)
+    raise ApplicationHandlerStop
+
+
+_SC_DAY_SETS = {"daily": range(7), "everyday": range(7), "weekdays": range(5), "weekend": (5, 6), "weekends": (5, 6)}
+
+
+def _sc_parse_days(tokens):
+    """['mon', 'wed'] / ['daily'] / ['weekdays'] -> sorted day numbers, or None when something isn't a day."""
+    days = set()
+    for t in (x.lower().strip(",") for x in tokens):
+        if t in SO_DAY_WORDS:
+            days.add(SO_DAY_WORDS[t])
+        elif t in _SC_DAY_SETS:
+            days.update(_SC_DAY_SETS[t])
+        else:
+            return None
+    return sorted(days) or None
+
+
+def _sc_parse_clock(tokens):
+    """['9', 'pm'] / ['9pm'] / ['21:00'] -> minutes after midnight, or None."""
+    _, mins, ok = _so_parse_when(tokens[:2] if len(tokens) >= 2 and tokens[1].lower() in ("am", "pm") else tokens[:1])
+    return mins if ok else None
+
+
+async def sched_cmd(update, context):
+    """/sched  |  add 9am Text  |  del 2  |  on 2  |  off 2  |  time 2 8pm  |  days 2 mon wed fri  |  text 2 New text  |  pin 2 on|off  |  now 2"""
+    if not await D.group_only(update):
+        return
+    chat, msg, args, note = update.effective_chat, update.effective_message, list(context.args or []), ""
+    cid, first, raw = chat.id, (args[0].lower() if args else ""), (msg.text or "")
+    mid = _ac_num(args[1], 1, 99) if len(args) >= 2 else None
+    it = sc_get(cid, mid) if mid else None
+
+    async def usage():
+        await msg.reply_html(L.t("sc.usage", cid))
+
+    if not args:
+        pass
+    elif first == "add":
+        m = re.match(r"^/\S+\s+add\s+(\S+)(?:\s+(am|pm)\b)?\s+(.+)$", raw, re.S | re.I)
+        mins = _sc_parse_clock([m.group(1)] + ([m.group(2)] if m.group(2) else [])) if m else None
+        if mins is None:
+            await usage()
+            return
+        item, err = sc_add(cid, m.group(3), mins)
+        if err:
+            await msg.reply_html(L.t("sc.err_full" if err == "full" else "sc.err_long", cid, max=SC_MAX_MSGS if err == "full" else SC_MAX_TEXT))
+            return
+        mid, note = item["id"], L.t("sc.t_added", cid, id=item["id"])      # show the new message so its time and days can be changed
+    elif first in ("del", "on", "off", "now", "time", "days", "pin", "text") and mid is None:
+        await usage()
+        return
+    elif first in ("del", "on", "off", "now", "time", "days", "pin", "text") and it is None:
+        await msg.reply_html(L.t("sc.gone", cid))
+        return
+    elif first == "del" and len(args) == 2:
+        sc_delete(cid, mid)
+        note = L.t("sc.t_deleted", cid)
+    elif first in ("on", "off") and len(args) == 2:
+        sc_update(cid, mid, on=first == "on")
+        note = L.t("sc.t_resumed" if first == "on" else "sc.t_paused", cid)
+    elif first == "now" and len(args) == 2:
+        note = L.t("sc.t_sent" if await sched_send(context.bot, cid, it) == "sent" else "sc.t_error", cid)
+    elif first == "time" and len(args) >= 3:
+        mins = _sc_parse_clock(args[2:])
+        if mins is None or len(args[2:]) > (2 if len(args) > 3 and args[3].lower() in ("am", "pm") else 1):
+            await usage()
+            return
+        sc_update(cid, mid, time=mins)
+        note = L.t("sc.t_time", cid, time=fmt_12h(mins))
+    elif first == "days" and len(args) >= 3:
+        days = _sc_parse_days(args[2:])
+        if days is None:
+            await usage()
+            return
+        sc_update(cid, mid, days=days)
+        note = L.t("sc.t_days", cid, days=_sc_days_text(days, cid))
+    elif first == "pin" and len(args) == 3 and args[2].lower() in ("on", "off"):
+        sc_update(cid, mid, pin=args[2].lower() == "on")
+        note = L.t("sc.t_pin_on" if args[2].lower() == "on" else "sc.t_pin_off", cid)
+    elif first == "text":
+        m = re.match(r"^/\S+\s+text\s+\d+\s+(.+)$", raw, re.S | re.I)
+        value = m.group(1).strip() if m else ""
+        if not value:
+            await usage()
+            return
+        if len(value) > SC_MAX_TEXT:
+            await msg.reply_html(L.t("sc.err_long", cid, max=SC_MAX_TEXT))
+            return
+        sc_update(cid, mid, text=value)
+        note = L.t("sc.t_saved", cid)
+    else:
+        await usage()
+        return
+    text, markup = _sc_detail_panel(chat, mid, note) if mid and sc_get(cid, mid) else _sc_list_panel(chat, note)
+    await msg.reply_html(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+# ======================================================================================================
 # 2k. /help PAGE 2 ("More Features")
 # ======================================================================================================
 # Page 2 is a grid like page 1 (three buttons in a line, from the top): one short button for every panel built in sections
 # 2d-2j, then nova's own 🌐 Language, 🗑 Delete and ✨ Extras. Groups only for these panels (they need a group). Each button
 # opens the panel through the same callback its own help page uses, so there is one panel per feature, not a copy.
-MORE_PANELS = (("wl", "wl:m"), ("ml", "ml:a:0:0"), ("rd", "rd:m"), ("pb", "pb:p"), ("rp", "rp:p"), ("gr", "gr:m"), ("rg", "rg:q"), ("so", "so:q"), ("an", "an:q"))
+MORE_PANELS = (("wl", "wl:m"), ("ml", "ml:a:0:0"), ("rd", "rd:m"), ("pb", "pb:p"), ("rp", "rp:p"), ("gr", "gr:m"), ("rg", "rg:q"), ("so", "so:q"), ("an", "an:q"), ("sc", "sc:q"))
 
 
 _HELP_PAGE_BUTTONS = {"warn": warn_ladder_button, "flood": raid_button, "locks": probation_button, "reports": report_button,
@@ -5153,7 +5592,7 @@ ANON_ADMIN_ID = 1087968824  # Telegram's "Group" anonymous-admin account
 
 # module -> the per-group setting keys it owns (exact names; "prefixes" cover families such as lock_<type>)
 MODULES = {
-    "admin": {"keys": ("auto_approve", "autoclose", "autoclose_msg_close", "autoclose_msg_open")},
+    "admin": {"keys": ("auto_approve", "autoclose", "autoclose_msg_close", "autoclose_msg_open", "night")},
     "antiflood": {"keys": ("flood_limit", "flood_secs", "flood_mode", "repeat_limit", "mention_limit",
                            "antispam", "spam_mode")},
     "blocklists": {"keys": ("blocklist_mode", "block_ads", "block_promo", "block_promo_auth", "block_punish",
@@ -5177,7 +5616,11 @@ MODULES = {
     "rules": {"keys": ("rules", "rules_private", "rules_button", "rules_gate", "gate_time", "gate_action")},
     "shoutout": {"keys": ("shout_on", "shout_day", "shout_time", "shout_top", "shout_text", "shout_mention")},
     "anniversary": {"keys": ("anniv_on", "anniv_time", "anniv_text", "anniv_seen")},
-    "translations": {"keys": ()},
+    "appeals": {"keys": ("mod_appeal", "mod_appeal_dest")},
+    "birthdays": {"keys": ("bdaygrp", "bdaymsg")},
+    "links": {"keys": ("link_main", "link_list")},
+    "schedule": {"keys": ("sched_msgs",)},
+    "translations": {"keys": ("lang",)},
     "warns": {"keys": ("warn_limit", "warn_time", "warn_mode", "warn_ladder", "warn_ladder_on")},
 }
 ORDER = tuple(MODULES)
@@ -5496,6 +5939,751 @@ async def ie_callback(update, context):
             await context.bot.send_message(chat.id, L.t("ie.export_fail", chat.id))
         return
     await q.answer()
+
+
+# ======================================================================================================
+# 4b. ONE-TAP BACKUP AND RESTORE  (builds on section 4: same file format, same safety rules)
+# ======================================================================================================
+#   /backup (/bk)    any admin, or the 💾 button on /help page 2: sends ONE file with every module of this group.
+#   /restore (/rs)   group CREATOR only: reply to a backup file with it, or just send the file in the group.
+#                    The bot shows what will change, asks to confirm, sends the current settings as an "undo" file, restores.
+# A restore makes the group MATCH the file for the modules it covers: settings, notes, filters and blocklist words that are
+# not in the file are removed (that is what "back to how it was" means). /import stays the additive way to merge.
+# The file is never trusted: format and version are checked, only keys a module owns are read, every value is checked.
+# State (timers, "already posted today", saved permissions) and members' data are NOT backed up: see NOT_BACKED_UP.
+BACKUP_KIND = "backup"
+RESTORE_NEEDS_CREATOR = True       # False: any group admin may restore (the confirm step stays)
+BK_FILE_SUFFIX = "_backup.json"    # a file with this ending, sent in the group, starts a restore by itself
+BK_PENDING_SECS = 600              # a restore waits this long for its confirm tap
+BK_WAIT_SECS = 300                 # after the ♻️ button: how long the next file is taken as the backup
+BK_PENDING_MAX = 200
+MAX_KEY_CHARS = 64
+
+# Every setting key the code reads or writes is in a MODULES entry above (so it is backed up) or listed here (so it is
+# left out on purpose, with the reason). tests/test_backup.py fails when a key is in neither: add it to the right place.
+NOT_BACKED_UP = {
+    "autoclose_state": "state: open or closed right now", "autoclose_saved": "state: permissions saved while closed",
+    "autoclose_pin": "state: id of the pinned message", "night_state": "state: night mode on right now",
+    "night_saved": "state: permissions saved by night mode", "night_pin": "state: id of the pinned message",
+    "raid_lock_state": "state: raid lock on right now", "raid_lock_saved": "state: permissions saved by the raid lock",
+    "raid_muted": "state: members muted by the raid shield", "raid_until": "timer: raid mode end",
+    "paused_until": "timer: /pause", "last_welcome_id": "state: id of the last welcome message",
+    "anniv_last": "state: already posted today", "shout_last": "state: already posted this week",
+    "sched_last": "state: already posted today", "bot_promoted_admins": "members' data: who the bot promoted",
+    "log_channel": "a channel the bot was linked to from that channel: never taken from a file",
+    "log_categories": "belongs to log_channel", "suggestions_on": "state of this bot's Telegram command list",
+    "cmd_sig": "state of this bot's Telegram command list", "sug_clean": "state of this bot's Telegram command list",
+    "bot_name": "this bot, not the group", "bot_description": "this bot, not the group",
+    "bot_short_description": "this bot, not the group", "stats_groups": "global (chat 0): the bot's group list",
+    "owner_power_until": "global (chat 0): the owner's power switch", "broadcast_last": "global (chat 0): last broadcast",
+}
+NOT_BACKED_UP_PREFIXES = ("uname:", "lastname:", "bday:", "bdayopt:", "bdayann:")   # members' data (names, birthdays)
+MORE_PANELS = MORE_PANELS + (("bk", "bk:m"),)                                     # 💾 on /help page 2
+_bk_pending = {}      # token -> {"chat", "user", "file", "until"}: a restore waiting for its confirm tap
+_bk_wait = {}         # (chat id, user id) -> until: the person tapped ♻️ and now sends the file
+
+
+class BackupError(Exception):
+    """Carries the lang key of the message to show."""
+    def __init__(self, key):
+        super().__init__(key)
+        self.key = key
+
+
+def key_is_covered(key):
+    """True when `key` (or a prefix like "lock_") is backed up or deliberately left out."""
+    if key.startswith("PREFIX:"):
+        p = key[7:]
+        return any(p == q or p.startswith(q) for q in NOT_BACKED_UP_PREFIXES) or \
+            any(p.startswith(q) or q.startswith(p) for spec in MODULES.values() for q in spec.get("prefixes", ()))
+    return _module_of(key) is not None or key in NOT_BACKED_UP or key.startswith(NOT_BACKED_UP_PREFIXES)
+
+
+# ------------------------------------------------------------------ the file
+def _backup_bytes(chat, data):
+    payload = {"format": FORMAT, "version": VERSION, "kind": BACKUP_KIND, "exported_at": int(time.time()),
+               "chat_id": chat.id, "chat_title": chat.title or "", "all_modules": list(ORDER), "modules": data}
+    raw = json.dumps(payload, ensure_ascii=False, indent=1).encode("utf-8")
+    if len(raw) > MAX_FILE_BYTES:
+        raise BackupError("bk.too_large")
+    return raw
+
+
+async def _send_backup(chat, bot, reply_to=None, caption_key="bk.cap"):
+    data = await asyncio.to_thread(_collect, chat.id, ORDER)
+    buf = io.BytesIO(_backup_bytes(chat, data))
+    safe = "".join(c if c.isalnum() else "_" for c in (chat.title or "chat"))[:30].strip("_") or "chat"
+    buf.name = safe + BK_FILE_SUFFIX
+    await bot.send_document(chat.id, buf, filename=buf.name, caption=L.t(caption_key, chat.id, count=len(data))[:1000],
+                            reply_to_message_id=reply_to, allow_sending_without_reply=True)
+
+
+def _read_backup(raw):
+    """bytes -> the file's dict, or BackupError. Only the outside is checked here (size, JSON, format, version)."""
+    if len(raw) > MAX_FILE_BYTES:
+        raise BackupError("ie.too_big")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise BackupError("bk.bad_file")
+    if not isinstance(payload, dict) or payload.get("format") != FORMAT:
+        raise BackupError("ie.not_file")
+    version = payload.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise BackupError("bk.bad_file")
+    if version > VERSION:
+        raise BackupError("bk.newer")
+    if not isinstance(payload.get("modules"), dict):
+        raise BackupError("bk.bad_file")
+    return payload
+
+
+def _clean_block(m, block):
+    """(one module's data from a file, in the shape _collect returns, number of entries ignored). Nothing is trusted."""
+    out, bad = {}, 0
+    values = {}
+    settings = block.get("settings")
+    for k, v in (settings.items() if isinstance(settings, dict) else ()):
+        if isinstance(k, str) and len(k) <= MAX_KEY_CHARS and _owns(m, k) and isinstance(v, (str, int, float)) \
+                and len(str(v)) <= MAX_VALUE_CHARS:
+            values[k] = str(v)
+        else:
+            bad += 1
+    if values:
+        out["settings"] = values
+
+    def rows(field, ok, make):
+        nonlocal bad
+        items = block.get(field)
+        if not MODULES[m].get(field) or not isinstance(items, list):
+            return
+        seen = {}
+        for it in items[:MAX_ITEMS]:
+            row = make(it) if ok(it) else None
+            if row is None:
+                bad += 1
+            else:
+                seen[row[0]] = row[1]
+        bad += max(0, len(items) - MAX_ITEMS)
+        if seen:
+            out[field] = list(seen.values())
+
+    text = lambda x, n: isinstance(x, str) and 0 < len(x) <= n
+    rows("notes", lambda i: isinstance(i, dict) and text(i.get("name"), 10 ** 4) and isinstance(i.get("content"), str)
+         and len(i["content"]) <= MAX_VALUE_CHARS, lambda i: (i["name"][:64], {"name": i["name"][:64], "content": i["content"]}))
+    rows("filters", lambda i: isinstance(i, dict) and text(i.get("keyword"), 10 ** 4) and isinstance(i.get("reply"), str)
+         and len(i["reply"]) <= MAX_VALUE_CHARS, lambda i: (i["keyword"][:100], {"keyword": i["keyword"][:100], "reply": i["reply"]}))
+    rows("blocklist", lambda i: text(i, 200), lambda i: (i, i))
+    rows("allowlist", lambda i: isinstance(i, dict) and text(i.get("kind"), 100) and text(i.get("value"), 300),
+         lambda i: ((i["kind"], i["value"]), {"kind": i["kind"], "value": i["value"]}))
+    return out, bad
+
+
+def _targets(payload):
+    """The modules a restore covers: those the file says it holds (a backup lists them all), in our own order."""
+    listed = payload.get("all_modules")
+    names = listed if isinstance(listed, list) else list(payload["modules"])
+    return [m for m in ORDER if m in names]
+
+
+def _prepare(chat_id, payload):
+    """(current data, the file's clean data, modules covered, entries ignored) — synchronous, reads the database."""
+    targets = _targets(payload)
+    clean, bad = {}, 0
+    for m in targets:
+        block = payload["modules"].get(m)
+        if isinstance(block, dict):
+            data, n = _clean_block(m, block)
+            bad += n
+            if data:
+                clean[m] = data
+    return _collect(chat_id, targets), clean, targets, bad
+
+
+def _flat(block):
+    """A module's data as one comparable dict: what it holds -> its value."""
+    out = {}
+    for k, v in (block.get("settings") or {}).items():
+        out[("s", k)] = str(v)
+    for it in block.get("notes") or ():
+        out[("n", it["name"])] = it["content"]
+    for it in block.get("filters") or ():
+        out[("f", it["keyword"])] = it["reply"]
+    for w in block.get("blocklist") or ():
+        out[("b", w)] = ""
+    for it in block.get("allowlist") or ():
+        out[("a", it["kind"], it["value"])] = ""
+    return out
+
+
+def _changes(cur, clean, targets):
+    """{module: (changed, added, removed)} for the modules where a restore would do something."""
+    out = {}
+    for m in targets:
+        a, b = _flat(cur.get(m, {})), _flat(clean.get(m, {}))
+        n = (sum(1 for k in a.keys() & b.keys() if a[k] != b[k]), len(b.keys() - a.keys()), len(a.keys() - b.keys()))
+        if any(n):
+            out[m] = n
+    return out
+
+
+def _restore_apply(chat_id, cur, clean, targets):
+    """Makes the group match the file for the covered modules (synchronous). Returns how many writes it did."""
+    chat_id, ops = int(chat_id), 0
+    for m in targets:
+        a, b = _flat(cur.get(m, {})), _flat(clean.get(m, {}))
+        for k, v in b.items():
+            if k in a and a[k] == v:
+                continue
+            if k[0] == "s":
+                store.set_setting(chat_id, k[1], v)
+            elif k[0] == "n":
+                store.note_set(chat_id, k[1], v)
+            elif k[0] == "f":
+                store.filter_add(chat_id, k[1], v)
+            elif k[0] == "b":
+                store.block_add(chat_id, k[1])
+            else:
+                store.allow_add(chat_id, k[1], k[2])
+            ops += 1
+        for k in a:
+            if k in b:
+                continue
+            if k[0] == "s":
+                store.del_setting(chat_id, k[1])
+            elif k[0] == "n":
+                store.note_del(chat_id, k[1])
+            elif k[0] == "f":
+                store.filter_remove(chat_id, k[1])
+            elif k[0] == "b":
+                store.block_remove(chat_id, k[1])
+            else:
+                store.allow_remove(chat_id, k[1], k[2])
+            ops += 1
+    return ops
+
+
+# ------------------------------------------------------------------ texts and screens
+def _bk_lines(changes, cid):
+    lines = []
+    for m in ORDER:
+        if m in changes:
+            parts = [L.t(key, cid, n=n) for key, n in zip(("bk.part_chg", "bk.part_add", "bk.part_rem"), changes[m]) if n]
+            lines.append(L.t("bk.line", cid, m=html.escape(m), parts=", ".join(parts)))
+    return "\n".join(lines)
+
+
+def _bk_date(ts):
+    try:
+        return time.strftime("%Y-%m-%d", time.gmtime(int(ts))) + " UTC"
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "?"
+
+
+def _bk_panel(chat):
+    cid = chat.id
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(L.t("bk.btn_backup", cid), callback_data="bk:b"),
+                                InlineKeyboardButton(L.t("bk.btn_restore", cid), callback_data="bk:r")],
+                               [InlineKeyboardButton(L.t("bk.btn_cmd", cid), callback_data="bk:c"),
+                                InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:more")]])
+    return L.t("bk.panel", cid), kb
+
+
+def _bk_command_page(chat):
+    cid = chat.id
+    return L.t("bk.cmd_page", cid), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="bk:m")]])
+
+
+async def _can_restore(chat, user):
+    return await (_is_creator(chat, user) if RESTORE_NEEDS_CREATOR else _is_admin(chat, user))
+
+
+def _bk_remember(chat_id, user_id, file_id):
+    now = time.monotonic()
+    for t in [t for t, p in _bk_pending.items() if p["until"] < now]:
+        _bk_pending.pop(t, None)
+    while len(_bk_pending) >= BK_PENDING_MAX:
+        _bk_pending.pop(next(iter(_bk_pending)))
+    token = os.urandom(4).hex()
+    _bk_pending[token] = {"chat": chat_id, "user": user_id, "file": file_id, "until": now + BK_PENDING_SECS}
+    return token
+
+
+# ------------------------------------------------------------------ backup
+async def _backup_now(chat, msg_or_none, bot):
+    """The shared part of /backup and the 💾 button. Returns the lang key of a problem, or None."""
+    wait = _cooldown(chat.id)
+    if wait:
+        return ("ie.slow", {"wait": wait})
+    try:
+        await _send_backup(chat, bot, reply_to=msg_or_none.message_id if msg_or_none else None)
+    except BackupError as e:
+        return (e.key, {})
+    except Exception:
+        log.exception("backup failed")
+        return ("bk.fail", {})
+    return None
+
+
+async def backup_cmd(update, context):
+    chat, msg, user = update.effective_chat, update.effective_message, update.effective_user
+    if not msg:
+        return
+    if chat.type == "private":
+        await msg.reply_text(L.t("bk.group_only"))
+        return
+    if not await _is_admin(chat, user):
+        await msg.reply_text(L.t("bk.admin_only", chat.id))
+        return
+    problem = await _backup_now(chat, msg, context.bot)
+    if problem:
+        await msg.reply_text(L.t(problem[0], chat.id, **problem[1]))
+
+
+# ------------------------------------------------------------------ restore
+async def _restore_preview(chat, msg, doc, user, bot, explicit):
+    cid = chat.id
+    if not await _can_restore(chat, user):
+        if explicit:
+            await msg.reply_text(L.t("bk.creator_only", cid))
+        return                                  # a file sent by someone else is none of our business
+    if (doc.file_size or 0) > MAX_FILE_BYTES:
+        await msg.reply_text(L.t("ie.too_big", cid))
+        return
+    wait = _cooldown(cid)
+    if wait:
+        await msg.reply_text(L.t("ie.slow", cid, wait=wait))
+        return
+    try:
+        raw = bytes(await (await bot.get_file(doc.file_id)).download_as_bytearray())
+        payload = _read_backup(raw)
+        cur, clean, targets, bad = await asyncio.to_thread(_prepare, cid, payload)
+    except BackupError as e:
+        await msg.reply_text(L.t(e.key, cid))
+        return
+    except TelegramError:
+        await msg.reply_text(L.t("ie.dl_fail", cid))
+        return
+    except Exception:
+        log.exception("restore: reading the backup failed")
+        await msg.reply_text(L.t("bk.bad_file", cid))
+        return
+    changes = _changes(cur, clean, targets)
+    note = L.t("bk.ignored", cid, n=bad) if bad else ""
+    if not changes:
+        await msg.reply_html(L.t("bk.same", cid) + note)
+        return
+    other = L.t("bk.other_group", cid) if isinstance(payload.get("chat_id"), int) and payload["chat_id"] != cid else ""
+    title = html.escape(str(payload.get("chat_title") or "-")[:60])
+    token = _bk_remember(cid, user.id, doc.file_id)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(L.t("bk.btn_yes", cid), callback_data=f"bk:y:{user.id}:{token}"),
+                                InlineKeyboardButton(L.t("bk.btn_no", cid), callback_data=f"bk:n:{user.id}:{token}")]])
+    await msg.reply_html(L.t("bk.preview", cid, title=title, date=_bk_date(payload.get("exported_at")), other=other,
+                             lines=_bk_lines(changes, cid)) + note, reply_markup=kb)
+
+
+async def restore_cmd(update, context):
+    chat, msg, user = update.effective_chat, update.effective_message, update.effective_user
+    if not msg:
+        return
+    if chat.type == "private":
+        await msg.reply_text(L.t("bk.group_only"))
+        return
+    doc = msg.reply_to_message.document if msg.reply_to_message else None
+    if not await _can_restore(chat, user):
+        await msg.reply_text(L.t("bk.creator_only", chat.id))
+        return
+    if doc is None:
+        await msg.reply_text(L.t("bk.reply_file", chat.id))
+        return
+    await _restore_preview(chat, msg, doc, user, context.bot, explicit=True)
+
+
+async def bk_file(update, context):
+    """group=108: a backup file sent in the group (by its name, or right after the ♻️ button) starts a restore."""
+    chat, msg, user = update.effective_chat, update.effective_message, update.effective_user
+    doc = msg.document if msg else None
+    if doc is None or chat is None or user is None or chat.type == "private":
+        return
+    waiting = _bk_wait.get((chat.id, user.id), 0) > time.monotonic()
+    if not ((doc.file_name or "").lower().endswith(BK_FILE_SUFFIX) or waiting):
+        return
+    _bk_wait.pop((chat.id, user.id), None)
+    await _restore_preview(chat, msg, doc, user, context.bot, explicit=waiting)
+
+
+async def _bk_confirm(q, context, chat, user, act, parts):
+    cid = chat.id
+    token = parts[2] if len(parts) > 2 else ""
+    pend = _bk_pending.get(token)
+    if len(parts) < 3 or not parts[1].isdigit() or int(parts[1]) != user.id or (pend and pend["user"] != user.id):
+        await q.answer(L.t("bk.only_asker", cid), show_alert=True)
+        return
+    if pend is None or pend["chat"] != cid or pend["until"] < time.monotonic():
+        _bk_pending.pop(token, None)
+        await q.answer()
+        await _ac_edit(q, L.t("bk.expired", cid), None)
+        return
+    if act == "n":
+        _bk_pending.pop(token, None)
+        await q.answer(L.t("ie.cancelled", cid))
+        await _ac_edit(q, L.t("ie.cancelled", cid), None)
+        return
+    if not await _can_restore(chat, user):
+        await q.answer(L.t("bk.creator_only", cid), show_alert=True)
+        return
+    _bk_pending.pop(token, None)                # one tap, one restore
+    await q.answer()
+    try:                                        # the file is read and checked AGAIN: nothing from the preview is trusted
+        raw = bytes(await (await context.bot.get_file(pend["file"])).download_as_bytearray())
+        cur, clean, targets, bad = await asyncio.to_thread(_prepare, cid, _read_backup(raw))
+    except BackupError as e:
+        await _ac_edit(q, L.t(e.key, cid), None)
+        return
+    except Exception:
+        log.exception("restore: reading the backup failed")
+        await _ac_edit(q, L.t("ie.dl_fail", cid), None)
+        return
+    try:                                        # the way back, before anything changes
+        await _send_backup(chat, context.bot, caption_key="bk.undo_cap")
+    except Exception:
+        log.exception("restore: the undo file could not be sent")
+        await _ac_edit(q, L.t("bk.undo_fail", cid), None)
+        return
+    try:
+        await asyncio.to_thread(_restore_apply, cid, cur, clean, targets)
+    except Exception:
+        log.exception("restore failed")
+        await _ac_edit(q, L.t("bk.restore_fail", cid), None)
+        return
+    await _ac_edit(q, L.t("bk.done", cid, lines=_bk_lines(_changes(cur, clean, targets), cid)), None)
+
+
+async def bk_callback(update, context):
+    """"bk:m" panel, "bk:c" commands, "bk:b" backup now, "bk:r" wait for the file, "bk:y:<user>:<token>" / "bk:n:..." confirm."""
+    q = update.callback_query
+    chat, user = (q.message.chat if q.message else None), q.from_user
+    if chat is None:
+        await q.answer()
+        return
+    parts = (q.data or "").split(":")[1:]
+    act = parts[0] if parts else ""
+    if act in ("y", "n"):                       # confirm buttons: only the person who asked (not the help-menu owner rule)
+        await _bk_confirm(q, context, chat, user, act, parts)
+        return
+    if await extra.menu_not_owner(q):
+        return
+    cid = chat.id
+    if act == "m":
+        await q.answer()
+        await _ac_edit(q, *_bk_panel(chat))
+    elif act == "c":
+        await q.answer()
+        await _ac_edit(q, *_bk_command_page(chat))
+    elif chat.type == "private":
+        await q.answer(L.t("bk.group_only"), show_alert=True)
+    elif act == "b":
+        if not await _is_admin(chat, user):
+            await q.answer(L.t("bk.admin_only", cid), show_alert=True)
+            return
+        await q.answer(L.t("bk.making", cid))
+        problem = await _backup_now(chat, None, context.bot)
+        if problem:
+            await context.bot.send_message(cid, L.t(problem[0], cid, **problem[1]))
+    elif act == "r":
+        if not await _can_restore(chat, user):
+            await q.answer(L.t("bk.creator_only", cid), show_alert=True)
+            return
+        if len(_bk_wait) > 500:
+            _bk_wait.clear()
+        _bk_wait[(cid, user.id)] = time.monotonic() + BK_WAIT_SECS
+        await q.answer(L.t("bk.send_file", cid), show_alert=True)
+    else:
+        await q.answer()
+
+
+# ======================================================================================================
+# 4c. GROUP LINKS  (/link /links for everybody, /setlink /addlink /dellink for admins; saved per group)
+# ======================================================================================================
+#   /setlink URL|auto|off   the MAIN link of this group (a t.me link, or "auto": the bot makes an invite link when asked)
+#   /addlink NAME URL       another link of yours (your other groups or channels); /dellink NAME removes it
+#   /link [NAME]            shows the main link (or the named one) with a Join button
+#   /links                  every saved link as buttons
+# Settings (per group, backed up by /backup): link_main = "https://t.me/..." | "auto" | ""; link_list = JSON {name: url}.
+# Only t.me / telegram.me links are accepted, and they are checked again every time they are read (a restored or imported
+# file is never trusted). A member can ask for a link every LK_MEMBER_SECS seconds; admins are not slowed down.
+LK_MAIN_KEY, LK_LIST_KEY = "link_main", "link_list"
+LK_MAX = 20                          # named links per group
+LK_MEMBER_SECS = 10
+LK_AUTO_SECS = 3600                  # an "auto" invite link is reused for this long (not one new link per question)
+LK_NAME_RE = re.compile(r"[a-z0-9_]{1,20}")
+LK_URL_RE = re.compile(r"https://t\.me/(?:\+[A-Za-z0-9_-]{8,64}|joinchat/[A-Za-z0-9_-]{8,64}|[A-Za-z][A-Za-z0-9_]{4,31}(?:/\d{1,12})?)")
+MORE_PANELS = MORE_PANELS + (("lk", "lk:m"),)                                  # 🔗 on /help page 2
+_lk_last = {}                        # (chat id, user id) -> monotonic time of the last answer
+_lk_auto = {}                        # chat id -> (url, monotonic time): the invite link made by "auto"
+
+
+def lk_norm(text):
+    """A clean https://t.me/... link from what an admin typed (@name, t.me/..., http://...), or None. Nothing else is accepted."""
+    t = (text or "").strip()
+    if t.startswith("@"):
+        t = "https://t.me/" + t[1:]
+    t = re.sub(r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/", "https://t.me/", t, flags=re.I)
+    return t if LK_URL_RE.fullmatch(t) else None
+
+
+def _lk_load(chat_id):
+    """(main, {name: url}) of this group. Everything is validated here, so a bad stored value is simply ignored."""
+    main = D.get_setting(chat_id, LK_MAIN_KEY, "") or ""
+    if main != "auto" and not (isinstance(main, str) and LK_URL_RE.fullmatch(main)):
+        main = ""
+    try:
+        data = json.loads(D.get_setting(chat_id, LK_LIST_KEY, "") or "{}")
+    except (ValueError, TypeError, RecursionError):
+        data = {}
+    links = {}
+    for k, v in (data.items() if isinstance(data, dict) else ()):
+        if len(links) < LK_MAX and isinstance(k, str) and LK_NAME_RE.fullmatch(k) and isinstance(v, str) and LK_URL_RE.fullmatch(v):
+            links[k] = v
+    return main, links
+
+
+def _lk_save_list(chat_id, links):
+    D.set_setting(chat_id, LK_LIST_KEY, json.dumps(links, sort_keys=True) if links else "")
+
+
+async def _lk_main_url(chat, bot, main):
+    """The URL behind the main link; for "auto" an invite link is made (needs the bot's 'invite users' right), then reused."""
+    if main != "auto":
+        return main
+    url, at = _lk_auto.get(chat.id, (None, 0))
+    if url and time.monotonic() - at < LK_AUTO_SECS:
+        return url
+    inv = await bot.create_chat_invite_link(chat.id, name="Shared by the bot")
+    url = lk_norm(getattr(inv, "invite_link", "") or "")
+    if not url:
+        raise TelegramError("no usable invite link")
+    if len(_lk_auto) > 500:
+        _lk_auto.clear()
+    _lk_auto[chat.id] = (url, time.monotonic())
+    return url
+
+
+def _lk_join_markup(cid, url):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(L.t("lk.btn_join", cid), url=url)]])
+
+
+async def _lk_slow(chat, user):
+    """Seconds this person must still wait (0 = go). Admins never wait."""
+    if await _is_admin(chat, user):
+        return 0
+    now, key = time.monotonic(), (chat.id, user.id)
+    left = int(LK_MEMBER_SECS - (now - _lk_last.get(key, -10 ** 9)))
+    if left > 0:
+        return left
+    if len(_lk_last) > 5000:
+        _lk_last.clear()
+    _lk_last[key] = now
+    return 0
+
+
+async def _lk_show(chat, user, bot, name, reply):
+    """The shared part of /link and the panel button: `reply(text, markup)` sends the answer."""
+    cid = chat.id
+    left = await _lk_slow(chat, user)
+    if left:
+        await reply(L.t("lk.slow", cid, secs=left), None)
+        return
+    main, links = _lk_load(cid)
+    if name:
+        if name not in links:
+            await reply(L.t("lk.not_found", cid, name=html.escape(name[:20]), names=", ".join(sorted(links)) or "-"), None)
+            return
+        await reply(L.t("lk.shown", cid, title=html.escape(name)), _lk_join_markup(cid, links[name]))
+        return
+    if not main:
+        if links:
+            await _lk_list(chat, bot, reply)
+        else:
+            await reply(L.t("lk.none", cid), None)
+        return
+    try:
+        url = await _lk_main_url(chat, bot, main)
+    except TelegramError:
+        await reply(L.t("lk.auto_fail", cid), None)
+        return
+    await reply(L.t("lk.shown", cid, title=html.escape(chat.title or "")), _lk_join_markup(cid, url))
+
+
+async def _lk_list(chat, bot, reply):
+    cid = chat.id
+    main, links = _lk_load(cid)
+    buttons = []
+    if main:
+        try:
+            buttons.append(InlineKeyboardButton("🔗 " + L.t("lk.main_name", cid), url=await _lk_main_url(chat, bot, main)))
+        except TelegramError:
+            pass
+    buttons += [InlineKeyboardButton("🔗 " + n, url=u) for n, u in sorted(links.items())]
+    if not buttons:
+        await reply(L.t("lk.none", cid), None)
+        return
+    await reply(L.t("lk.list_head", cid), InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)]))
+
+
+# ------------------------------------------------------------------ commands
+async def _lk_gate(update, admin):
+    """(msg, chat, user) when the command may run here, else None after saying why."""
+    chat, msg, user = update.effective_chat, update.effective_message, update.effective_user
+    if not msg or not chat or not user:
+        return None
+    if chat.type == "private":
+        await msg.reply_text(L.t("lk.group_only"))
+        return None
+    if admin and not await _is_admin(chat, user):
+        await msg.reply_text(L.t("lk.admin_only", chat.id))
+        return None
+    return msg, chat, user
+
+
+async def link_cmd(update, context):
+    g = await _lk_gate(update, False)
+    if g:
+        msg, chat, user = g
+        name = (context.args[0].lower() if context.args else "")
+        await _lk_show(chat, user, context.bot, name, lambda t, m: msg.reply_html(t, reply_markup=m))
+
+
+async def links_cmd(update, context):
+    g = await _lk_gate(update, False)
+    if g:
+        msg, chat, user = g
+        left = await _lk_slow(chat, user)
+        if left:
+            await msg.reply_text(L.t("lk.slow", chat.id, secs=left))
+            return
+        await _lk_list(chat, context.bot, lambda t, m: msg.reply_html(t, reply_markup=m))
+
+
+async def setlink_cmd(update, context):
+    g = await _lk_gate(update, True)
+    if not g:
+        return
+    msg, chat, user = g
+    cid, arg = chat.id, (context.args[0] if context.args else "")
+    if not arg:
+        main, _ = _lk_load(cid)
+        shown = html.escape(main) if main and main != "auto" else L.t("lk.main_auto" if main else "lk.main_none", cid)
+        await msg.reply_html(L.t("lk.use_set", cid, main=shown))
+        return
+    if arg.lower() == "off":
+        D.set_setting(cid, LK_MAIN_KEY, "")
+        _lk_auto.pop(cid, None)
+        await msg.reply_text(L.t("lk.set_off", cid))
+        return
+    if arg.lower() == "auto":
+        try:
+            _lk_auto.pop(cid, None)
+            await _lk_main_url(chat, context.bot, "auto")
+        except TelegramError:
+            await msg.reply_text(L.t("lk.auto_fail", cid))
+            return
+        D.set_setting(cid, LK_MAIN_KEY, "auto")
+        await msg.reply_text(L.t("lk.set_auto", cid))
+        return
+    url = lk_norm(arg)
+    if not url:
+        await msg.reply_text(L.t("lk.bad_url", cid))
+        return
+    D.set_setting(cid, LK_MAIN_KEY, url)
+    await msg.reply_html(L.t("lk.set_ok", cid, url=html.escape(url)))
+
+
+async def addlink_cmd(update, context):
+    g = await _lk_gate(update, True)
+    if not g:
+        return
+    msg, chat, user = g
+    cid, a = chat.id, context.args or []
+    if len(a) < 2:
+        await msg.reply_html(L.t("lk.use_add", cid))
+        return
+    name, url = a[0].lower(), lk_norm(a[1])
+    if not LK_NAME_RE.fullmatch(name):
+        await msg.reply_text(L.t("lk.bad_name", cid))
+        return
+    if not url:
+        await msg.reply_text(L.t("lk.bad_url", cid))
+        return
+    _, links = _lk_load(cid)
+    if name not in links and len(links) >= LK_MAX:
+        await msg.reply_text(L.t("lk.too_many", cid, max=LK_MAX))
+        return
+    updated = name in links
+    links[name] = url
+    _lk_save_list(cid, links)
+    await msg.reply_html(L.t("lk.updated" if updated else "lk.added", cid, name=html.escape(name)))
+
+
+async def dellink_cmd(update, context):
+    g = await _lk_gate(update, True)
+    if not g:
+        return
+    msg, chat, user = g
+    cid, name = chat.id, (context.args[0].lower() if context.args else "")
+    if not name:
+        await msg.reply_html(L.t("lk.use_del", cid))
+        return
+    _, links = _lk_load(cid)
+    if name not in links:
+        await msg.reply_html(L.t("lk.del_none", cid, name=html.escape(name[:20])))
+        return
+    del links[name]
+    _lk_save_list(cid, links)
+    await msg.reply_html(L.t("lk.removed", cid, name=html.escape(name)))
+
+
+# ------------------------------------------------------------------ panel on /help page 2
+def _lk_panel(chat):
+    cid = chat.id
+    main, links = _lk_load(cid)
+    shown = html.escape(main) if main and main != "auto" else L.t("lk.main_auto" if main else "lk.main_none", cid)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(L.t("lk.btn_show", cid), callback_data="lk:s"),
+                                InlineKeyboardButton(L.t("lk.btn_all", cid), callback_data="lk:l")],
+                               [InlineKeyboardButton(L.t("lk.btn_cmd", cid), callback_data="lk:c"),
+                                InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:more")]])
+    return L.t("lk.panel", cid, main=shown, count=len(links)), kb
+
+
+async def lk_callback(update, context):
+    """"lk:m" panel · "lk:c" commands (copyable) · "lk:s" show the main link · "lk:l" all links."""
+    q = update.callback_query
+    chat, user = (q.message.chat if q.message else None), q.from_user
+    if chat is None:
+        await q.answer()
+        return
+    if await extra.menu_not_owner(q):
+        return
+    cid, act = chat.id, ((q.data or "").split(":") + [""])[1]
+    if act == "m":
+        await q.answer()
+        await _ac_edit(q, *_lk_panel(chat))
+    elif act == "c":
+        await q.answer()
+        await _ac_edit(q, L.t("lk.cmd_page", cid), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="lk:m")]]))
+    elif act in ("s", "l"):
+        if chat.type == "private":
+            await q.answer(L.t("lk.group_only"), show_alert=True)
+            return
+        await q.answer()
+        send = lambda t, m: context.bot.send_message(cid, t, parse_mode="HTML", reply_markup=m)
+        if act == "s":
+            await _lk_show(chat, user, context.bot, "", send)
+        else:
+            left = await _lk_slow(chat, user)
+            await (send(L.t("lk.slow", cid, secs=left), None) if left else _lk_list(chat, context.bot, send))
+    else:
+        await q.answer()
 
 
 # ======================================================================================================
@@ -5986,6 +7174,9 @@ def register(app, deps):
     app.add_handler(CommandHandler("raidmode", raidmode_cmd))          # Raid Shield: ban / mute joiners / lock the group
     app.add_handler(CommandHandler("raidwindow", raidwindow_cmd))
     app.add_handler(CallbackQueryHandler(rd_callback, pattern=r"^rd:"))
+    app.add_handler(CommandHandler("sched", sched_cmd))                # Scheduled messages
+    app.add_handler(CallbackQueryHandler(sc_callback, pattern=r"^sc:"))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, sc_input), group=-14)    # ➕ / ✏️: the next message
     app.add_handler(CommandHandler("anniv", anniv_cmd))                # Join anniversaries
     app.add_handler(CallbackQueryHandler(an_callback, pattern=r"^an:"))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, an_input), group=-13)    # ✏️ Text: the next message
@@ -6042,6 +7233,16 @@ def register(app, deps):
     app.add_handler(CommandHandler("import", import_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CallbackQueryHandler(ie_callback, pattern=r"^ie:"))
+
+    # one-tap backup / restore (section 4b): /backup /bk, /restore /rs, the 💾 panel, a backup file sent in the group
+    app.add_handler(CommandHandler(["backup", "bk"], backup_cmd))
+    app.add_handler(CommandHandler(["restore", "rs"], restore_cmd))
+    app.add_handler(CallbackQueryHandler(bk_callback, pattern=r"^bk:"))
+    # group links (section 4c): /link /links for everybody, /setlink /addlink /dellink for admins, the 🔗 panel
+    for _name, _fn in (("link", link_cmd), ("links", links_cmd), ("setlink", setlink_cmd), ("addlink", addlink_cmd), ("dellink", dellink_cmd)):
+        app.add_handler(CommandHandler(_name, _fn))
+    app.add_handler(CallbackQueryHandler(lk_callback, pattern=r"^lk:"))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.Document.ALL, bk_file), group=108)
 
     # broadcast (Bot Staff panel): buttons + the message the staff member sends
     app.add_handler(CallbackQueryHandler(bc_callback, pattern=r"^bc:"))

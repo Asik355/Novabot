@@ -4893,6 +4893,11 @@ def register_blocking(app, deps):
         app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, ads_guard), group=-7)
     else:
         log.info("Auto-Ads blocker is switched off (AUTOADS_ENABLED=0).")
+    try:  # Git manager (github.py): all /git commands live there; a problem in it never stops the bot
+        import github
+        github.register_git_handlers(app, deps)
+    except Exception:
+        log.exception("Git manager could not be loaded; the rest of the bot is not affected.")
 
 
 # =============================================================================

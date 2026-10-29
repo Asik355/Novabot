@@ -22,3 +22,6 @@ imageio-ffmpeg>=0.5.1
 # Local picture check for NSFW Content protection (extra.py imports PIL; without it photos are never sent to the AI
 # unless the caption/file name/spoiler already looks suspicious)
 Pillow>=10.0,<13.0
+
+# Git manager (github.py): encrypts each person's saved GitHub token (needs the GIT_TOKEN_KEY environment variable)
+cryptography>=42.0,<47.0
