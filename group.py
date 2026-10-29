@@ -4990,8 +4990,8 @@ def help_buttons(key, chat):
 
 
 def more_buttons(chat):
-    """The panel buttons for /help page 2, in order (empty in private chats)."""
-    if chat is None or getattr(chat, "type", "private") == "private":
+    """The panel buttons for /help page 2, in order (shown in groups and in private chats)."""
+    if chat is None:
         return []
     cid = getattr(chat, "id", None)
     return [InlineKeyboardButton(L.t("mo.b_" + key, cid), callback_data=data) for key, data in MORE_PANELS]

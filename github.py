@@ -655,7 +655,7 @@ async def _repos_view(token: str, page: int, cid: Any, uid: int) -> tuple:
         row.append(InlineKeyboardButton("⬅️", callback_data=f"gt:rp:{page - 1}"))
     if more:
         row.append(InlineKeyboardButton("➡️", callback_data=f"gt:rp:{page + 1}"))
-    rows = ([row] if row else []) + [[InlineKeyboardButton(_t("pick.back", cid), callback_data="gt:m")]]
+    rows = ([row] if row else []) + [[InlineKeyboardButton(_t("pick.back", cid), callback_data="gt:b")]]
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -1141,7 +1141,7 @@ PAGES = {"g": ("gt.how", ("gt.btn_token", "gt:t")), "c": ("gt.cmds", ("gt.btn_gu
 
 
 async def git_callback(update, context):
-    """gt:m panel · gt:g guide · gt:c commands · gt:t token · gt:p permissions · gt:s status · gt:rp:<page> repos · gt:y|n:<user>:<token>."""
+    """gt:m home (Buttons | Commands) · gt:b buttons panel · gt:g guide · gt:c commands · gt:t token · gt:p permissions · gt:s status · gt:rp:<page> repos · gt:y|n:<user>:<token>."""
     q = update.callback_query
     chat, user = (q.message.chat if q.message else None), q.from_user
     if chat is None:
@@ -1155,15 +1155,19 @@ async def git_callback(update, context):
     if await _menu_blocked(q):
         return
     btn = lambda key, data: InlineKeyboardButton(_t(key, cid), callback_data=data)
-    if act == "m":
+    if act == "m":                                                            # landing: 🔘 Buttons | ⌨️ Commands
+        await q.answer()
+        await _edit(q, _t("gt.home", cid), InlineKeyboardMarkup([
+            [btn("gt.btn_buttons", "gt:b"), btn("gt.btn_cmds", "gt:c")], [btn("pick.back", "help:more")]]))
+    elif act == "b":                                                          # every button of the Git panel
         await q.answer()
         await _edit(q, _t("gt.panel", cid), InlineKeyboardMarkup([
             [btn("gt.btn_guide", "gt:g"), btn("gt.btn_cmds", "gt:c")], [btn("gt.btn_repos", "gt:rp:1"), btn("gt.btn_status", "gt:s")],
-            [btn("gt.btn_token", "gt:t"), btn("gt.btn_perms", "gt:p")], [btn("pick.back", "help:more")]]))
+            [btn("gt.btn_token", "gt:t"), btn("gt.btn_perms", "gt:p")], [btn("pick.back", "gt:m")]]))
     elif act in PAGES:                                                        # guide, commands, token guide, permissions
         await q.answer()
         key, side = PAGES[act]
-        rows = ([[btn(side[0], side[1])]] if side else []) + [[btn("pick.back", "gt:m")]]
+        rows = ([[btn(side[0], side[1])]] if side else []) + [[btn("pick.back", "gt:m" if act == "c" else "gt:b")]]
         await _edit(q, _t(key, cid), InlineKeyboardMarkup(rows))
     elif act == "s":
         if chat.type != "private" or not _rate_ok(user.id):
@@ -1178,7 +1182,7 @@ async def git_callback(update, context):
             text = await _status_text(user.id, token, cid)
         except GitError as e:
             text = _show_error(e, cid)
-        await _edit(q, text, InlineKeyboardMarkup([[btn("pick.back", "gt:m")]]))
+        await _edit(q, text, InlineKeyboardMarkup([[btn("pick.back", "gt:b")]]))
     elif act == "rp":
         if chat.type != "private" or not _rate_ok(user.id):
             await q.answer(_t("gt.private" if chat.type != "private" else "gt.slow", cid), show_alert=True)
@@ -1192,7 +1196,7 @@ async def git_callback(update, context):
         try:
             text, kb = await _repos_view(token, page, cid, user.id)
         except GitError as e:
-            text, kb = _show_error(e, cid), InlineKeyboardMarkup([[btn("pick.back", "gt:m")]])
+            text, kb = _show_error(e, cid), InlineKeyboardMarkup([[btn("pick.back", "gt:b")]])
         await _edit(q, text, kb)
     else:
         await q.answer()
@@ -1272,6 +1276,12 @@ def register_git_handlers(app, deps) -> None:
     for lang_dict, texts in ((L.EN, TEXTS_EN), (L.HINGLISH, TEXTS_HI)):          # the texts live next to the code
         for k, v in texts.items():
             lang_dict.setdefault(k, v)
+    icon = os.environ.get("GIT_EMOJI_ID", "").strip()                          # optional: custom-emoji id of a GitHub logo
+    if icon.isdigit():                                                          # shown in message headers (buttons cannot show it)
+        for d in (L.EN, L.HINGLISH):
+            for k in ("gt.panel", "gt.home", "gt.cmds"):
+                if isinstance(d.get(k), str):
+                    d[k] = d[k].replace("<b>🐙 Git</b>", f'<b><tg-emoji emoji-id="{icon}">🐙</tg-emoji> Git</b>')
     grp = sys.modules.get("group")                                              # the 🐙 button on /help page 2
     if grp is not None and ("gt", "gt:m") not in grp.MORE_PANELS:
         grp.MORE_PANELS = grp.MORE_PANELS + (("gt", "gt:m"),)
@@ -1287,7 +1297,7 @@ def register_git_handlers(app, deps) -> None:
 # Merged into lang.py's tables at start-up. Same keys and same {placeholders} in both; never name a placeholder lang / chat_id / key.
 # Texts are sent as HTML: never put a raw < or > in them.
 TEXTS_EN = {
-    "mo.b_gt": "🐙 Git",
+    "mo.b_gt": "🐙 GitHub",
     "gt.btn_yes": "✅ Yes",
     "gt.btn_no": "❌ Cancel",
     "gt.btn_delete": "🗑 Yes, delete",
@@ -1405,15 +1415,17 @@ TEXTS_EN = {
     "gt.zip_unpacked": "🚫 The ZIP unpacks to more than {mb} MB.",
     "gt.zip_dupe": "🚫 The ZIP has the same path twice: <code>{name}</code>.",
     "gt.how": "<b>📖 Step by step</b>\nTap a line to copy it, paste it in a PRIVATE chat with me, and change the words.\n\n<b>1. Connect (once)</b>\nMake a token (button 🔑 Get token), then send:\n<code>/gittoken ghp_yourtoken</code>\nI delete your message and keep the token safe.\n\n<b>2. Make a new repository</b>\n<code>/gitnew mybot</code>\nIt is private. For a public one:\n<code>/gitnew mybot public</code>\n\n<b>3. Put your files on GitHub</b>\nMake a ZIP of your project folder, then send:\n<code>/gitpush yourname/mybot</code>\nThen send me the ZIP. I show what is new or changed. Tap ⬆️ Push to confirm. Nothing is deleted from GitHub.\n\n<b>4. Change one file</b>\nReplace it with a new file:\n<code>/gitput yourname/mybot bot.py</code>\nEdit its text here in Telegram:\n<code>/gitedit yourname/mybot bot.py</code>\nI always show the change first.\n\n<b>5. Look, download, delete</b>\nSee the files:\n<code>/gitls yourname/mybot</code>\nGet one file:\n<code>/gitget yourname/mybot bot.py</code>\nGet everything as a ZIP:\n<code>/gitzip yourname/mybot</code>\nDelete a file (asks first):\n<code>/gitdel yourname/mybot bot.py</code>\n\nYour GitHub name and repo names are in <code>/gitrepos</code>.\nStuck? <code>/gitcancel</code> stops whatever I was waiting for.",
-    "gt.cmds": "<b>⌨️ All commands</b>\nTap a line to copy it.\n\n<b>Connect</b>\n<code>/gittoken ghp_yourtoken</code> connect your GitHub\n<code>/gitstatus</code> who you are connected as\n<code>/gitoff</code> disconnect\n\n<b>Repositories</b>\n<code>/gitrepos</code> your repos\n<code>/gitinfo yourname/mybot</code> repo details\n<code>/gitls yourname/mybot</code> list the files\n<code>/gitls yourname/mybot src</code> list a folder\n<code>/gitnew mybot</code> new private repo\n<code>/gitnew mybot public</code> new public repo\n<code>/gitdelrepo yourname/mybot</code> delete a repo (you type its name to confirm)\n\n<b>Files</b>\n<code>/gitget yourname/mybot bot.py</code> download a file\n<code>/gitput yourname/mybot bot.py</code> upload or replace a file\n<code>/gitedit yourname/mybot bot.py</code> edit a text file\n<code>/gitdel yourname/mybot bot.py</code> delete a file (asks first)\n\n<b>ZIP</b>\n<code>/gitzip yourname/mybot</code> download everything as a ZIP\n<code>/gitpush yourname/mybot</code> upload a ZIP of files, then send the ZIP\n\n<b>Other</b>\n<code>/gitcancel</code> stop a step I am waiting for\n<code>/gitupdate</code> bot owner only: update the bot's own repo",
+    "gt.cmds": "<b>⌨️ All commands</b>\nTap a <b>blue</b> command to run it. Tap the grey example to copy it.\n\n<b>Connect</b>\n/gittoken <code>ghp_yourtoken</code> connect your GitHub\n/gitstatus who you are connected as\n/gitoff disconnect\n\n<b>Repositories</b>\n/gitrepos your repos\n/gitinfo <code>yourname/mybot</code> repo details\n/gitls <code>yourname/mybot</code> list the files\n/gitls <code>yourname/mybot src</code> list a folder\n/gitnew <code>mybot</code> new private repo\n/gitnew <code>mybot public</code> new public repo\n/gitdelrepo <code>yourname/mybot</code> delete a repo (you type its name to confirm)\n\n<b>Files</b>\n/gitget <code>yourname/mybot bot.py</code> download a file\n/gitput <code>yourname/mybot bot.py</code> upload or replace a file\n/gitedit <code>yourname/mybot bot.py</code> edit a text file\n/gitdel <code>yourname/mybot bot.py</code> delete a file (asks first)\n\n<b>ZIP</b>\n/gitzip <code>yourname/mybot</code> download everything as a ZIP\n/gitpush <code>yourname/mybot</code> upload a ZIP of files, then send the ZIP\n\n<b>Other</b>\n/gitcancel stop a step I am waiting for\n/gitupdate bot owner only: update the bot's own repo",
     "gt.btn_guide": "📖 Guide",
     "gt.btn_cmds": "⌨️ Commands",
+    "gt.btn_buttons": "🔘 Buttons",
+    "gt.home": "<b>🐙 Git</b>\n\nChoose how you want to use it:\n🔘 <b>Buttons</b>: tap through everything with buttons.\n⌨️ <b>Commands</b>: see every command, ready to copy.",
     "gt.btn_repos": "📚 My repos",
     "gt.btn_status": "🔑 Status",
 }
 
 TEXTS_HI = {
-    "mo.b_gt": "🐙 Git",
+    "mo.b_gt": "🐙 GitHub",
     "gt.btn_yes": "✅ Haan",
     "gt.btn_no": "❌ Cancel",
     "gt.btn_delete": "🗑 Haan, delete karo",
@@ -1531,9 +1543,11 @@ TEXTS_HI = {
     "gt.zip_unpacked": "🚫 ZIP khulne par {mb} MB se zyada ho jaati hai.",
     "gt.zip_dupe": "🚫 ZIP mein ek hi path do baar hai: <code>{name}</code>.",
     "gt.how": "<b>📖 Step by step</b>\nLine par tap karke copy karo, mere PRIVATE chat mein paste karo, aur shabd badlo.\n\n<b>1. Connect karo (ek baar)</b>\nToken banao (button 🔑 Get token), phir bhejo:\n<code>/gittoken ghp_yourtoken</code>\nMain tumhara message delete kar deta hoon aur token safe rakhta hoon.\n\n<b>2. Nayi repository banao</b>\n<code>/gitnew mybot</code>\nYeh private hoti hai. Public ke liye:\n<code>/gitnew mybot public</code>\n\n<b>3. Apni files GitHub par daalo</b>\nApne project folder ki ZIP banao, phir bhejo:\n<code>/gitpush yourname/mybot</code>\nPhir mujhe ZIP bhejo. Main dikhata hoon kya nayi ya badli hai. Confirm ke liye ⬆️ Push dabao. GitHub se kuch delete nahi hota.\n\n<b>4. Ek file badlo</b>\nNayi file se replace karo:\n<code>/gitput yourname/mybot bot.py</code>\nUska text yahin Telegram mein edit karo:\n<code>/gitedit yourname/mybot bot.py</code>\nMain badlav pehle hamesha dikhata hoon.\n\n<b>5. Dekho, download karo, delete karo</b>\nFiles dekho:\n<code>/gitls yourname/mybot</code>\nEk file lo:\n<code>/gitget yourname/mybot bot.py</code>\nSab kuch ZIP mein lo:\n<code>/gitzip yourname/mybot</code>\nFile delete karo (pehle poochta hoon):\n<code>/gitdel yourname/mybot bot.py</code>\n\nTumhara GitHub naam aur repo ke naam <code>/gitrepos</code> mein hain.\nAtak gaye? <code>/gitcancel</code> jo main wait kar raha tha use rok deta hai.",
-    "gt.cmds": "<b>⌨️ Saari commands</b>\nLine par tap karke copy karo.\n\n<b>Connect</b>\n<code>/gittoken ghp_yourtoken</code> apna GitHub connect karo\n<code>/gitstatus</code> kis account se connected ho\n<code>/gitoff</code> disconnect karo\n\n<b>Repositories</b>\n<code>/gitrepos</code> tumhari repos\n<code>/gitinfo yourname/mybot</code> repo ki details\n<code>/gitls yourname/mybot</code> files ki list\n<code>/gitls yourname/mybot src</code> folder ki list\n<code>/gitnew mybot</code> nayi private repo\n<code>/gitnew mybot public</code> nayi public repo\n<code>/gitdelrepo yourname/mybot</code> repo delete karo (confirm ke liye uska naam type karo)\n\n<b>Files</b>\n<code>/gitget yourname/mybot bot.py</code> file download karo\n<code>/gitput yourname/mybot bot.py</code> file upload ya replace karo\n<code>/gitedit yourname/mybot bot.py</code> text file edit karo\n<code>/gitdel yourname/mybot bot.py</code> file delete karo (pehle poochta hoon)\n\n<b>ZIP</b>\n<code>/gitzip yourname/mybot</code> sab kuch ZIP mein download karo\n<code>/gitpush yourname/mybot</code> files ki ZIP upload karo, phir ZIP bhejo\n\n<b>Aur</b>\n<code>/gitcancel</code> jo step main wait kar raha hoon use roko\n<code>/gitupdate</code> sirf bot owner: bot ki apni repo update karo",
+    "gt.cmds": "<b>⌨️ Saari commands</b>\n<b>Neeli</b> command par tap karo to chalegi. Grey example par tap karo to copy hoga.\n\n<b>Connect</b>\n/gittoken <code>ghp_yourtoken</code> apna GitHub connect karo\n/gitstatus kis account se connected ho\n/gitoff disconnect karo\n\n<b>Repositories</b>\n/gitrepos tumhari repos\n/gitinfo <code>yourname/mybot</code> repo ki details\n/gitls <code>yourname/mybot</code> files ki list\n/gitls <code>yourname/mybot src</code> folder ki list\n/gitnew <code>mybot</code> nayi private repo\n/gitnew <code>mybot public</code> nayi public repo\n/gitdelrepo <code>yourname/mybot</code> repo delete karo (confirm ke liye uska naam type karo)\n\n<b>Files</b>\n/gitget <code>yourname/mybot bot.py</code> file download karo\n/gitput <code>yourname/mybot bot.py</code> file upload ya replace karo\n/gitedit <code>yourname/mybot bot.py</code> text file edit karo\n/gitdel <code>yourname/mybot bot.py</code> file delete karo (pehle poochta hoon)\n\n<b>ZIP</b>\n/gitzip <code>yourname/mybot</code> sab kuch ZIP mein download karo\n/gitpush <code>yourname/mybot</code> files ki ZIP upload karo, phir ZIP bhejo\n\n<b>Aur</b>\n/gitcancel jo step main wait kar raha hoon use roko\n/gitupdate sirf bot owner: bot ki apni repo update karo",
     "gt.btn_guide": "📖 Guide",
     "gt.btn_cmds": "⌨️ Commands",
+    "gt.btn_buttons": "🔘 Buttons",
+    "gt.home": "<b>🐙 Git</b>\n\nChuno kaise use karna hai:\n🔘 <b>Buttons</b>: sab kuch buttons se chalao.\n⌨️ <b>Commands</b>: saari commands copy karne ke liye dekho.",
     "gt.btn_repos": "📚 My repos",
     "gt.btn_status": "🔑 Status",
 }
