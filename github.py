@@ -88,7 +88,6 @@ _busy: set = set()
 _ops: dict = {}                          # token -> pending confirm
 _inputs: dict = {}                       # user id -> what the bot waits for next
 _auto_pick: dict = {}                    # user id -> files found for a directly uploaded file (waiting for a tap)
-_gt_origin: dict = {}                    # (chat id, message id) -> the Git screen was opened from /help page 1
 
 
 class GitError(Exception):
@@ -1613,14 +1612,11 @@ async def git_callback(update, context):
     if await _menu_blocked(q):
         return
     btn = lambda key, data: InlineKeyboardButton(_t(key, cid), callback_data=data)
-    if act == "h":                                                            # opened from /help page 1: Back goes to page 1
-        if len(_gt_origin) > 500:
-            _gt_origin.clear()
-        _gt_origin[(cid, q.message.message_id)] = True
+    if act == "h":                                                            # the 🐙 GitHub button on /help page 1
         act = "m"
     if act == "m":                                                            # landing: 🔘 Buttons | ⌨️ Commands
         await q.answer()
-        back = "help:main" if (cid, q.message.message_id) in _gt_origin else "help:more"
+        back = "help:main"
         await _edit(q, _t("gt.home", cid), InlineKeyboardMarkup([
             [btn("gt.btn_buttons", "gt:b"), btn("gt.btn_cmds", "gt:c")], [btn("pick.back", back)]]))
     elif act == "b":                                                          # every button of the Git panel
@@ -1760,9 +1756,6 @@ def register_git_handlers(app, deps) -> None:
             for k in ("gt.panel", "gt.home", "gt.cmds"):
                 if isinstance(d.get(k), str):
                     d[k] = d[k].replace("<b>🐙 Git</b>", f'<b><tg-emoji emoji-id="{icon}">🐙</tg-emoji> Git</b>')
-    grp = sys.modules.get("group")                                              # the 🐙 button on /help page 2
-    if grp is not None and ("gt", "gt:m") not in grp.MORE_PANELS:
-        grp.MORE_PANELS = grp.MORE_PANELS + (("gt", "gt:m"),)
     for names, fn in COMMANDS:
         app.add_handler(CommandHandler(list(names), fn))
     app.add_handler(CallbackQueryHandler(git_callback, pattern=r"^gt:"))
@@ -1793,7 +1786,7 @@ TEXTS_EN = {
     "gt.busy": "⏳ Your previous Git job is still running.",
     "gt.no_requests": "⚠️ The server is missing the \"requests\" package, so Git commands are off.",
     "gt.no_token": "🔑 Connect your GitHub first: send /gittoken in this private chat (see the 🐙 Git button in /help for the guide).",
-    "gt.token_help": "<b>🔑 /gittoken</b>\n\nSend: <code>/gittoken YOUR_TOKEN</code>\nI delete your message and save the token encrypted.\nNeed a token? Open /help → page 2 → 🐙 Git → 🔑 Token guide.",
+    "gt.token_help": "<b>🔑 /gittoken</b>\n\nSend: <code>/gittoken YOUR_TOKEN</code>\nI delete your message and save the token encrypted.\nNeed a token? Open /help → page 1 → 🐙 GitHub → 🔑 Token guide.",
     "gt.token_public": "⚠️ Never post a token in a group. I deleted that message if I could. Revoke that token on GitHub now, then send /gittoken in a private chat with me.",
     "gt.token_bad": "⚠️ That does not look like a GitHub token. I deleted your message.",
     "gt.token_rejected": "⚠️ GitHub rejected that token (wrong, expired or revoked). I deleted your message.",
@@ -1921,7 +1914,7 @@ TEXTS_HI = {
     "gt.busy": "⏳ Tumhara pichla Git kaam abhi chal raha hai.",
     "gt.no_requests": "⚠️ Server par \"requests\" package nahi hai, isliye Git commands band hain.",
     "gt.no_token": "🔑 Pehle apna GitHub connect karo: is private chat mein /gittoken bhejo (guide ke liye /help mein 🐙 Git button).",
-    "gt.token_help": "<b>🔑 /gittoken</b>\n\nBhejo: <code>/gittoken YOUR_TOKEN</code>\nMain tumhara message delete kar deta hoon aur token encrypted save karta hoon.\nToken chahiye? /help → page 2 → 🐙 Git → 🔑 Token guide.",
+    "gt.token_help": "<b>🔑 /gittoken</b>\n\nBhejo: <code>/gittoken YOUR_TOKEN</code>\nMain tumhara message delete kar deta hoon aur token encrypted save karta hoon.\nToken chahiye? /help → page 1 → 🐙 GitHub → 🔑 Token guide.",
     "gt.token_public": "⚠️ Token kabhi group mein mat bhejo. Maine wo message delete kar diya agar ho saka. Us token ko abhi GitHub par revoke karo, phir mere private chat mein /gittoken bhejo.",
     "gt.token_bad": "⚠️ Yeh GitHub token jaisa nahi lagta. Maine tumhara message delete kar diya.",
     "gt.token_rejected": "⚠️ GitHub ne yeh token reject kar diya (galat, expired ya revoked). Maine tumhara message delete kar diya.",
