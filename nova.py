@@ -1826,12 +1826,12 @@ def help_main_keyboard(chat=None, user_id=None):
     # button after it.
     
     fun_row = list(fun_systems.fun_help_row())  # 🎉 Fun, 🗑 Delete, placeholder (🗑 Delete now lives on page 2)
-    # front page: 🎉 Fun and 🎮 Games side by side (🗑 Delete and ✨ Extras moved to "More Features")
+    # front page: 🎉 Fun, 🎮 Games and 🐙 GitHub on one line (🗑 Delete and ✨ Extras moved to "More Features")
     rows.append([fun_row[0] if fun_row else InlineKeyboardButton("🎉 Fun", callback_data="help:fun"),
-                 InlineKeyboardButton("🎮 Games", callback_data="help:games")])
+                 InlineKeyboardButton("🎮 Games", callback_data="help:games"),
+                 InlineKeyboardButton("🐙 GitHub", callback_data="gt:h")])  # github.py's panel (its Back returns to this page)
     rows.append([InlineKeyboardButton("📥 Download", callback_data="help:dl"),
                  InlineKeyboardButton("📦 Import & Export", callback_data="help:ie")])
-    rows.append([InlineKeyboardButton("🐙 GitHub", callback_data="gt:h")])  # github.py's panel (Back returns to this page)
     rows.append([InlineKeyboardButton("More Features ➡️", callback_data="help:more")])  # full width, changes the page
     if user_id in OWNER_IDS or (user_id and is_super_admin(user_id)):  # 🛡 Bot Staff: just above the Suggestion Bar, owner + bot staff only
         rows.append([InlineKeyboardButton("🛡 Bot Staff", callback_data="own:m")])
