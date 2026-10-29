@@ -43,8 +43,8 @@ from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, f
 
 try:
     from lang import lang as L
-except ImportError:                      # pragma: no cover
-    L = None
+except ImportError:                      # lang.py uploaded next to this file instead of inside a lang/ folder
+    import lang as L
 
 log = logging.getLogger(__name__)
 
