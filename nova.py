@@ -1831,6 +1831,7 @@ def help_main_keyboard(chat=None, user_id=None):
                  InlineKeyboardButton("🎮 Games", callback_data="help:games")])
     rows.append([InlineKeyboardButton("📥 Download", callback_data="help:dl"),
                  InlineKeyboardButton("📦 Import & Export", callback_data="help:ie")])
+    rows.append([InlineKeyboardButton("🐙 GitHub", callback_data="gt:h")])  # github.py's panel (Back returns to this page)
     rows.append([InlineKeyboardButton("More Features ➡️", callback_data="help:more")])  # full width, changes the page
     if user_id in OWNER_IDS or (user_id and is_super_admin(user_id)):  # 🛡 Bot Staff: just above the Suggestion Bar, owner + bot staff only
         rows.append([InlineKeyboardButton("🛡 Bot Staff", callback_data="own:m")])
