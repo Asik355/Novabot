@@ -15,6 +15,7 @@ import difflib
 import hashlib
 import html
 import io
+import json
 import logging
 import os
 import re
@@ -971,6 +972,19 @@ async def _pick_path(msg, token: str, o: str, n: str, text: str) -> Optional[str
     return None
 
 
+async def _send_current(bot, cid, token: str, o: str, n: str, path: str) -> None:
+    """Sends the file as it is now in the repo, as a document, so the person can download it before replacing it.
+    A new file, a folder or a file that is too big is skipped quietly."""
+    try:
+        _meta, data = await _run(api_file, token, o, n, path)
+    except GitError:
+        return
+    buf = io.BytesIO(data)
+    buf.name = path.rsplit("/", 1)[-1]
+    await bot.send_document(cid, buf, filename=buf.name,
+                            caption=_t("gt.backup_cap", cid, repo=f"{o}/{n}", path=path, size=_fmt_size(len(data)))[:1000])
+
+
 async def _send_files(bot, cid, token: str, o: str, n: str, names: list) -> None:
     """Sends each named file as a Telegram document (up to GET_MAX). A name can be a path, a file name, or a name without its extension."""
     full = f"{o}/{n}"
@@ -1150,7 +1164,9 @@ async def gituploadfile_cmd(update, context):
     if path is None:
         await _say(msg, _t("gt.bad_path", cid))
         return
-    _wait_for(uid, "upload", repo=full, path=path)
+    if not text.startswith("+"):                                # an existing file: send its current version first
+        await _send_current(context.bot, cid, token, o, n, path)
+    _wait_for(uid, "upload", repo=full, path=path, pre=not text.startswith("+"))
     await _say(msg, _t("gt.upload_ask", cid, path=html.escape(path), mb=MAX_SINGLE // MB))
 
 
@@ -1260,7 +1276,7 @@ async def _show_files(msg, uid, token, repo: dict):
     await _say(msg, _t("gt.fl_head", cid, repo=html.escape(full), branch=html.escape(branch), files=_code_list(files, 40), more=more))
 
 
-async def _got_pickfile(msg, uid, want):
+async def _got_pickfile(msg, bot, uid, token, want):
     cid = msg.chat.id
     text = (msg.text or "").strip()[:200]
     if not text:
@@ -1290,7 +1306,11 @@ async def _got_pickfile(msg, uid, want):
         if path is None:
             await _say(msg, _t("gt.bad_path", cid))
             return
-    _wait_for(uid, "upload", repo=want["repo"], path=path)             # the normal /gitput step takes over from here
+    if not text.startswith("+"):                                       # an existing file: send its current version first
+        rp = parse_repo(want["repo"])
+        if rp:
+            await _send_current(bot, cid, token, rp[0], rp[1], path)
+    _wait_for(uid, "upload", repo=want["repo"], path=path, pre=not text.startswith("+"))             # the normal /gitput step takes over from here
     await _say(msg, _t("gt.upload_ask", cid, path=html.escape(path), mb=MAX_SINGLE // MB))
 
 
@@ -1589,7 +1609,10 @@ async def git_input(update, context):
     if not msg or not user or not chat or chat.type != "private":
         return
     want = _inputs.get(user.id)
-    if want and want["kind"] == "getfiles" and msg.document is not None:    # a file sent while the list is open is an upload, not a number
+    if want and want["kind"] in ("getfiles", "pickfile", "pickrepo", "selrepo") and msg.document is not None:
+        # a file sent while a list or a name is being asked for is an upload: replace the file with the same name
+        if want["kind"] == "pickfile" and want.get("repo"):
+            _sel_set(user.id, want["repo"])                         # look only in the repo they were just working in
         _inputs.pop(user.id, None)
         want = None
     if not want:
@@ -1619,7 +1642,7 @@ async def git_input(update, context):
         elif kind in ("pickrepo", "visrepo") and msg.text:
             await _choose_repo(msg, user.id, token, msg.text.strip()[:100], kind, want.get("target"))
         elif kind == "pickfile" and msg.text:
-            await _got_pickfile(msg, user.id, want)
+            await _got_pickfile(msg, context.bot, user.id, token, want)
         elif kind == "selrepo" and msg.text:
             await _choose_sel(msg, context.bot, user.id, token, msg.text.strip()[:100], want.get("then", ""))
         elif kind == "getfiles" and msg.text:
@@ -1722,7 +1745,7 @@ async def _got_upload(msg, bot, uid, token, want, doc=None):
         await _ask_mismatch(msg, uid, want, doc, fname, len(raw))
         return
     _inputs.pop(uid, None)
-    t = _new_op(uid, "upload", repo=want["repo"], path=want["path"], sha=sha, file_id=doc.file_id)
+    t = _new_op(uid, "upload", repo=want["repo"], path=want["path"], sha=sha, file_id=doc.file_id, pre=bool(want.get("pre")))
     key = "gt.upload_over" if sha else "gt.upload_new"
     await _say(msg, _t(key, cid, repo=want["repo"], path=html.escape(want["path"]), old=_fmt_size(old_size), new=_fmt_size(len(raw))),
                _confirm_markup(uid, t, cid, "gt.btn_overwrite" if sha else "gt.btn_create"))
@@ -1753,22 +1776,45 @@ def _name_mismatch(uploaded: str, target: str) -> bool:
     return not (us == ts and (ue == te or not ue or not te))
 
 
+def _mm_view(cid, uid: int, tok: str, op: dict) -> tuple:
+    """The 'Is this the right file?' message and its buttons."""
+    base = lambda p: p.rsplit("/", 1)[-1][:28]
+    cb = lambda c: f"gt:mm:{uid}:{tok}:{c}"
+    rows = [[InlineKeyboardButton(_t("gt.mm_target", cid, name=base(op["path"])), callback_data=cb("t"))]]
+    if op.get("alt"):
+        rows.append([InlineKeyboardButton(_t("gt.mm_alt", cid, name=base(op["alt"])), callback_data=cb("a"))])
+    rows.append([InlineKeyboardButton(_t("gt.mm_again", cid), callback_data=cb("r"))])
+    rows.append([InlineKeyboardButton(_t("gt.btn_no", cid), callback_data=cb("c"))])
+    text = _t("gt.mm_head", cid, path=html.escape(op["path"]), repo=html.escape(op["repo"]),
+              name=html.escape(op["name"][:60]), size=_fmt_size(op["size"]))
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _mm_sure_view(cid, uid: int, tok: str, op: dict, step: int) -> tuple:
+    """Steps 1 and 2 of the extra questions asked before a differently named file overwrites the chosen one."""
+    cb = lambda c: f"gt:mm:{uid}:{tok}:{c}"
+    base = lambda p: p.rsplit("/", 1)[-1][:28]
+    vals = dict(target=html.escape(base(op["path"])), name=html.escape(op["name"][:60]))
+    if step == 1:
+        text = _t("gt.mm_sure1", cid, **vals)
+        rows = [[InlineKeyboardButton(_t("gt.mm_continue", cid), callback_data=cb("t1"))],
+                [InlineKeyboardButton(_t("gt.mm_back", cid), callback_data=cb("b"))]]
+    else:
+        text = _t("gt.mm_sure2", cid, **vals)
+        rows = [[InlineKeyboardButton(_t("gt.mm_final", cid, target=base(op["path"])), callback_data=cb("t2"))],
+                [InlineKeyboardButton(_t("gt.btn_no", cid), callback_data=cb("c"))]]
+    return text, InlineKeyboardMarkup(rows)
+
+
 async def _ask_mismatch(msg, uid, want, doc, fname: str, new_size: int):
     cid = msg.chat.id
     folder = want["path"].rsplit("/", 1)[0] + "/" if "/" in want["path"] else ""
     alt = safe_path(folder + fname)
     alt = None if alt == want["path"] else alt
     _inputs.pop(uid, None)
-    t = _new_op(uid, "mismatch", repo=want["repo"], path=want["path"], alt=alt, file_id=doc.file_id)
-    base = lambda p: p.rsplit("/", 1)[-1][:28]
-    cb = lambda c: f"gt:mm:{uid}:{t}:{c}"
-    rows = [[InlineKeyboardButton(_t("gt.mm_target", cid, name=base(want["path"])), callback_data=cb("t"))]]
-    if alt:
-        rows.append([InlineKeyboardButton(_t("gt.mm_alt", cid, name=base(alt)), callback_data=cb("a"))])
-    rows.append([InlineKeyboardButton(_t("gt.mm_again", cid), callback_data=cb("r"))])
-    rows.append([InlineKeyboardButton(_t("gt.btn_no", cid), callback_data=cb("c"))])
-    await _say(msg, _t("gt.mm_head", cid, path=html.escape(want["path"]), repo=html.escape(want["repo"]),
-                       name=html.escape(fname[:60]), size=_fmt_size(new_size)), InlineKeyboardMarkup(rows))
+    t = _new_op(uid, "mismatch", repo=want["repo"], path=want["path"], alt=alt, file_id=doc.file_id, name=fname, size=new_size)
+    text, markup = _mm_view(cid, uid, t, _ops[t])
+    await _say(msg, text, markup)
 
 
 async def _mismatch_button(q, context, chat, user, parts):
@@ -1794,7 +1840,16 @@ async def _mismatch_button(q, context, chat, user, parts):
         await q.answer()
         await _edit(q, _t("gt.upload_ask", cid, path=html.escape(op["path"]), mb=MAX_SINGLE // MB))
         return
-    path = op["alt"] if choice == "a" else op["path"] if choice == "t" else None
+    if choice in ("t", "t1", "b"):                                 # overwriting a differently named file: ask again, in easy words
+        op["until"] = time.monotonic() + PENDING_SECS
+        await q.answer()
+        if choice == "b":
+            text, markup = _mm_view(cid, user.id, tok, op)
+        else:
+            text, markup = _mm_sure_view(cid, user.id, tok, op, 1 if choice == "t" else 2)
+        await _edit(q, text, markup)
+        return
+    path = op["alt"] if choice == "a" else op["path"] if choice == "t2" else None
     if not path:
         await q.answer()
         return
@@ -1821,7 +1876,8 @@ async def _mismatch_button(q, context, chat, user, parts):
             if e.key != "gt.e_404":
                 raise
         up = {"kind": "upload", "uid": user.id, "repo": op["repo"], "path": path, "sha": sha, "file_id": op["file_id"]}
-        await _edit(q, await _do_confirmed(q, context, up, token))
+        result = await _do_confirmed(q, context, up, token)
+        await _edit(q, result, _undo_markup(cid, user.id, up.get("undo_id", "")))
     except GitError as e:
         await _edit(q, _show_error(e, cid))
     except TelegramError as e:
@@ -1834,6 +1890,160 @@ async def _mismatch_button(q, context, chat, user, parts):
         _busy.discard(user.id)
 
 
+# ================================================================== undo: every change can be put back (history kept in the database)
+UNDO_KEY = "git_undo"                    # settings key, stored under the person's own user id
+UNDO_KEEP = 10                           # changes remembered per person
+UNDO_FILES_MAX = 50                      # files remembered per change
+BACKUP_DOCS_MAX = 5                      # old versions sent as documents before one change
+
+
+def _undo_load(uid: int) -> list:
+    try:
+        v = json.loads(_D.get_setting(uid, UNDO_KEY, "") or "[]")
+    except (ValueError, TypeError):
+        return []
+    return [x for x in v if isinstance(x, dict) and x.get("id") and x.get("repo") and x.get("files")] if isinstance(v, list) else []
+
+
+def _undo_record(uid: int, repo: str, pairs: list, icon: str = "✏️") -> str:
+    """Remembers a change: pairs = [(path, blob sha before the change, '' when the file was new)]. Returns the id, '' if it could not be saved.
+    Never raises: a failed note must not break the change itself."""
+    try:
+        if not pairs:
+            return ""
+        names = ", ".join(p.rsplit("/", 1)[-1] for p, _o in pairs[:3]) + (f" +{len(pairs) - 3}" if len(pairs) > 3 else "")
+        eid = secrets.token_hex(3)
+        entry = {"id": eid, "repo": repo, "t": int(time.time()), "label": f"{icon} {names}"[:60],
+                 "files": [{"path": p, "old": o} for p, o in pairs[:UNDO_FILES_MAX]]}
+        _D.set_setting(uid, UNDO_KEY, json.dumps(([entry] + _undo_load(uid))[:UNDO_KEEP]))
+        return eid
+    except Exception as e:
+        log.error("git: could not save undo note: %s %s", type(e).__name__, scrub(e)[:200])
+        return ""
+
+
+def _undo_drop(uid: int, eid: str) -> None:
+    try:
+        _D.set_setting(uid, UNDO_KEY, json.dumps([x for x in _undo_load(uid) if x["id"] != eid]))
+    except Exception as e:
+        log.error("git: could not update undo notes: %s %s", type(e).__name__, scrub(e)[:200])
+
+
+def api_blob(token: str, o: str, n: str, sha: str, limit: int = MAX_SINGLE) -> bytes:
+    """An old version of a file, by its blob sha (GitHub keeps it in the history)."""
+    r = _call(token, "GET", f"/repos/{o}/{n}/git/blobs/{sha}", accept="application/vnd.github.raw", stream=True)
+    return _read_capped(r, limit)
+
+
+def _undo_apply(token: str, repo: str, files: list) -> list:
+    """Puts every file back as it was: an old file gets its old content, a file that was new is removed again."""
+    o, n = repo.split("/")
+    done = []
+    for f in files:
+        path, old = f["path"], f.get("old") or ""
+        cur = ""
+        try:
+            meta = api_contents(token, o, n, path)
+            if not isinstance(meta, list) and meta.get("type") == "file":
+                cur = meta["sha"]
+        except GitError as e:
+            if e.key != "gt.e_404":
+                raise
+        if old:
+            if cur != old:
+                api_put_file(token, o, n, path, api_blob(token, o, n, old), f"Undo change to {path} via Telegram bot", "", cur)
+        elif cur:
+            api_delete_file(token, o, n, path, cur, f"Undo: remove {path} via Telegram bot")
+        done.append(path)
+    return done
+
+
+def _undo_markup(cid, uid: int, eid: str):
+    if not eid:
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton(_t("gt.btn_undo", cid), callback_data=f"gt:un:{uid}:{eid}")]])
+
+
+async def _send_old_versions(bot, cid, token: str, o: str, n: str, pairs: list) -> None:
+    """Before a change: the old versions as documents, so the person can keep them. Quiet when there is nothing to send."""
+    for path, old in [p for p in pairs if p[1]][:BACKUP_DOCS_MAX]:
+        try:
+            data = await _run(api_blob, token, o, n, old)
+            buf = io.BytesIO(data)
+            buf.name = path.rsplit("/", 1)[-1]
+            await bot.send_document(cid, buf, filename=buf.name,
+                                    caption=_t("gt.backup_cap", cid, repo=f"{o}/{n}", path=path, size=_fmt_size(len(data)))[:1000])
+        except (GitError, TelegramError) as e:
+            log.warning("git: could not send the old version of a file: %s", scrub(e)[:120])
+
+
+async def _undo_button(q, context, chat, user, act, parts):
+    """gt:un:<uid>:<id> asks · gt:ux:<uid>:<id> does it · gt:uc:<uid>:<id> keeps things as they are."""
+    cid = chat.id
+    if len(parts) < 3 or not parts[1].isdigit() or int(parts[1]) != user.id:
+        await q.answer(_t("gt.only_asker", cid), show_alert=True)
+        return
+    if chat.type != "private":
+        await q.answer(_t("gt.private", cid), show_alert=True)
+        return
+    entry = next((x for x in _undo_load(user.id) if x["id"] == parts[2]), None)
+    if entry is None:
+        await q.answer(_t("gt.undo_gone", cid), show_alert=True)
+        return
+    if act == "uc":
+        await q.answer()
+        await _edit(q, _t("gt.undo_kept", cid))
+        return
+    if act == "un":
+        await q.answer()
+        names = "\n".join(f"• <code>{html.escape(f['path'])}</code>" + ("" if f.get("old") else " " + _t("gt.undo_new", cid)) for f in entry["files"][:8])
+        more = f"\n… +{len(entry['files']) - 8}" if len(entry["files"]) > 8 else ""
+        await _edit(q, _t("gt.undo_ask", cid, repo=html.escape(entry["repo"]), files=names + more), InlineKeyboardMarkup([
+            [InlineKeyboardButton(_t("gt.undo_yes", cid), callback_data=f"gt:ux:{user.id}:{entry['id']}")],
+            [InlineKeyboardButton(_t("gt.btn_no", cid), callback_data=f"gt:uc:{user.id}:{entry['id']}")]]))
+        return
+    token, _ = token_for(user.id)
+    if not token:
+        await q.answer(_t("gt.no_token", cid), show_alert=True)
+        return
+    if user.id in _busy:
+        await q.answer(_t("gt.busy", cid), show_alert=True)
+        return
+    _busy.add(user.id)
+    await q.answer()
+    try:
+        await _edit(q, _t("gt.working", cid))
+        done = await _run(_undo_apply, token, entry["repo"], entry["files"])
+        _undo_drop(user.id, entry["id"])
+        await _edit(q, _t("gt.undo_done", cid, n=len(done), repo=html.escape(entry["repo"])))
+    except GitError as e:
+        await _edit(q, _show_error(e, cid))
+    except TelegramError as e:
+        log.error("git: telegram error while undoing: %s", scrub(e))
+        await _edit(q, _t("gt.tg_fail", cid))
+    except Exception as e:
+        log.error("git: undo failed: %s %s", type(e).__name__, scrub(e)[:200])
+        await _edit(q, _t("gt.unexpected", cid))
+    finally:
+        _busy.discard(user.id)
+
+
+@_guarded
+async def gitundo_cmd(update, context):
+    g = await _gate(update)
+    if not g:
+        return
+    msg, uid, _token = g
+    cid = msg.chat.id
+    items = _undo_load(uid)
+    if not items:
+        await _say(msg, _t("gt.undo_none", cid))
+        return
+    lines = [f"• {html.escape(it['label'])} — <b>{html.escape(it['repo'])}</b>, {time.strftime('%d %b %H:%M', time.gmtime(it['t']))} UTC" for it in items[:5]]
+    rows = [[InlineKeyboardButton("↩️ " + it["label"][:40], callback_data=f"gt:un:{uid}:{it['id']}")] for it in items[:5]]
+    await _say(msg, _t("gt.undo_list", cid, list="\n".join(lines)), InlineKeyboardMarkup(rows))
+
+
 # ================================================================== buttons: confirm / cancel / repo pages / help pages
 async def _do_confirmed(q, context, op, token):
     """Runs a confirmed operation. Files that came from Telegram are downloaded and checked AGAIN here."""
@@ -1841,7 +2051,9 @@ async def _do_confirmed(q, context, op, token):
     o, n = op["repo"].split("/")
     cid = q.message.chat.id
     if kind == "delfile":
+        await _send_old_versions(context.bot, cid, token, o, n, [(op["path"], op["sha"])])
         await _run(api_delete_file, token, o, n, op["path"], op["sha"], f"Delete {op['path']} via Telegram bot")
+        op["undo_id"] = _undo_record(uid, op["repo"], [(op["path"], op["sha"])], "🗑")
         return _t("gt.delfile_done", cid, path=html.escape(op["path"]))
     if kind == "edit":
         if op.get("text") is not None:
@@ -1853,10 +2065,14 @@ async def _do_confirmed(q, context, op, token):
             except UnicodeDecodeError:
                 raise GitError("gt.not_text")
         await _run(api_put_file, token, o, n, op["path"], data, f"Edit {op['path']} via Telegram bot", "", op["sha"])
+        op["undo_id"] = _undo_record(uid, op["repo"], [(op["path"], op["sha"])], "✏️")
         return _t("gt.saved", cid, path=html.escape(op["path"]))
     if kind == "upload":
         data = await _download_tg(context.bot, types_doc(op["file_id"]), MAX_SINGLE)
+        if not op.get("pre"):                                   # the old file was not sent yet when the person picked it
+            await _send_old_versions(context.bot, cid, token, o, n, [(op["path"], op["sha"])])
         await _run(api_put_file, token, o, n, op["path"], data, f"{'Update' if op['sha'] else 'Add'} {op['path']} via Telegram bot", "", op["sha"])
+        op["undo_id"] = _undo_record(uid, op["repo"], [(op["path"], op["sha"])], "📄")
         return _t("gt.saved", cid, path=html.escape(op["path"]))
     if kind == "visibility":
         await _run(api_set_private, token, o, n, bool(op["private"]))
@@ -1879,7 +2095,10 @@ async def _do_confirmed(q, context, op, token):
             if not send:
                 out.append(_t("gt.push_same", cid))
                 continue
+            before = [(p, remote.get(p, "")) for p in send]
+            await _send_old_versions(context.bot, cid, token, ro, rn, before)
             sha = await _run(api_push_files, token, ro, rn, branch, send, f"Update {len(send)} file(s) via Telegram bot")
+            op["undo_id"] = _undo_record(uid, full, before, "📦" if len(before) > 1 else "📄")
             out.append(_t("gt.push_done", cid, n=len(send), repo=html.escape(full), branch=html.escape(branch), sha=sha[:7]))
         return "\n\n".join(out)
     if kind == "pushzip":
@@ -1893,7 +2112,9 @@ async def _do_confirmed(q, context, op, token):
         if not new and not changed:
             return _t("gt.push_same", cid)
         send = {p: files[p] for p in new + changed}
+        before = [(p, remote.get(p, "")) for p in send]
         sha = await _run(api_push_files, token, o, n, op["branch"], send, f"Update {len(send)} file(s) via Telegram bot")
+        op["undo_id"] = _undo_record(uid, op["repo"], before, "📦")
         return _t("gt.push_done", cid, n=len(send), repo=html.escape(op["repo"]), branch=html.escape(op["branch"]), sha=sha[:7]) + \
             (_t("gt.update_done_note", cid) if op.get("update") else "")
     return _t("gt.expired", cid)
@@ -1932,6 +2153,9 @@ async def git_callback(update, context):
     act = parts[0] if parts else ""
     if act in ("y", "n"):
         await _confirm_button(q, context, chat, user, act, parts)
+        return
+    if act in ("un", "ux", "uc"):                                              # ↩️ undo a change
+        await _undo_button(q, context, chat, user, act, parts)
         return
     if act == "mm":                                                           # wrong file name: replace anyway / use its own name / resend
         await _mismatch_button(q, context, chat, user, parts)
@@ -2049,7 +2273,8 @@ async def _confirm_button(q, context, chat, user, act, parts):
     await q.answer()
     try:
         await _edit(q, _t("gt.working", cid))
-        await _edit(q, await _do_confirmed(q, context, op, token))
+        result = await _do_confirmed(q, context, op, token)
+        await _edit(q, result, _undo_markup(cid, user.id, op.get("undo_id", "")))
     except GitError as e:
         await _edit(q, _show_error(e, cid))
     except TelegramError as e:
@@ -2070,6 +2295,7 @@ COMMANDS = (
     (("gitstatus",), gitstatus_cmd),
     (("gitoff", "removegittoken"), removegittoken_cmd),
     (("gitrepos",), gitrepos_cmd),
+    (("gitundo",), gitundo_cmd),
     (("gitinfo", "gitrepoinfo"), gitrepoinfo_cmd),
     (("gitls", "gitfiles", "gitfile", "gitrepofiles"), gitrepofiles_cmd),
     (("gitnew", "gitcreaterepo"), gitcreaterepo_cmd),
@@ -2129,14 +2355,14 @@ TEXTS_EN = {
     "gt.btn_token": "🔑 Get token",
     "gt.btn_perms": "🔐 Permissions",
     "gt.panel": "<b>🐙 Git</b>\n\nPut your project on GitHub and manage it from Telegram with simple commands. It works in a private chat with me, and only on YOUR GitHub account.\n\nNew here? Tap 📖 Guide: it goes step by step.\nTap ⌨️ Commands to see every command, ready to copy.\nTap 📚 My repos or 🔑 Status to check your connection.",
-    "gt.guide": "<b>🔑 Connect your GitHub</b>\n\n1. On GitHub: Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.\n2. Pick only the repositories you want me to touch and the permissions you need (see 🔐 Permissions).\n3. Copy the token, open a PRIVATE chat with me and send:\n<code>/gittoken YOUR_TOKEN</code>\nI delete your message and save the token encrypted. I never show it again.\n\nNever post a token in a group. If you did, revoke it on GitHub at once.\nTo disconnect: /gitoff (then also revoke the token on GitHub).",
+    "gt.guide": "<b>🔑 Connect your GitHub</b>\n\n1. On GitHub: Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.\n2. Pick only the repositories you want me to touch and the permissions you need (see 🔐 Permissions).\n3. Copy the token, open a PRIVATE chat with me and send:\n/gittoken <code>YOUR_TOKEN</code>\nI delete your message and save the token encrypted. I never show it again.\n\nNever post a token in a group. If you did, revoke it on GitHub at once.\nTo disconnect: /gitoff (then also revoke the token on GitHub).",
     "gt.perms": "<b>🔐 What each command needs</b>\n\nFine-grained token:\n• Read (/gitrepos, /gitinfo, /gitls, /gitget, /gitzip): Metadata + Contents: Read\n• Write (/gitedit, /gitput, /gitpush): Contents: Read and write\n• Delete a file (/gitdel): Contents: Read and write\n• /gitnew: Administration: Read and write (account permission)\n• /gitdelrepo: Administration: Read and write\n\nClassic token: <code>repo</code> (or <code>public_repo</code> for public repos only), plus <code>delete_repo</code> for /gitdelrepo.\n\nGive a token only what you will use.",
     "gt.private": "🔒 Use this in a private chat with me. Tokens and files never go through a group.",
     "gt.slow": "⏳ Too many commands. Try again in a minute.",
     "gt.busy": "⏳ Your previous Git job is still running.",
     "gt.no_requests": "⚠️ The server is missing the \"requests\" package, so Git commands are off.",
     "gt.no_token": "🔑 Connect your GitHub first: send /gittoken in this private chat (see the 🐙 Git button in /help for the guide).",
-    "gt.token_help": "<b>🔑 /gittoken</b>\n\nSend: <code>/gittoken YOUR_TOKEN</code>\nI delete your message and save the token encrypted.\nNeed a token? Open /help → page 1 → 🐙 GitHub → 🔑 Token guide.",
+    "gt.token_help": "<b>🔑 /gittoken</b>\n\nSend: /gittoken <code>YOUR_TOKEN</code>\nI delete your message and save the token encrypted.\nNeed a token? Open /help → page 1 → 🐙 GitHub → 🔑 Token guide.",
     "gt.token_public": "⚠️ Never post a token in a group. I deleted that message if I could. Revoke that token on GitHub now, then send /gittoken in a private chat with me.",
     "gt.token_bad": "⚠️ That does not look like a GitHub token. I deleted your message.",
     "gt.token_rejected": "⚠️ GitHub rejected that token (wrong, expired or revoked). I deleted your message.",
@@ -2199,6 +2425,7 @@ TEXTS_EN = {
     "gt.delrepo_mismatch": "Cancelled: the name did not match. Nothing was deleted.",
     "gt.delrepo_done": "🗑 Deleted <b>{name}</b>.",
     "gt.file_cap": "{repo}: {path} ({size})",
+    "gt.backup_cap": "📥 Current {path} from {repo} ({size}). Download it as a backup before you change it.",
     "gt.delfile_ask": "🗑 Delete <code>{path}</code> from <b>{repo}</b> ({size})?\nThis makes a commit that removes the file.",
     "gt.delfile_done": "🗑 Deleted <code>{path}</code>.",
     "gt.edit_ask": "✏️ I sent you the current file. Now send the full new text (up to {max} characters) or the edited file as a document. I show you the changes before saving. /gitcancel to stop.\n(<code>{path}</code>)",
@@ -2235,8 +2462,8 @@ TEXTS_EN = {
     "gt.zip_many": "🚫 The ZIP has {n} files; the limit is {max}.",
     "gt.zip_unpacked": "🚫 The ZIP unpacks to more than {mb} MB.",
     "gt.zip_dupe": "🚫 The ZIP has the same path twice: <code>{name}</code>.",
-    "gt.how": "<b>📖 Step by step</b>\nTap a line to copy it, paste it in a PRIVATE chat with me, and change the words.\n\n<b>1. Connect (once)</b>\nMake a token (button 🔑 Get token), then send:\n<code>/gittoken ghp_yourtoken</code>\nI delete your message and keep the token safe.\n\n<b>2. Make a new repository</b>\n<code>/gitnew mybot</code>\nIt is private. For a public one:\n<code>/gitnew mybot public</code>\n\n<b>3. Put your files on GitHub</b>\nMake a ZIP of your project folder, then send:\n<code>/gitpush yourname/mybot</code>\nThen send me the ZIP. I show what is new or changed. Tap ⬆️ Push to confirm. Nothing is deleted from GitHub.\n\n<b>4. Change one file</b>\nReplace it with a new file:\n<code>/gitput yourname/mybot bot.py</code>\nEdit its text here in Telegram:\n<code>/gitedit yourname/mybot bot.py</code>\nI always show the change first.\n\n<b>5. Look, download, delete</b>\nSee the files:\n<code>/gitls yourname/mybot</code>\nGet one file:\n<code>/gitget yourname/mybot bot.py</code>\nGet everything as a ZIP:\n<code>/gitzip yourname/mybot</code>\nDelete a file (asks first):\n<code>/gitdel yourname/mybot bot.py</code>\n\nYour GitHub name and repo names are in <code>/gitrepos</code>.\nStuck? <code>/gitcancel</code> stops whatever I was waiting for.",
-    "gt.cmds": "<b>⌨️ All commands</b>\nTap a <b>blue</b> command to run it. Tap the grey example to copy it.\n\n<b>Connect</b>\n/gittoken <code>ghp_yourtoken</code> connect your GitHub\n/gitstatus who you are connected as\n/gitoff disconnect\n\n<b>Repositories</b>\n/gitvis <code>nova</code> make a repo public or private (asks first)\n/gitrepos your repos\n/gitinfo <code>yourname/mybot</code> repo details\n/gitls <code>yourname/mybot</code> list the files\n/gitls <code>yourname/mybot src</code> list a folder\n/gitnew <code>mybot</code> new private repo\n/gitnew <code>mybot public</code> new public repo\n/gitdelrepo <code>yourname/mybot</code> delete a repo (you type its name to confirm)\n\n<b>Files</b>\n/gitreplace easiest way: send the repo name, pick a file, send the new file\n📎 Or just send me one or many files at once: names already in your repos get replaced (I ask once)\n/gitget <code>yourname/mybot bot.py</code> download a file\n/gitput <code>yourname/mybot bot.py</code> upload or replace a file\n/gitedit <code>yourname/mybot bot.py</code> edit a text file\n/gitdel <code>yourname/mybot bot.py</code> delete a file (asks first)\n\n<b>ZIP</b>\n/gitzip <code>yourname/mybot</code> download everything as a ZIP\n/gitpush <code>yourname/mybot</code> upload a ZIP of files, then send the ZIP\n\n<b>Other</b>\n/gitcancel stop a step I am waiting for\n/gitupdate bot owner only: update the bot's own repo",
+    "gt.how": "<b>📖 Step by step</b>\nTap a blue command to run it. Tap the grey example to copy it. Do this in a PRIVATE chat with me.\n\n<b>1. Connect (once)</b>\nMake a token (button 🔑 Get token), then send:\n/gittoken <code>ghp_yourtoken</code>\nI delete your message and keep the token safe.\n\n<b>2. Make a new repository</b>\n/gitnew <code>mybot</code>\nIt is private. For a public one:\n/gitnew <code>mybot public</code>\n\n<b>3. Put your files on GitHub</b>\nMake a ZIP of your project folder, then send:\n/gitpush <code>yourname/mybot</code>\nThen send me the ZIP. I show what is new or changed. Tap ⬆️ Push to confirm. Nothing is deleted from GitHub.\n\n<b>4. Change one file</b>\nReplace it with a new file:\n/gitput <code>yourname/mybot bot.py</code>\nEdit its text here in Telegram:\n/gitedit <code>yourname/mybot bot.py</code>\nI always show the change first.\n\n<b>5. Look, download, delete</b>\nSee the files:\n/gitls <code>yourname/mybot</code>\nGet one file:\n/gitget <code>yourname/mybot bot.py</code>\nGet everything as a ZIP:\n/gitzip <code>yourname/mybot</code>\nDelete a file (asks first):\n/gitdel <code>yourname/mybot bot.py</code>\n\nYour GitHub name and repo names are in /gitrepos.\nStuck? /gitcancel stops whatever I was waiting for.",
+    "gt.cmds": "<b>⌨️ All commands</b>\nTap a <b>blue</b> command to run it. Tap the grey example to copy it.\n\n<b>Connect</b>\n/gittoken <code>ghp_yourtoken</code> connect your GitHub\n/gitstatus who you are connected as\n/gitoff disconnect\n\n<b>Repositories</b>\n/gitvis <code>nova</code> make a repo public or private (asks first)\n/gitrepos your repos\n/gitinfo <code>yourname/mybot</code> repo details\n/gitls <code>yourname/mybot</code> list the files\n/gitls <code>yourname/mybot src</code> list a folder\n/gitnew <code>mybot</code> new private repo\n/gitnew <code>mybot public</code> new public repo\n/gitdelrepo <code>yourname/mybot</code> delete a repo (you type its name to confirm)\n\n<b>Files</b>\n/gitreplace easiest way: send the repo name, pick a file, send the new file\n📎 Or just send me one or many files at once: names already in your repos get replaced (I ask once)\n/gitget <code>yourname/mybot bot.py</code> download a file\n/gitput <code>yourname/mybot bot.py</code> upload or replace a file\n/gitedit <code>yourname/mybot bot.py</code> edit a text file\n/gitdel <code>yourname/mybot bot.py</code> delete a file (asks first)\n\n<b>ZIP</b>\n/gitzip <code>yourname/mybot</code> download everything as a ZIP\n/gitpush <code>yourname/mybot</code> upload a ZIP of files, then send the ZIP\n\n<b>Other</b>\n/gitundo put back your last change (I keep the last 10)\n/gitcancel stop a step I am waiting for\n/gitupdate bot owner only: update the bot's own repo",
     "gt.btn_guide": "📖 Guide",
     "gt.btn_cmds": "⌨️ Commands",
     "gt.btn_buttons": "🔘 Buttons",
@@ -2257,14 +2484,14 @@ TEXTS_HI = {
     "gt.btn_token": "🔑 Get token",
     "gt.btn_perms": "🔐 Permissions",
     "gt.panel": "<b>🐙 Git</b>\n\nApna project GitHub par rakho aur Telegram se simple commands se sambhalo. Yeh mere private chat mein chalta hai, aur sirf TUMHARE GitHub account par.\n\nNaye ho? 📖 Guide dabao: yeh step by step batata hai.\nSaari commands copy karne ke liye ⌨️ Commands dabao.\nConnection check karne ke liye 📚 My repos ya 🔑 Status dabao.",
-    "gt.guide": "<b>🔑 Apna GitHub connect karo</b>\n\n1. GitHub par: Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.\n2. Sirf wahi repositories chuno jinhe mujhe chhuna hai aur zaroori permissions do (🔐 Permissions dekho).\n3. Token copy karo, mere PRIVATE chat mein bhejo:\n<code>/gittoken YOUR_TOKEN</code>\nMain tumhara message delete kar deta hoon aur token encrypted save karta hoon. Dobara kabhi nahi dikhata.\n\nToken kabhi group mein mat bhejo. Bhej diya to turant GitHub par revoke karo.\nDisconnect karne ke liye: /gitoff (phir GitHub par bhi revoke karo).",
+    "gt.guide": "<b>🔑 Apna GitHub connect karo</b>\n\n1. GitHub par: Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.\n2. Sirf wahi repositories chuno jinhe mujhe chhuna hai aur zaroori permissions do (🔐 Permissions dekho).\n3. Token copy karo, mere PRIVATE chat mein bhejo:\n/gittoken <code>YOUR_TOKEN</code>\nMain tumhara message delete kar deta hoon aur token encrypted save karta hoon. Dobara kabhi nahi dikhata.\n\nToken kabhi group mein mat bhejo. Bhej diya to turant GitHub par revoke karo.\nDisconnect karne ke liye: /gitoff (phir GitHub par bhi revoke karo).",
     "gt.perms": "<b>🔐 Har command ko kya chahiye</b>\n\nFine-grained token:\n• Read (/gitrepos, /gitinfo, /gitls, /gitget, /gitzip): Metadata + Contents: Read\n• Write (/gitedit, /gitput, /gitpush): Contents: Read and write\n• File delete (/gitdel): Contents: Read and write\n• /gitnew: Administration: Read and write (account permission)\n• /gitdelrepo: Administration: Read and write\n\nClassic token: <code>repo</code> (sirf public repos ke liye <code>public_repo</code>), aur /gitdelrepo ke liye <code>delete_repo</code>.\n\nToken ko sirf utna do jitna use karoge.",
     "gt.private": "🔒 Ise mere private chat mein use karo. Token aur files kabhi group se nahi guzarte.",
     "gt.slow": "⏳ Bahut zyada commands. Ek minute baad try karo.",
     "gt.busy": "⏳ Tumhara pichla Git kaam abhi chal raha hai.",
     "gt.no_requests": "⚠️ Server par \"requests\" package nahi hai, isliye Git commands band hain.",
     "gt.no_token": "🔑 Pehle apna GitHub connect karo: is private chat mein /gittoken bhejo (guide ke liye /help mein 🐙 Git button).",
-    "gt.token_help": "<b>🔑 /gittoken</b>\n\nBhejo: <code>/gittoken YOUR_TOKEN</code>\nMain tumhara message delete kar deta hoon aur token encrypted save karta hoon.\nToken chahiye? /help → page 1 → 🐙 GitHub → 🔑 Token guide.",
+    "gt.token_help": "<b>🔑 /gittoken</b>\n\nBhejo: /gittoken <code>YOUR_TOKEN</code>\nMain tumhara message delete kar deta hoon aur token encrypted save karta hoon.\nToken chahiye? /help → page 1 → 🐙 GitHub → 🔑 Token guide.",
     "gt.token_public": "⚠️ Token kabhi group mein mat bhejo. Maine wo message delete kar diya agar ho saka. Us token ko abhi GitHub par revoke karo, phir mere private chat mein /gittoken bhejo.",
     "gt.token_bad": "⚠️ Yeh GitHub token jaisa nahi lagta. Maine tumhara message delete kar diya.",
     "gt.token_rejected": "⚠️ GitHub ne yeh token reject kar diya (galat, expired ya revoked). Maine tumhara message delete kar diya.",
@@ -2327,6 +2554,7 @@ TEXTS_HI = {
     "gt.delrepo_mismatch": "Cancel: naam match nahi hua. Kuch delete nahi hua.",
     "gt.delrepo_done": "🗑 <b>{name}</b> delete ho gayi.",
     "gt.file_cap": "{repo}: {path} ({size})",
+    "gt.backup_cap": "📥 {repo} ki abhi wali {path} ({size}). Badalne se pehle backup ke liye download kar lo.",
     "gt.delfile_ask": "🗑 <b>{repo}</b> se <code>{path}</code> ({size}) delete karein?\nIsse ek commit banega jo file hata deta hai.",
     "gt.delfile_done": "🗑 <code>{path}</code> delete ho gayi.",
     "gt.edit_ask": "✏️ Maine abhi wali file bhej di. Ab poora naya text bhejo ({max} characters tak) ya edit ki hui file document ke roop mein. Save se pehle badlav dikhaunga. Rokne ke liye /gitcancel.\n(<code>{path}</code>)",
@@ -2363,8 +2591,8 @@ TEXTS_HI = {
     "gt.zip_many": "🚫 ZIP mein {n} files hain; limit {max} hai.",
     "gt.zip_unpacked": "🚫 ZIP khulne par {mb} MB se zyada ho jaati hai.",
     "gt.zip_dupe": "🚫 ZIP mein ek hi path do baar hai: <code>{name}</code>.",
-    "gt.how": "<b>📖 Step by step</b>\nLine par tap karke copy karo, mere PRIVATE chat mein paste karo, aur shabd badlo.\n\n<b>1. Connect karo (ek baar)</b>\nToken banao (button 🔑 Get token), phir bhejo:\n<code>/gittoken ghp_yourtoken</code>\nMain tumhara message delete kar deta hoon aur token safe rakhta hoon.\n\n<b>2. Nayi repository banao</b>\n<code>/gitnew mybot</code>\nYeh private hoti hai. Public ke liye:\n<code>/gitnew mybot public</code>\n\n<b>3. Apni files GitHub par daalo</b>\nApne project folder ki ZIP banao, phir bhejo:\n<code>/gitpush yourname/mybot</code>\nPhir mujhe ZIP bhejo. Main dikhata hoon kya nayi ya badli hai. Confirm ke liye ⬆️ Push dabao. GitHub se kuch delete nahi hota.\n\n<b>4. Ek file badlo</b>\nNayi file se replace karo:\n<code>/gitput yourname/mybot bot.py</code>\nUska text yahin Telegram mein edit karo:\n<code>/gitedit yourname/mybot bot.py</code>\nMain badlav pehle hamesha dikhata hoon.\n\n<b>5. Dekho, download karo, delete karo</b>\nFiles dekho:\n<code>/gitls yourname/mybot</code>\nEk file lo:\n<code>/gitget yourname/mybot bot.py</code>\nSab kuch ZIP mein lo:\n<code>/gitzip yourname/mybot</code>\nFile delete karo (pehle poochta hoon):\n<code>/gitdel yourname/mybot bot.py</code>\n\nTumhara GitHub naam aur repo ke naam <code>/gitrepos</code> mein hain.\nAtak gaye? <code>/gitcancel</code> jo main wait kar raha tha use rok deta hai.",
-    "gt.cmds": "<b>⌨️ Saari commands</b>\n<b>Neeli</b> command par tap karo to chalegi. Grey example par tap karo to copy hoga.\n\n<b>Connect</b>\n/gittoken <code>ghp_yourtoken</code> apna GitHub connect karo\n/gitstatus kis account se connected ho\n/gitoff disconnect karo\n\n<b>Repositories</b>\n/gitvis <code>nova</code> repo ko public ya private karo (pehle poochta hoon)\n/gitrepos tumhari repos\n/gitinfo <code>yourname/mybot</code> repo ki details\n/gitls <code>yourname/mybot</code> files ki list\n/gitls <code>yourname/mybot src</code> folder ki list\n/gitnew <code>mybot</code> nayi private repo\n/gitnew <code>mybot public</code> nayi public repo\n/gitdelrepo <code>yourname/mybot</code> repo delete karo (confirm ke liye uska naam type karo)\n\n<b>Files</b>\n/gitreplace sabse aasan: repo ka naam bhejo, file chuno, nayi file bhejo\n📎 Ya seedha ek ya kai files ek saath bhejo: jinke naam tumhari repo mein hain wo replace hongi (main ek baar poochta hoon)\n/gitget <code>yourname/mybot bot.py</code> file download karo\n/gitput <code>yourname/mybot bot.py</code> file upload ya replace karo\n/gitedit <code>yourname/mybot bot.py</code> text file edit karo\n/gitdel <code>yourname/mybot bot.py</code> file delete karo (pehle poochta hoon)\n\n<b>ZIP</b>\n/gitzip <code>yourname/mybot</code> sab kuch ZIP mein download karo\n/gitpush <code>yourname/mybot</code> files ki ZIP upload karo, phir ZIP bhejo\n\n<b>Aur</b>\n/gitcancel jo step main wait kar raha hoon use roko\n/gitupdate sirf bot owner: bot ki apni repo update karo",
+    "gt.how": "<b>📖 Step by step</b>\nNeeli command par tap karo to chalegi. Grey example par tap karo to copy hoga. Yeh mere PRIVATE chat mein karo.\n\n<b>1. Connect karo (ek baar)</b>\nToken banao (button 🔑 Get token), phir bhejo:\n/gittoken <code>ghp_yourtoken</code>\nMain tumhara message delete kar deta hoon aur token safe rakhta hoon.\n\n<b>2. Nayi repository banao</b>\n/gitnew <code>mybot</code>\nYeh private hoti hai. Public ke liye:\n/gitnew <code>mybot public</code>\n\n<b>3. Apni files GitHub par daalo</b>\nApne project folder ki ZIP banao, phir bhejo:\n/gitpush <code>yourname/mybot</code>\nPhir mujhe ZIP bhejo. Main dikhata hoon kya nayi ya badli hai. Confirm ke liye ⬆️ Push dabao. GitHub se kuch delete nahi hota.\n\n<b>4. Ek file badlo</b>\nNayi file se replace karo:\n/gitput <code>yourname/mybot bot.py</code>\nUska text yahin Telegram mein edit karo:\n/gitedit <code>yourname/mybot bot.py</code>\nMain badlav pehle hamesha dikhata hoon.\n\n<b>5. Dekho, download karo, delete karo</b>\nFiles dekho:\n/gitls <code>yourname/mybot</code>\nEk file lo:\n/gitget <code>yourname/mybot bot.py</code>\nSab kuch ZIP mein lo:\n/gitzip <code>yourname/mybot</code>\nFile delete karo (pehle poochta hoon):\n/gitdel <code>yourname/mybot bot.py</code>\n\nTumhara GitHub naam aur repo ke naam /gitrepos mein hain.\nAtak gaye? /gitcancel jo main wait kar raha tha use rok deta hai.",
+    "gt.cmds": "<b>⌨️ Saari commands</b>\n<b>Neeli</b> command par tap karo to chalegi. Grey example par tap karo to copy hoga.\n\n<b>Connect</b>\n/gittoken <code>ghp_yourtoken</code> apna GitHub connect karo\n/gitstatus kis account se connected ho\n/gitoff disconnect karo\n\n<b>Repositories</b>\n/gitvis <code>nova</code> repo ko public ya private karo (pehle poochta hoon)\n/gitrepos tumhari repos\n/gitinfo <code>yourname/mybot</code> repo ki details\n/gitls <code>yourname/mybot</code> files ki list\n/gitls <code>yourname/mybot src</code> folder ki list\n/gitnew <code>mybot</code> nayi private repo\n/gitnew <code>mybot public</code> nayi public repo\n/gitdelrepo <code>yourname/mybot</code> repo delete karo (confirm ke liye uska naam type karo)\n\n<b>Files</b>\n/gitreplace sabse aasan: repo ka naam bhejo, file chuno, nayi file bhejo\n📎 Ya seedha ek ya kai files ek saath bhejo: jinke naam tumhari repo mein hain wo replace hongi (main ek baar poochta hoon)\n/gitget <code>yourname/mybot bot.py</code> file download karo\n/gitput <code>yourname/mybot bot.py</code> file upload ya replace karo\n/gitedit <code>yourname/mybot bot.py</code> text file edit karo\n/gitdel <code>yourname/mybot bot.py</code> file delete karo (pehle poochta hoon)\n\n<b>ZIP</b>\n/gitzip <code>yourname/mybot</code> sab kuch ZIP mein download karo\n/gitpush <code>yourname/mybot</code> files ki ZIP upload karo, phir ZIP bhejo\n\n<b>Aur</b>\n/gitundo apna aakhri badlav wapas lo (main aakhri 10 rakhta hoon)\n/gitcancel jo step main wait kar raha hoon use roko\n/gitupdate sirf bot owner: bot ki apni repo update karo",
     "gt.btn_guide": "📖 Guide",
     "gt.btn_cmds": "⌨️ Commands",
     "gt.btn_buttons": "🔘 Buttons",
@@ -2453,20 +2681,54 @@ TEXTS_EN.update({
     "gt.mm_target": "✅ Replace {name} with it",
     "gt.mm_alt": "📄 Save it as {name} instead",
     "gt.mm_again": "🔁 Send another file",
+    "gt.mm_sure1": "⚠️ <b>Wait, are you sure?</b>\n\nYou chose to change <code>{target}</code>.\nBut the file you sent is called <code>{name}</code>.\n\nIf you continue, everything inside <code>{target}</code> will be replaced by the code of <code>{name}</code>.\n\n👉 Most people want the other button: <b>Save it as {name}</b>.",
+    "gt.mm_sure2": "🛑 <b>Last check!</b>\n\nThe old <code>{target}</code> will be gone and <code>{name}</code> will take its place. This can break your bot.\n\nDo you really want this?",
+    "gt.mm_continue": "Yes, continue",
+    "gt.mm_back": "⬅️ No, go back",
+    "gt.mm_final": "✅ Yes, replace {target}",
 })
 TEXTS_HI.update({
     "gt.mm_head": "⚠️ <b>Kya yeh sahi file hai?</b>\n\nTumne <b>{repo}</b> mein <code>{path}</code> replace karne ko kaha tha, par jo file bheji uska naam <code>{name}</code> hai ({size}).\n\nKya karna hai?",
     "gt.mm_target": "✅ {name} ko isse replace karo",
     "gt.mm_alt": "📄 Isse {name} naam se save karo",
     "gt.mm_again": "🔁 Doosri file bhejo",
+    "gt.mm_sure1": "⚠️ <b>Ruko, pakka ho?</b>\n\nTumne <code>{target}</code> badalne ko kaha hai.\nPar jo file bheji uska naam <code>{name}</code> hai.\n\nAgar aage badhoge to <code>{target}</code> ke andar ka sab kuch <code>{name}</code> ke code se badal jayega.\n\n👉 Zyada tar log doosra button chahte hain: <b>Isse {name} naam se save karo</b>.",
+    "gt.mm_sure2": "🛑 <b>Aakhri check!</b>\n\nPurani <code>{target}</code> hat jayegi aur uski jagah <code>{name}</code> aa jayegi. Isse tumhara bot kharab ho sakta hai.\n\nKya sach mein yahi chahte ho?",
+    "gt.mm_continue": "Haan, aage badho",
+    "gt.mm_back": "⬅️ Nahi, wapas jao",
+    "gt.mm_final": "✅ Haan, {target} replace karo",
+})
+
+
+TEXTS_EN.update({
+    "gt.btn_undo": "↩️ Undo this change",
+    "gt.undo_ask": "↩️ <b>Put the old version back?</b>\n\nIn <b>{repo}</b>:\n{files}\n\nThe file will go back to how it was before your change. Anything you changed after that is lost.",
+    "gt.undo_yes": "✅ Yes, put it back",
+    "gt.undo_new": "(it was new, so it will be removed)",
+    "gt.undo_done": "✅ Done. {n} file(s) in <b>{repo}</b> are back as they were.",
+    "gt.undo_kept": "👍 OK. Nothing was changed.",
+    "gt.undo_gone": "That change is not in my list any more.",
+    "gt.undo_none": "↩️ Nothing to undo yet. After you change a file, I keep the last 10 changes here.",
+    "gt.undo_list": "↩️ <b>Undo a change</b>\nTap the change you want to put back:\n\n{list}",
+})
+TEXTS_HI.update({
+    "gt.btn_undo": "↩️ Yeh badlav wapas lo",
+    "gt.undo_ask": "↩️ <b>Purana version wapas rakhein?</b>\n\n<b>{repo}</b> mein:\n{files}\n\nFile waisi ho jayegi jaisi tumhare badlav se pehle thi. Uske baad jo badla wo hat jayega.",
+    "gt.undo_yes": "✅ Haan, wapas rakho",
+    "gt.undo_new": "(yeh nayi thi, isliye hat jayegi)",
+    "gt.undo_done": "✅ Ho gaya. <b>{repo}</b> ki {n} file(s) pehle jaisi ho gayi.",
+    "gt.undo_kept": "👍 Theek hai. Kuch nahi badla.",
+    "gt.undo_gone": "Yeh badlav ab meri list mein nahi hai.",
+    "gt.undo_none": "↩️ Abhi wapas lene ko kuch nahi. File badalne ke baad main aakhri 10 badlav yahan rakhta hoon.",
+    "gt.undo_list": "↩️ <b>Badlav wapas lo</b>\nJo badlav wapas rakhna hai us par tap karo:\n\n{list}",
 })
 
 
 # ================================================================== texts for: open a repo once, file-list document, plain-words help
 TEXTS_EN.update({
     "gt.in_repo": "📂 <b>You are inside {repo}</b>",
-    "gt.in_now": "📂 <b>You are now inside {repo}</b>\n\nSend a file name to work with it. Example: <code>/gitget nova.py</code>\nSend /gitls to see the files, or /gitrepo to switch to another repo.",
-    "gt.in_cur": "📂 <b>You are inside {repo}</b>\n\nTo switch, send <code>/gitrepo reponame</code>. To see all your repos, send /gitrepos. To leave this repo, send /gitcancel.",
+    "gt.in_now": "📂 <b>You are now inside {repo}</b>\n\nSend a file name to work with it. Example: /gitget <code>nova.py</code>\nSend /gitls to see the files, or /gitrepo to switch to another repo.",
+    "gt.in_cur": "📂 <b>You are inside {repo}</b>\n\nTo switch, send /gitrepo <code>reponame</code>. To see all your repos, send /gitrepos. To leave this repo, send /gitcancel.",
     "gt.sel_ask": "📚 <b>Your repos</b>\n\n{list}{more}\n\n✏️ Send the name of the repo you want to open, for example <code>novabot</code>. /gitcancel to stop.",
     "gt.sel_more": "\n… and {n} more. Send a name and I will find it.",
     "gt.ls_none": "📂 <b>{repo}</b>\n\nNo files found in <code>{path}</code>. Send /gitls to see everything.",
@@ -2479,22 +2741,22 @@ TEXTS_EN.update({
     "gt.nofile": "❌ No file like <code>{q}</code> in <b>{repo}</b>. Send /gitls to see the file names.",
     "gt.sel_nomatch": "No file in this repo has exactly the same name as:\n{list}\n\nNothing was changed. To add a new file, use /gitput.",
     "gt.sel_skip": "\n\n⏭ Skipped (no file with exactly this name in this repo, or the name is in several folders):\n{list}",
-    "gt.use_repoinfo": "ℹ️ <b>Repo details</b>\nSend the command and the repo name.\nExample: <code>/gitinfo novabot</code>\nNot sure of the name? Send /gitrepos.",
-    "gt.use_repofiles": "📂 <b>See the files in a repo</b>\nSend /gitls, then pick your repo.\nOr type it: <code>/gitls yourname/novabot</code>\nTo open a folder, add its name: <code>/gitls src</code>",
-    "gt.use_getfile": "⬇️ <b>Download files</b>\nOpen a repo with /gitrepo, then send the command and the file name.\nExample: <code>/gitget nova.py</code>",
-    "gt.use_deletefile": "🗑 <b>Delete a file</b>\nOpen a repo with /gitrepo, then send the command and the file name.\nExample: <code>/gitdel old.py</code>\nI always ask before deleting.",
-    "gt.use_editfile": "✏️ <b>Edit a text file</b>\nOpen a repo with /gitrepo, then send the command and the file name.\nExample: <code>/gitedit nova.py</code>",
-    "gt.use_uploadfile": "⬆️ <b>Upload or replace a file</b>\nSend /gitput, then pick your repo.\nOr type it: <code>/gitput nova.py</code>",
-    "gt.use_download": "📦 <b>Download a repo as a ZIP</b>\nSend /gitzip, then pick your repo.\nOr type it: <code>/gitzip yourname/novabot</code>\nFor another branch, add its name: <code>/gitzip yourname/novabot dev</code>",
-    "gt.use_pushzip": "⬆️ <b>Send a ZIP of your project to GitHub</b>\nSend /gitpush, then pick your repo, then send the ZIP.\nOr type it: <code>/gitpush yourname/novabot</code>\nFor another branch, add its name: <code>/gitpush yourname/novabot dev</code>",
+    "gt.use_repoinfo": "ℹ️ <b>Repo details</b>\nSend the command and the repo name.\nExample: /gitinfo <code>novabot</code>\nNot sure of the name? Send /gitrepos.",
+    "gt.use_repofiles": "📂 <b>See the files in a repo</b>\nSend /gitls, then pick your repo.\nOr type it: /gitls <code>yourname/novabot</code>\nTo open a folder, add its name: /gitls <code>src</code>",
+    "gt.use_getfile": "⬇️ <b>Download files</b>\nOpen a repo with /gitrepo, then send the command and the file name.\nExample: /gitget <code>nova.py</code>",
+    "gt.use_deletefile": "🗑 <b>Delete a file</b>\nOpen a repo with /gitrepo, then send the command and the file name.\nExample: /gitdel <code>old.py</code>\nI always ask before deleting.",
+    "gt.use_editfile": "✏️ <b>Edit a text file</b>\nOpen a repo with /gitrepo, then send the command and the file name.\nExample: /gitedit <code>nova.py</code>",
+    "gt.use_uploadfile": "⬆️ <b>Upload or replace a file</b>\nSend /gitput, then pick your repo.\nOr type it: /gitput <code>nova.py</code>",
+    "gt.use_download": "📦 <b>Download a repo as a ZIP</b>\nSend /gitzip, then pick your repo.\nOr type it: /gitzip <code>yourname/novabot</code>\nFor another branch, add its name: /gitzip <code>yourname/novabot dev</code>",
+    "gt.use_pushzip": "⬆️ <b>Send a ZIP of your project to GitHub</b>\nSend /gitpush, then pick your repo, then send the ZIP.\nOr type it: /gitpush <code>yourname/novabot</code>\nFor another branch, add its name: /gitpush <code>yourname/novabot dev</code>",
     "gt.update_unset": "⚠️ /gitupdate is not set up yet. The bot owner must set GIT_UPDATE_REPO on the server.",
-    "gt.how": "<b>📖 Guide</b>\n\n1️⃣ <b>Connect GitHub:</b> send <code>/gittoken yourtoken</code> (see the token guide).\n2️⃣ <b>Open a repo:</b> send /gitrepo, then the repo name. I remember it, and every reply shows 📂 where you are.\n3️⃣ <b>See the files:</b> send /gitls. You get a numbered list. Send a number like <code>2</code>, or several like <code>1 3 5</code>, and I send those files as documents. /gitzip sends the whole repo as a ZIP.\n4️⃣ <b>Replace files:</b> just send me one or many files. A file with exactly the same name in the repo replaces the old one. I show a list and ask once.\n5️⃣ <b>More jobs inside the repo:</b> <code>/gitget nova.py</code> download, <code>/gitput nova.py</code> upload, <code>/gitedit nova.py</code> edit, <code>/gitdel nova.py</code> delete.\n6️⃣ <b>Send a whole project:</b> send /gitpush, then your ZIP.\n\n/gitcancel stops a step and leaves the repo.",
-    "gt.cmds": "<b>⌨️ All commands</b>\nTap a blue command to run it. Tap the grey example to copy it.\n\n<b>Start here</b>\n/git open this GitHub menu\n/gittoken <code>yourtoken</code> connect your GitHub\n/gitrepo open the repo you want to work in. After that you only type file names.\n\n<b>See your repos and files</b>\n/gitrepos your repos\n/gitls the files of your repo, as a numbered list. Send a number to get that file\n/gitls <code>src</code> the files of one folder\n/gitinfo <code>novabot</code> details of a repo\n\n<b>Download</b>\n/gitget <code>nova.py</code> send a file here (many names: one per line)\n/gitzip send the whole repo as a ZIP\n\n<b>Change files</b>\n📎 Just send me one or many files: files with exactly the same name replace the old ones\n/gitput <code>nova.py</code> upload or replace one file\n/gitedit <code>nova.py</code> edit a text file\n/gitdel <code>nova.py</code> delete a file (I ask first)\n/gitpush send a ZIP of your project to GitHub\n\n<b>Repos</b>\n/gitnew <code>mybot</code> create a private repo (add <code>public</code> for a public one)\n/gitvis <code>novabot</code> make a repo public or private\n/gitdelrepo <code>yourname/novabot</code> delete a repo\n\n<b>Other</b>\n/gitstatus check your connection\n/gitoff disconnect your GitHub\n/gitcancel stop a step and leave the repo\n/gitupdate update the bot itself (bot owner only)",
+    "gt.how": "<b>📖 Guide</b>\n\n1️⃣ <b>Connect GitHub:</b> send /gittoken <code>yourtoken</code> (see the token guide).\n2️⃣ <b>Open a repo:</b> send /gitrepo, then the repo name. I remember it, and every reply shows 📂 where you are.\n3️⃣ <b>See the files:</b> send /gitls. You get a numbered list. Send a number like <code>2</code>, or several like <code>1 3 5</code>, and I send those files as documents. /gitzip sends the whole repo as a ZIP.\n4️⃣ <b>Replace files:</b> just send me one or many files. A file with exactly the same name in the repo replaces the old one. I show a list and ask once.\n5️⃣ <b>More jobs inside the repo:</b> /gitget <code>nova.py</code> download, /gitput <code>nova.py</code> upload, /gitedit <code>nova.py</code> edit, /gitdel <code>nova.py</code> delete.\n6️⃣ <b>Send a whole project:</b> send /gitpush, then your ZIP.\n\n/gitcancel stops a step and leaves the repo.",
+    "gt.cmds": "<b>⌨️ All commands</b>\nTap a blue command to run it. Tap the grey example to copy it.\n\n<b>Start here</b>\n/git open this GitHub menu\n/gittoken <code>yourtoken</code> connect your GitHub\n/gitrepo open the repo you want to work in. After that you only type file names.\n\n<b>See your repos and files</b>\n/gitrepos your repos\n/gitls the files of your repo, as a numbered list. Send a number to get that file\n/gitls <code>src</code> the files of one folder\n/gitinfo <code>novabot</code> details of a repo\n\n<b>Download</b>\n/gitget <code>nova.py</code> send a file here (many names: one per line)\n/gitzip send the whole repo as a ZIP\n\n<b>Change files</b>\n📎 Just send me one or many files: files with exactly the same name replace the old ones\n/gitput <code>nova.py</code> upload or replace one file\n/gitedit <code>nova.py</code> edit a text file\n/gitdel <code>nova.py</code> delete a file (I ask first)\n/gitpush send a ZIP of your project to GitHub\n\n<b>Repos</b>\n/gitnew <code>mybot</code> create a private repo (add <code>public</code> for a public one)\n/gitvis <code>novabot</code> make a repo public or private\n/gitdelrepo <code>yourname/novabot</code> delete a repo\n\n<b>Other</b>\n/gitstatus check your connection\n/gitoff disconnect your GitHub\n/gitundo put back your last change (I keep the last 10)\n/gitcancel stop a step and leave the repo\n/gitupdate update the bot itself (bot owner only)",
 })
 TEXTS_HI.update({
     "gt.in_repo": "📂 <b>Tum {repo} ke andar ho</b>",
-    "gt.in_now": "📂 <b>Ab tum {repo} ke andar ho</b>\n\nKaam karne ke liye bas file ka naam bhejo. Jaise: <code>/gitget nova.py</code>\nFiles dekhne ke liye /gitls bhejo, doosri repo ke liye /gitrepo.",
-    "gt.in_cur": "📂 <b>Tum {repo} ke andar ho</b>\n\nBadalne ke liye <code>/gitrepo reponame</code> bhejo. Saari repos dekhne ke liye /gitrepos. Is repo se bahar nikalne ke liye /gitcancel.",
+    "gt.in_now": "📂 <b>Ab tum {repo} ke andar ho</b>\n\nKaam karne ke liye bas file ka naam bhejo. Jaise: /gitget <code>nova.py</code>\nFiles dekhne ke liye /gitls bhejo, doosri repo ke liye /gitrepo.",
+    "gt.in_cur": "📂 <b>Tum {repo} ke andar ho</b>\n\nBadalne ke liye /gitrepo <code>reponame</code> bhejo. Saari repos dekhne ke liye /gitrepos. Is repo se bahar nikalne ke liye /gitcancel.",
     "gt.sel_ask": "📚 <b>Tumhari repos</b>\n\n{list}{more}\n\n✏️ Jo repo kholni hai uska naam bhejo, jaise <code>novabot</code>. Rokne ke liye /gitcancel.",
     "gt.sel_more": "\n… aur {n} repos. Naam bhejo, main dhoondh lunga.",
     "gt.ls_none": "📂 <b>{repo}</b>\n\n<code>{path}</code> mein koi file nahi mili. Sab dekhne ke liye /gitls bhejo.",
@@ -2507,15 +2769,15 @@ TEXTS_HI.update({
     "gt.nofile": "❌ <b>{repo}</b> mein <code>{q}</code> jaisi file nahi mili. File ke naam dekhne ke liye /gitls bhejo.",
     "gt.sel_nomatch": "Is repo mein in naamon ki bilkul same file nahi mili:\n{list}\n\nKuch nahi badla. Nayi file jodne ke liye /gitput use karo.",
     "gt.sel_skip": "\n\n⏭ Chhod di (is repo mein bilkul same naam ki file nahi, ya naam kai folders mein hai):\n{list}",
-    "gt.use_repoinfo": "ℹ️ <b>Repo ki details</b>\nCommand ke saath repo ka naam bhejo.\nJaise: <code>/gitinfo novabot</code>\nNaam yaad nahi? /gitrepos bhejo.",
-    "gt.use_repofiles": "📂 <b>Repo ki files dekho</b>\n/gitls bhejo, phir apni repo chuno.\nYa likh ke: <code>/gitls yourname/novabot</code>\nFolder kholne ke liye uska naam jodo: <code>/gitls src</code>",
-    "gt.use_getfile": "⬇️ <b>Files download karo</b>\nPehle /gitrepo se repo kholo, phir command ke saath file ka naam bhejo.\nJaise: <code>/gitget nova.py</code>",
-    "gt.use_deletefile": "🗑 <b>File delete karo</b>\nPehle /gitrepo se repo kholo, phir command ke saath file ka naam bhejo.\nJaise: <code>/gitdel old.py</code>\nDelete se pehle main hamesha poochta hoon.",
-    "gt.use_editfile": "✏️ <b>Text file edit karo</b>\nPehle /gitrepo se repo kholo, phir command ke saath file ka naam bhejo.\nJaise: <code>/gitedit nova.py</code>",
-    "gt.use_uploadfile": "⬆️ <b>File upload ya replace karo</b>\n/gitput bhejo, phir apni repo chuno.\nYa likh ke: <code>/gitput nova.py</code>",
-    "gt.use_download": "📦 <b>Repo ko ZIP mein download karo</b>\n/gitzip bhejo, phir apni repo chuno.\nYa likh ke: <code>/gitzip yourname/novabot</code>\nDoosri branch ke liye uska naam jodo: <code>/gitzip yourname/novabot dev</code>",
-    "gt.use_pushzip": "⬆️ <b>Apne project ka ZIP GitHub par bhejo</b>\n/gitpush bhejo, phir apni repo chuno, phir ZIP bhejo.\nYa likh ke: <code>/gitpush yourname/novabot</code>\nDoosri branch ke liye uska naam jodo: <code>/gitpush yourname/novabot dev</code>",
+    "gt.use_repoinfo": "ℹ️ <b>Repo ki details</b>\nCommand ke saath repo ka naam bhejo.\nJaise: /gitinfo <code>novabot</code>\nNaam yaad nahi? /gitrepos bhejo.",
+    "gt.use_repofiles": "📂 <b>Repo ki files dekho</b>\n/gitls bhejo, phir apni repo chuno.\nYa likh ke: /gitls <code>yourname/novabot</code>\nFolder kholne ke liye uska naam jodo: /gitls <code>src</code>",
+    "gt.use_getfile": "⬇️ <b>Files download karo</b>\nPehle /gitrepo se repo kholo, phir command ke saath file ka naam bhejo.\nJaise: /gitget <code>nova.py</code>",
+    "gt.use_deletefile": "🗑 <b>File delete karo</b>\nPehle /gitrepo se repo kholo, phir command ke saath file ka naam bhejo.\nJaise: /gitdel <code>old.py</code>\nDelete se pehle main hamesha poochta hoon.",
+    "gt.use_editfile": "✏️ <b>Text file edit karo</b>\nPehle /gitrepo se repo kholo, phir command ke saath file ka naam bhejo.\nJaise: /gitedit <code>nova.py</code>",
+    "gt.use_uploadfile": "⬆️ <b>File upload ya replace karo</b>\n/gitput bhejo, phir apni repo chuno.\nYa likh ke: /gitput <code>nova.py</code>",
+    "gt.use_download": "📦 <b>Repo ko ZIP mein download karo</b>\n/gitzip bhejo, phir apni repo chuno.\nYa likh ke: /gitzip <code>yourname/novabot</code>\nDoosri branch ke liye uska naam jodo: /gitzip <code>yourname/novabot dev</code>",
+    "gt.use_pushzip": "⬆️ <b>Apne project ka ZIP GitHub par bhejo</b>\n/gitpush bhejo, phir apni repo chuno, phir ZIP bhejo.\nYa likh ke: /gitpush <code>yourname/novabot</code>\nDoosri branch ke liye uska naam jodo: /gitpush <code>yourname/novabot dev</code>",
     "gt.update_unset": "⚠️ /gitupdate abhi set up nahi hai. Bot owner ko server par GIT_UPDATE_REPO set karna hoga.",
-    "gt.how": "<b>📖 Guide</b>\n\n1️⃣ <b>GitHub jodo:</b> <code>/gittoken yourtoken</code> bhejo (token guide dekho).\n2️⃣ <b>Repo kholo:</b> /gitrepo bhejo, phir repo ka naam. Main yaad rakhta hoon, aur har reply mein 📂 dikhta hai ki tum kahan ho.\n3️⃣ <b>Files dekho:</b> /gitls bhejo. Numbered list milegi. Number bhejo jaise <code>2</code>, ya kai jaise <code>1 3 5</code>, to main wo files document mein bhej dunga. /gitzip poori repo ZIP mein deta hai.\n4️⃣ <b>Files replace karo:</b> bas ek ya kai files bhej do. Repo mein bilkul same naam ki file purani ko replace karti hai. Main list dikhakar ek baar poochta hoon.\n5️⃣ <b>Repo ke andar aur kaam:</b> <code>/gitget nova.py</code> download, <code>/gitput nova.py</code> upload, <code>/gitedit nova.py</code> edit, <code>/gitdel nova.py</code> delete.\n6️⃣ <b>Poora project bhejo:</b> /gitpush bhejo, phir ZIP.\n\n/gitcancel kisi bhi step ko rokta hai aur repo se bahar nikalta hai.",
-    "gt.cmds": "<b>⌨️ Saari commands</b>\nNeeli command dabao to chalegi. Grey example dabao to copy hoga.\n\n<b>Yahan se shuru karo</b>\n/git yeh GitHub menu kholo\n/gittoken <code>yourtoken</code> apna GitHub jodo\n/gitrepo wo repo kholo jisme kaam karna hai. Uske baad sirf file ka naam likhna hai.\n\n<b>Repos aur files dekho</b>\n/gitrepos tumhari repos\n/gitls repo ki files, numbered list mein. Number bhejo to wo file mil jayegi\n/gitls <code>src</code> ek folder ki files\n/gitinfo <code>novabot</code> repo ki details\n\n<b>Download</b>\n/gitget <code>nova.py</code> file yahan bhejo (kai naam: ek line mein ek)\n/gitzip poori repo ZIP mein\n\n<b>Files badlo</b>\n📎 Bas ek ya kai files bhej do: bilkul same naam ki files purani ko replace karti hain\n/gitput <code>nova.py</code> ek file upload ya replace\n/gitedit <code>nova.py</code> text file edit\n/gitdel <code>nova.py</code> file delete (pehle poochta hoon)\n/gitpush apne project ka ZIP GitHub par bhejo\n\n<b>Repos</b>\n/gitnew <code>mybot</code> private repo banao (public ke liye <code>public</code> jodo)\n/gitvis <code>novabot</code> repo public ya private karo\n/gitdelrepo <code>yourname/novabot</code> repo delete karo\n\n<b>Aur</b>\n/gitstatus connection check karo\n/gitoff apna GitHub hatao\n/gitcancel step rokho aur repo se bahar niklo\n/gitupdate bot ko update karo (sirf bot owner)",
+    "gt.how": "<b>📖 Guide</b>\n\n1️⃣ <b>GitHub jodo:</b> /gittoken <code>yourtoken</code> bhejo (token guide dekho).\n2️⃣ <b>Repo kholo:</b> /gitrepo bhejo, phir repo ka naam. Main yaad rakhta hoon, aur har reply mein 📂 dikhta hai ki tum kahan ho.\n3️⃣ <b>Files dekho:</b> /gitls bhejo. Numbered list milegi. Number bhejo jaise <code>2</code>, ya kai jaise <code>1 3 5</code>, to main wo files document mein bhej dunga. /gitzip poori repo ZIP mein deta hai.\n4️⃣ <b>Files replace karo:</b> bas ek ya kai files bhej do. Repo mein bilkul same naam ki file purani ko replace karti hai. Main list dikhakar ek baar poochta hoon.\n5️⃣ <b>Repo ke andar aur kaam:</b> /gitget <code>nova.py</code> download, /gitput <code>nova.py</code> upload, /gitedit <code>nova.py</code> edit, /gitdel <code>nova.py</code> delete.\n6️⃣ <b>Poora project bhejo:</b> /gitpush bhejo, phir ZIP.\n\n/gitcancel kisi bhi step ko rokta hai aur repo se bahar nikalta hai.",
+    "gt.cmds": "<b>⌨️ Saari commands</b>\nNeeli command dabao to chalegi. Grey example dabao to copy hoga.\n\n<b>Yahan se shuru karo</b>\n/git yeh GitHub menu kholo\n/gittoken <code>yourtoken</code> apna GitHub jodo\n/gitrepo wo repo kholo jisme kaam karna hai. Uske baad sirf file ka naam likhna hai.\n\n<b>Repos aur files dekho</b>\n/gitrepos tumhari repos\n/gitls repo ki files, numbered list mein. Number bhejo to wo file mil jayegi\n/gitls <code>src</code> ek folder ki files\n/gitinfo <code>novabot</code> repo ki details\n\n<b>Download</b>\n/gitget <code>nova.py</code> file yahan bhejo (kai naam: ek line mein ek)\n/gitzip poori repo ZIP mein\n\n<b>Files badlo</b>\n📎 Bas ek ya kai files bhej do: bilkul same naam ki files purani ko replace karti hain\n/gitput <code>nova.py</code> ek file upload ya replace\n/gitedit <code>nova.py</code> text file edit\n/gitdel <code>nova.py</code> file delete (pehle poochta hoon)\n/gitpush apne project ka ZIP GitHub par bhejo\n\n<b>Repos</b>\n/gitnew <code>mybot</code> private repo banao (public ke liye <code>public</code> jodo)\n/gitvis <code>novabot</code> repo public ya private karo\n/gitdelrepo <code>yourname/novabot</code> repo delete karo\n\n<b>Aur</b>\n/gitstatus connection check karo\n/gitoff apna GitHub hatao\n/gitundo apna aakhri badlav wapas lo (main aakhri 10 rakhta hoon)\n/gitcancel step rokho aur repo se bahar niklo\n/gitupdate bot ko update karo (sirf bot owner)",
 })
