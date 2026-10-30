@@ -6549,8 +6549,8 @@ async def _lk_entries(chat, bot, main, extras):
 
 
 def _lk_text(rows):
-    """One block per link: the name in bold, the link under it in a copyable (tap to copy) style."""
-    return "\n\n".join(f"🔗 <b>{html.escape(label)}</b>\n<code>{html.escape(url)}</code>" for _s, label, url in rows)
+    """One block per link: the name in bold, the link under it as a tappable link."""
+    return "\n\n".join(f"🔗 <b>{html.escape(label)}</b>\n{html.escape(url)}" for _s, label, url in rows)
 
 
 def _lk_markup(cid, rows, admin):
@@ -6639,7 +6639,7 @@ async def setlink_cmd(update, context):
     cid, arg = chat.id, (context.args[0] if context.args else "")
     if not arg:
         main, _ = _lk_load(cid)
-        shown = f"<code>{html.escape(main)}</code>" if main and main != "auto" else L.t("lk2.main_auto" if main else "lk2.main_none", cid)
+        shown = f"{html.escape(main)}" if main and main != "auto" else L.t("lk2.main_auto" if main else "lk2.main_none", cid)
         await msg.reply_html(L.t("lk2.use_set", cid, main=shown))
         return
     if arg.lower() == "off":
@@ -6724,7 +6724,7 @@ def _lk_back(cid, data="lk:g"):
 def _lk_panel(chat):
     cid = chat.id
     main, extras = _lk_load(cid)
-    shown = f"<code>{html.escape(main)}</code>" if main and main != "auto" else L.t("lk2.main_auto" if main else "lk2.main_none", cid)
+    shown = f"{html.escape(main)}" if main and main != "auto" else L.t("lk2.main_auto" if main else "lk2.main_none", cid)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(L.t("lk2.btn_manage", cid), callback_data="lk:g")],
                                [InlineKeyboardButton(L.t("lk2.btn_cmd", cid), callback_data="lk:c"), _lk_back(cid, "help:more")]])
     return L.t("lk2.panel", cid, main=shown, count=len(extras), max=LK_MAX), kb
@@ -6737,7 +6737,7 @@ def _lk_manage(chat, note=""):
     lines = []
     if main:
         lines.append(f"🔗 <b>{html.escape(_lk_label(cid, 1))}</b>: " +
-                     (f"<code>{html.escape(main)}</code>" if main != "auto" else L.t("lk2.main_auto", cid)))
+                     (f"{html.escape(main)}" if main != "auto" else L.t("lk2.main_auto", cid)))
     lines += [f"🔗 <b>{html.escape(_lk_label(cid, s, n))}</b>: <code>{html.escape(u)}</code>" for s, (u, n) in extras.items()]
     rows = []
     if len(extras) < LK_MAX:
@@ -6996,8 +6996,8 @@ LK_TEXTS_EN = {
     "lk2.manage_none": "No links yet.",
     "lk2.pick_edit": "✏️ <b>Which link do you want to edit?</b>",
     "lk2.pick_del": "🗑 <b>Which link do you want to delete?</b>",
-    "lk2.edit_menu": "✏️ <b>{label}</b>\n<code>{url}</code>\n\nWhat do you want to change?",
-    "lk2.confirm_del": "🗑 Delete <b>{label}</b>?\n<code>{url}</code>",
+    "lk2.edit_menu": "✏️ <b>{label}</b>\n{url}\n\nWhat do you want to change?",
+    "lk2.confirm_del": "🗑 Delete <b>{label}</b>?\n{url}",
     "lk2.ask_add": "➕ <b>Add a new link</b>\n\nSend the link, and a name if you want. Example:\n<code>https://t.me/mychannel My Channel</code>\n\nSend <code>cancel</code> to stop.",
     "lk2.ask_name": "✏️ <b>New name for {label}</b>\n\nSend the new name. Send <code>-</code> to go back to <b>{default}</b>.\nSend <code>cancel</code> to stop.",
     "lk2.ask_link": "🔗 <b>New link for {label}</b>\n\nSend the new link, for example <code>https://t.me/mychannel</code>.\nSend <code>cancel</code> to stop.",
@@ -7011,11 +7011,11 @@ LK_TEXTS_EN = {
     "lk2.changed": "✅ <b>{label}</b> updated.",
     "lk2.removed": "✅ <b>{label}</b> deleted.",
     "lk2.gone": "That link does not exist any more.",
-    "lk2.del_main": "The Main link is removed with <code>/setlink off</code>.",
-    "lk2.use_set": "🔗 <b>Main link</b>\nNow: {main}\n\nSend the command and the link:\n<code>/setlink https://t.me/yourgroup</code>\n\nOther options: <code>/setlink auto</code> (the bot makes an invite link) or <code>/setlink off</code>.",
-    "lk2.use_add": "➕ <b>Add a link</b>\nSend the command and the link. Add a name if you want:\n<code>/addlink https://t.me/mychannel</code>\n<code>/addlink https://t.me/mychannel My Channel</code>\n\nThe first one becomes Link 2, the next Link 3, and so on up to Link 10.",
-    "lk2.use_del": "🗑 <b>Delete a link</b>\nSend the command and the link number or name:\n<code>/dellink 3</code>\nSend /link to see them.",
-    "lk2.cmd_page": "⌨️ <b>Link commands</b>\nTap a command to copy it.\n\n<b>Everybody</b>\n<code>/link</code> show all links\n<code>/link 2</code> show one link (number or name)\n\n<b>Admins</b>\n<code>/setlink https://t.me/yourgroup</code> set the Main link\n<code>/setlink auto</code> the bot makes an invite link\n<code>/setlink off</code> remove the Main link\n<code>/addlink https://t.me/mychannel</code> add Link 2, then Link 3 ... up to Link 10\n<code>/addlink https://t.me/mychannel My Channel</code> add it with a name\n<code>/dellink 3</code> delete Link 3\n\nTo change a name or a link, use ⚙️ Link management.",
+    "lk2.del_main": "The Main link is removed with /setlink <code>off</code>.",
+    "lk2.use_set": "🔗 <b>Main link</b>\nNow: {main}\n\nSend the command and the link:\n/setlink <code>https://t.me/yourgroup</code>\n\nOther options: /setlink <code>auto</code> (the bot makes an invite link) or /setlink <code>off</code>.",
+    "lk2.use_add": "➕ <b>Add a link</b>\nSend the command and the link. Add a name if you want:\n/addlink <code>https://t.me/mychannel</code>\n/addlink <code>https://t.me/mychannel My Channel</code>\n\nThe first one becomes Link 2, the next Link 3, and so on up to Link 10.",
+    "lk2.use_del": "🗑 <b>Delete a link</b>\nSend the command and the link number or name:\n/dellink <code>3</code>\nSend /link to see them.",
+    "lk2.cmd_page": "⌨️ <b>Link commands</b>\nTap a blue command to run it. Tap the grey example to copy it.\n\n<b>Everybody</b>\n/link show all links\n/link <code>2</code> show one link (number or name)\n\n<b>Admins</b>\n/setlink <code>https://t.me/yourgroup</code> set the Main link\n/setlink <code>auto</code> the bot makes an invite link\n/setlink <code>off</code> remove the Main link\n/addlink <code>https://t.me/mychannel</code> add Link 2, then Link 3 ... up to Link 10\n/addlink <code>https://t.me/mychannel My Channel</code> add it with a name\n/dellink <code>3</code> delete Link 3\n\nTo change a name or a link, use ⚙️ Link management.",
 }
 LK_TEXTS_HI = {
     "lk2.main": "Main link",
@@ -7040,8 +7040,8 @@ LK_TEXTS_HI = {
     "lk2.manage_none": "Abhi koi link nahi hai.",
     "lk2.pick_edit": "✏️ <b>Kaun sa link edit karna hai?</b>",
     "lk2.pick_del": "🗑 <b>Kaun sa link delete karna hai?</b>",
-    "lk2.edit_menu": "✏️ <b>{label}</b>\n<code>{url}</code>\n\nKya badalna hai?",
-    "lk2.confirm_del": "🗑 <b>{label}</b> delete karna hai?\n<code>{url}</code>",
+    "lk2.edit_menu": "✏️ <b>{label}</b>\n{url}\n\nKya badalna hai?",
+    "lk2.confirm_del": "🗑 <b>{label}</b> delete karna hai?\n{url}",
     "lk2.ask_add": "➕ <b>Naya link jodo</b>\n\nLink bhejo, aur chaho to naam bhi. Jaise:\n<code>https://t.me/mychannel My Channel</code>\n\nRokne ke liye <code>cancel</code> bhejo.",
     "lk2.ask_name": "✏️ <b>{label} ka naya naam</b>\n\nNaya naam bhejo. <b>{default}</b> par wapas jaane ke liye <code>-</code> bhejo.\nRokne ke liye <code>cancel</code> bhejo.",
     "lk2.ask_link": "🔗 <b>{label} ka naya link</b>\n\nNaya link bhejo, jaise <code>https://t.me/mychannel</code>.\nRokne ke liye <code>cancel</code> bhejo.",
@@ -7055,11 +7055,11 @@ LK_TEXTS_HI = {
     "lk2.changed": "✅ <b>{label}</b> update ho gaya.",
     "lk2.removed": "✅ <b>{label}</b> delete ho gaya.",
     "lk2.gone": "Yeh link ab maujood nahi hai.",
-    "lk2.del_main": "Main link hatane ke liye <code>/setlink off</code> use karo.",
-    "lk2.use_set": "🔗 <b>Main link</b>\nAbhi: {main}\n\nCommand ke saath link bhejo:\n<code>/setlink https://t.me/yourgroup</code>\n\nAur options: <code>/setlink auto</code> (bot invite link banata hai) ya <code>/setlink off</code>.",
-    "lk2.use_add": "➕ <b>Link jodo</b>\nCommand ke saath link bhejo. Chaho to naam bhi:\n<code>/addlink https://t.me/mychannel</code>\n<code>/addlink https://t.me/mychannel My Channel</code>\n\nPehla Link 2 banega, agla Link 3, aise Link 10 tak.",
-    "lk2.use_del": "🗑 <b>Link delete karo</b>\nCommand ke saath link ka number ya naam bhejo:\n<code>/dellink 3</code>\nLinks dekhne ke liye /link bhejo.",
-    "lk2.cmd_page": "⌨️ <b>Link commands</b>\nCommand dabao to copy ho jayegi.\n\n<b>Sabke liye</b>\n<code>/link</code> saare links dekho\n<code>/link 2</code> ek link dekho (number ya naam)\n\n<b>Admins ke liye</b>\n<code>/setlink https://t.me/yourgroup</code> Main link set karo\n<code>/setlink auto</code> bot invite link banata hai\n<code>/setlink off</code> Main link hatao\n<code>/addlink https://t.me/mychannel</code> Link 2 jodo, phir Link 3 ... Link 10 tak\n<code>/addlink https://t.me/mychannel My Channel</code> naam ke saath jodo\n<code>/dellink 3</code> Link 3 delete karo\n\nNaam ya link badalne ke liye ⚙️ Link management use karo.",
+    "lk2.del_main": "Main link hatane ke liye /setlink <code>off</code> use karo.",
+    "lk2.use_set": "🔗 <b>Main link</b>\nAbhi: {main}\n\nCommand ke saath link bhejo:\n/setlink <code>https://t.me/yourgroup</code>\n\nAur options: /setlink <code>auto</code> (bot invite link banata hai) ya /setlink <code>off</code>.",
+    "lk2.use_add": "➕ <b>Link jodo</b>\nCommand ke saath link bhejo. Chaho to naam bhi:\n/addlink <code>https://t.me/mychannel</code>\n/addlink <code>https://t.me/mychannel My Channel</code>\n\nPehla Link 2 banega, agla Link 3, aise Link 10 tak.",
+    "lk2.use_del": "🗑 <b>Link delete karo</b>\nCommand ke saath link ka number ya naam bhejo:\n/dellink <code>3</code>\nLinks dekhne ke liye /link bhejo.",
+    "lk2.cmd_page": "⌨️ <b>Link commands</b>\nNeeli command par tap karo to chalegi. Grey example par tap karo to copy hoga.\n\n<b>Sabke liye</b>\n/link saare links dekho\n/link <code>2</code> ek link dekho (number ya naam)\n\n<b>Admins ke liye</b>\n/setlink <code>https://t.me/yourgroup</code> Main link set karo\n/setlink <code>auto</code> bot invite link banata hai\n/setlink <code>off</code> Main link hatao\n/addlink <code>https://t.me/mychannel</code> Link 2 jodo, phir Link 3 ... Link 10 tak\n/addlink <code>https://t.me/mychannel My Channel</code> naam ke saath jodo\n/dellink <code>3</code> Link 3 delete karo\n\nNaam ya link badalne ke liye ⚙️ Link management use karo.",
 }
 
 
