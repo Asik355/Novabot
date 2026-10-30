@@ -5618,7 +5618,7 @@ MODULES = {
     "anniversary": {"keys": ("anniv_on", "anniv_time", "anniv_text", "anniv_seen")},
     "appeals": {"keys": ("mod_appeal", "mod_appeal_dest")},
     "birthdays": {"keys": ("bdaygrp", "bdaymsg")},
-    "links": {"keys": ("link_main", "link_list")},
+    "links": {"keys": ("link_main", "link_extra", "link_list")},
     "schedule": {"keys": ("sched_msgs",)},
     "translations": {"keys": ("lang",)},
     "warns": {"keys": ("warn_limit", "warn_time", "warn_mode", "warn_ladder", "warn_ladder_on")},
@@ -6403,24 +6403,30 @@ async def bk_callback(update, context):
 
 
 # ======================================================================================================
-# 4c. GROUP LINKS  (/link /links for everybody, /setlink /addlink /dellink for admins; saved per group)
+# 4c. GROUP LINKS  (/link /links for everybody; /setlink /addlink /dellink and the ⚙️ management buttons for admins)
 # ======================================================================================================
 #   /setlink URL|auto|off   the MAIN link of this group (a t.me link, or "auto": the bot makes an invite link when asked)
-#   /addlink NAME URL       another link of yours (your other groups or channels); /dellink NAME removes it
-#   /link [NAME]            shows the main link (or the named one) with a Join button
-#   /links                  every saved link as buttons
-# Settings (per group, backed up by /backup): link_main = "https://t.me/..." | "auto" | ""; link_list = JSON {name: url}.
+#   /addlink URL [NAME]     the next free slot: Link 2, Link 3 ... up to Link 10 (Main + 9 more). A NAME is optional.
+#   /dellink NUMBER|NAME    removes Link 2 ... Link 10
+#   /link, /links           the Main link and every other link: copyable text + one open button each
+#   ⚙️ Link management      (/help > 🔗, and under /link for admins): add, edit (name / link / both) and delete
+# Settings (per group, backed up by /backup): link_main = "https://t.me/..." | "auto" | "";
+#   link_extra = JSON {"2": {"u": url, "n": name}, ...}. The old link_list ({name: url}) is still read until the first change.
 # Only t.me / telegram.me links are accepted, and they are checked again every time they are read (a restored or imported
-# file is never trusted). A member can ask for a link every LK_MEMBER_SECS seconds; admins are not slowed down.
-LK_MAIN_KEY, LK_LIST_KEY = "link_main", "link_list"
-LK_MAX = 20                          # named links per group
+# file is never trusted). A member can ask for the links every LK_MEMBER_SECS seconds; admins are not slowed down.
+LK_MAIN_KEY, LK_EXTRA_KEY, LK_LIST_KEY = "link_main", "link_extra", "link_list"
+LK_LAST_SLOT = 10                    # Main link = 1, then Link 2 ... Link 10
+LK_MAX = LK_LAST_SLOT - 1            # other links per group
+LK_LABEL_MAX = 30                    # characters of a custom name
 LK_MEMBER_SECS = 10
 LK_AUTO_SECS = 3600                  # an "auto" invite link is reused for this long (not one new link per question)
-LK_NAME_RE = re.compile(r"[a-z0-9_]{1,20}")
+LK_ASK_SECS = 300                    # seconds the bot waits for the text after ➕ / ✏️
+LK_NAME_RE = re.compile(r"[a-z0-9_]{1,20}")                                     # names in the old list
 LK_URL_RE = re.compile(r"https://t\.me/(?:\+[A-Za-z0-9_-]{8,64}|joinchat/[A-Za-z0-9_-]{8,64}|[A-Za-z][A-Za-z0-9_]{4,31}(?:/\d{1,12})?)")
 MORE_PANELS = MORE_PANELS + (("lk", "lk:m"),)                                  # 🔗 on /help page 2
 _lk_last = {}                        # (chat id, user id) -> monotonic time of the last answer
 _lk_auto = {}                        # chat id -> (url, monotonic time): the invite link made by "auto"
+_lk_pending = {}                     # (chat id, admin id) -> {"kind": add|name|link|both, "slot", "panel": (chat id, message id), "until"}
 
 
 def lk_norm(text):
@@ -6432,24 +6438,85 @@ def lk_norm(text):
     return t if LK_URL_RE.fullmatch(t) else None
 
 
-def _lk_load(chat_id):
-    """(main, {name: url}) of this group. Everything is validated here, so a bad stored value is simply ignored."""
-    main = D.get_setting(chat_id, LK_MAIN_KEY, "") or ""
-    if main != "auto" and not (isinstance(main, str) and LK_URL_RE.fullmatch(main)):
-        main = ""
+def _lk_clean_name(text):
+    """A custom name: one line, no control characters, at most LK_LABEL_MAX characters."""
+    return re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f]", " ", str(text or ""))).strip()[:LK_LABEL_MAX]
+
+
+def _lk_parse(text):
+    """(url, name) from 'LINK [NAME]' (or the old 'NAME LINK'); None when there is no Telegram link in it."""
+    bits = (text or "").split()
+    if not bits:
+        return None
+    url = lk_norm(bits[0])
+    if url:
+        return url, _lk_clean_name(" ".join(bits[1:]))
+    url = lk_norm(bits[-1]) if len(bits) > 1 else None
+    return (url, _lk_clean_name(" ".join(bits[:-1]))) if url else None
+
+
+def _lk_legacy(chat_id):
+    """The old {name: url} list from before the numbered links, validated."""
     try:
         data = json.loads(D.get_setting(chat_id, LK_LIST_KEY, "") or "{}")
     except (ValueError, TypeError, RecursionError):
-        data = {}
-    links = {}
+        return {}
+    out = {}
     for k, v in (data.items() if isinstance(data, dict) else ()):
-        if len(links) < LK_MAX and isinstance(k, str) and LK_NAME_RE.fullmatch(k) and isinstance(v, str) and LK_URL_RE.fullmatch(v):
-            links[k] = v
-    return main, links
+        if len(out) < LK_MAX and isinstance(k, str) and LK_NAME_RE.fullmatch(k) and isinstance(v, str) and LK_URL_RE.fullmatch(v):
+            out[k] = v
+    return out
 
 
-def _lk_save_list(chat_id, links):
-    D.set_setting(chat_id, LK_LIST_KEY, json.dumps(links, sort_keys=True) if links else "")
+def _lk_load(chat_id):
+    """(main, {slot: (url, name)}) of this group. Everything is validated here, so a bad stored value is simply ignored."""
+    main = D.get_setting(chat_id, LK_MAIN_KEY, "") or ""
+    if main != "auto" and not (isinstance(main, str) and LK_URL_RE.fullmatch(main)):
+        main = ""
+    extras = {}
+    raw = D.get_setting(chat_id, LK_EXTRA_KEY, "") or ""
+    if raw:
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError, RecursionError):
+            data = {}
+        for k, v in (data.items() if isinstance(data, dict) else ()):
+            try:
+                slot = int(k)
+            except (TypeError, ValueError):
+                continue
+            url = v.get("u") if isinstance(v, dict) else None
+            if 2 <= slot <= LK_LAST_SLOT and isinstance(url, str) and LK_URL_RE.fullmatch(url):
+                extras[slot] = (url, _lk_clean_name(v.get("n", "")))
+    else:                                                       # nothing saved in the new form yet: the old list becomes Link 2, 3 ...
+        for slot, (name, url) in zip(range(2, LK_LAST_SLOT + 1), sorted(_lk_legacy(chat_id).items())):
+            extras[slot] = (url, name)
+    return main, dict(sorted(extras.items()))
+
+
+def _lk_save(chat_id, extras):
+    D.set_setting(chat_id, LK_EXTRA_KEY,
+                  json.dumps({str(s): {"u": u, "n": n} for s, (u, n) in sorted(extras.items())}) if extras else "")
+    D.set_setting(chat_id, LK_LIST_KEY, "")                     # the old list now lives inside link_extra
+
+
+def _lk_label(cid, slot, name=""):
+    return L.t("lk2.main", cid) if slot == 1 else (name or L.t("lk2.n", cid, n=slot))
+
+
+def _lk_find(cid, text, extras):
+    """The slot a typed number or name points to (1 = Main link, 2..10 = the others), or None."""
+    t = re.sub(r"\s+", " ", (text or "").strip()).lower()
+    if t in ("main", "1", L.t("lk2.main", cid).lower()):
+        return 1
+    m = re.fullmatch(r"(?:link )?(\d{1,2})", t)
+    if m:
+        s = int(m.group(1))
+        return s if s in extras else None
+    for s, (_u, n) in extras.items():
+        if n and n.lower() == t:
+            return s
+    return None
 
 
 async def _lk_main_url(chat, bot, main):
@@ -6469,8 +6536,29 @@ async def _lk_main_url(chat, bot, main):
     return url
 
 
-def _lk_join_markup(cid, url):
-    return InlineKeyboardMarkup([[InlineKeyboardButton(L.t("lk.btn_join", cid), url=url)]])
+async def _lk_entries(chat, bot, main, extras):
+    """([(slot, label, url)], auto_failed): the Main link first (when set and usable), then Link 2 ... Link 10."""
+    cid, rows, failed = chat.id, [], False
+    if main:
+        try:
+            rows.append((1, _lk_label(cid, 1), await _lk_main_url(chat, bot, main)))
+        except TelegramError:
+            failed = True
+    rows += [(s, _lk_label(cid, s, n), u) for s, (u, n) in extras.items()]
+    return rows, failed
+
+
+def _lk_text(rows):
+    """One block per link: the name in bold, the link under it in a copyable (tap to copy) style."""
+    return "\n\n".join(f"🔗 <b>{html.escape(label)}</b>\n<code>{html.escape(url)}</code>" for _s, label, url in rows)
+
+
+def _lk_markup(cid, rows, admin):
+    buttons = [InlineKeyboardButton("🔗 " + label[:LK_LABEL_MAX], url=url) for _s, label, url in rows]
+    kb = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    if admin:
+        kb.append([InlineKeyboardButton(L.t("lk2.btn_manage", cid), callback_data="lk:g")])
+    return InlineKeyboardMarkup(kb) if kb else None
 
 
 async def _lk_slow(chat, user):
@@ -6488,47 +6576,29 @@ async def _lk_slow(chat, user):
 
 
 async def _lk_show(chat, user, bot, name, reply):
-    """The shared part of /link and the panel button: `reply(text, markup)` sends the answer."""
+    """The shared part of /link, /links and the panel button: `reply(text, markup)` sends the answer.
+    No name = every link; a number or name = just that one."""
     cid = chat.id
     left = await _lk_slow(chat, user)
     if left:
         await reply(L.t("lk.slow", cid, secs=left), None)
         return
-    main, links = _lk_load(cid)
+    admin = await _is_admin(chat, user)
+    main, extras = _lk_load(cid)
+    rows, failed = await _lk_entries(chat, bot, main, extras)
     if name:
-        if name not in links:
-            await reply(L.t("lk.not_found", cid, name=html.escape(name[:20]), names=", ".join(sorted(links)) or "-"), None)
+        slot = _lk_find(cid, name, extras)
+        rows = [r for r in rows if r[0] == slot] if slot else []
+        if not rows:
+            await reply(L.t("lk2.not_found", cid, name=html.escape(name[:LK_LABEL_MAX])), None)
             return
-        await reply(L.t("lk.shown", cid, title=html.escape(name)), _lk_join_markup(cid, links[name]))
-        return
-    if not main:
-        if links:
-            await _lk_list(chat, bot, reply)
+    if not rows:
+        if failed:
+            await reply(L.t("lk.auto_fail", cid), None)
         else:
-            await reply(L.t("lk.none", cid), None)
+            await reply(L.t("lk2.none", cid) + (L.t("lk2.none_admin", cid) if admin else ""), _lk_markup(cid, [], admin))
         return
-    try:
-        url = await _lk_main_url(chat, bot, main)
-    except TelegramError:
-        await reply(L.t("lk.auto_fail", cid), None)
-        return
-    await reply(L.t("lk.shown", cid, title=html.escape(chat.title or "")), _lk_join_markup(cid, url))
-
-
-async def _lk_list(chat, bot, reply):
-    cid = chat.id
-    main, links = _lk_load(cid)
-    buttons = []
-    if main:
-        try:
-            buttons.append(InlineKeyboardButton("🔗 " + L.t("lk.main_name", cid), url=await _lk_main_url(chat, bot, main)))
-        except TelegramError:
-            pass
-    buttons += [InlineKeyboardButton("🔗 " + n, url=u) for n, u in sorted(links.items())]
-    if not buttons:
-        await reply(L.t("lk.none", cid), None)
-        return
-    await reply(L.t("lk.list_head", cid), InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)]))
+    await reply(_lk_text(rows), _lk_markup(cid, rows, admin))
 
 
 # ------------------------------------------------------------------ commands
@@ -6550,19 +6620,15 @@ async def link_cmd(update, context):
     g = await _lk_gate(update, False)
     if g:
         msg, chat, user = g
-        name = (context.args[0].lower() if context.args else "")
-        await _lk_show(chat, user, context.bot, name, lambda t, m: msg.reply_html(t, reply_markup=m))
+        name = " ".join(context.args or []).strip()
+        await _lk_show(chat, user, context.bot, name, lambda t, m: msg.reply_html(t, reply_markup=m, disable_web_page_preview=True))
 
 
 async def links_cmd(update, context):
     g = await _lk_gate(update, False)
     if g:
         msg, chat, user = g
-        left = await _lk_slow(chat, user)
-        if left:
-            await msg.reply_text(L.t("lk.slow", chat.id, secs=left))
-            return
-        await _lk_list(chat, context.bot, lambda t, m: msg.reply_html(t, reply_markup=m))
+        await _lk_show(chat, user, context.bot, "", lambda t, m: msg.reply_html(t, reply_markup=m, disable_web_page_preview=True))
 
 
 async def setlink_cmd(update, context):
@@ -6573,8 +6639,8 @@ async def setlink_cmd(update, context):
     cid, arg = chat.id, (context.args[0] if context.args else "")
     if not arg:
         main, _ = _lk_load(cid)
-        shown = html.escape(main) if main and main != "auto" else L.t("lk.main_auto" if main else "lk.main_none", cid)
-        await msg.reply_html(L.t("lk.use_set", cid, main=shown))
+        shown = f"<code>{html.escape(main)}</code>" if main and main != "auto" else L.t("lk2.main_auto" if main else "lk2.main_none", cid)
+        await msg.reply_html(L.t("lk2.use_set", cid, main=shown))
         return
     if arg.lower() == "off":
         D.set_setting(cid, LK_MAIN_KEY, "")
@@ -6604,25 +6670,27 @@ async def addlink_cmd(update, context):
     if not g:
         return
     msg, chat, user = g
-    cid, a = chat.id, context.args or []
-    if len(a) < 2:
-        await msg.reply_html(L.t("lk.use_add", cid))
+    cid = chat.id
+    if not context.args:
+        await msg.reply_html(L.t("lk2.use_add", cid))
         return
-    name, url = a[0].lower(), lk_norm(a[1])
-    if not LK_NAME_RE.fullmatch(name):
-        await msg.reply_text(L.t("lk.bad_name", cid))
+    parsed = _lk_parse(" ".join(context.args))
+    if parsed is None:
+        await msg.reply_html(L.t("lk2.err_link", cid))
         return
-    if not url:
-        await msg.reply_text(L.t("lk.bad_url", cid))
+    url, name = parsed
+    _, extras = _lk_load(cid)
+    same = next((s for s, (u, n) in extras.items() if u == url), None)
+    if same:
+        await msg.reply_html(L.t("lk2.dup", cid, label=html.escape(_lk_label(cid, same, extras[same][1]))))
         return
-    _, links = _lk_load(cid)
-    if name not in links and len(links) >= LK_MAX:
-        await msg.reply_text(L.t("lk.too_many", cid, max=LK_MAX))
+    slot = next((s for s in range(2, LK_LAST_SLOT + 1) if s not in extras), None)
+    if slot is None:
+        await msg.reply_html(L.t("lk2.full", cid, max=LK_MAX))
         return
-    updated = name in links
-    links[name] = url
-    _lk_save_list(cid, links)
-    await msg.reply_html(L.t("lk.updated" if updated else "lk.added", cid, name=html.escape(name)))
+    extras[slot] = (url, name)
+    _lk_save(cid, extras)
+    await msg.reply_html(L.t("lk2.added", cid, label=html.escape(_lk_label(cid, slot, name))))
 
 
 async def dellink_cmd(update, context):
@@ -6630,33 +6698,163 @@ async def dellink_cmd(update, context):
     if not g:
         return
     msg, chat, user = g
-    cid, name = chat.id, (context.args[0].lower() if context.args else "")
-    if not name:
-        await msg.reply_html(L.t("lk.use_del", cid))
+    cid, text = chat.id, " ".join(context.args or []).strip()
+    if not text:
+        await msg.reply_html(L.t("lk2.use_del", cid))
         return
-    _, links = _lk_load(cid)
-    if name not in links:
-        await msg.reply_html(L.t("lk.del_none", cid, name=html.escape(name[:20])))
+    _, extras = _lk_load(cid)
+    slot = _lk_find(cid, text, extras)
+    if slot == 1:
+        await msg.reply_html(L.t("lk2.del_main", cid))
         return
-    del links[name]
-    _lk_save_list(cid, links)
-    await msg.reply_html(L.t("lk.removed", cid, name=html.escape(name)))
+    if not slot:
+        await msg.reply_html(L.t("lk2.not_found", cid, name=html.escape(text[:LK_LABEL_MAX])))
+        return
+    label = _lk_label(cid, slot, extras[slot][1])
+    del extras[slot]
+    _lk_save(cid, extras)
+    await msg.reply_html(L.t("lk2.removed", cid, label=html.escape(label)))
 
 
-# ------------------------------------------------------------------ panel on /help page 2
+# ------------------------------------------------------------------ panel on /help page 2 and the ⚙️ management screens
+def _lk_back(cid, data="lk:g"):
+    return InlineKeyboardButton(L.t("pick.back", cid), callback_data=data)
+
+
 def _lk_panel(chat):
     cid = chat.id
-    main, links = _lk_load(cid)
-    shown = html.escape(main) if main and main != "auto" else L.t("lk.main_auto" if main else "lk.main_none", cid)
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(L.t("lk.btn_show", cid), callback_data="lk:s"),
-                                InlineKeyboardButton(L.t("lk.btn_all", cid), callback_data="lk:l")],
-                               [InlineKeyboardButton(L.t("lk.btn_cmd", cid), callback_data="lk:c"),
-                                InlineKeyboardButton(L.t("pick.back", cid), callback_data="help:more")]])
-    return L.t("lk.panel", cid, main=shown, count=len(links)), kb
+    main, extras = _lk_load(cid)
+    shown = f"<code>{html.escape(main)}</code>" if main and main != "auto" else L.t("lk2.main_auto" if main else "lk2.main_none", cid)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(L.t("lk2.btn_manage", cid), callback_data="lk:g")],
+                               [InlineKeyboardButton(L.t("lk2.btn_cmd", cid), callback_data="lk:c"), _lk_back(cid, "help:more")]])
+    return L.t("lk2.panel", cid, main=shown, count=len(extras), max=LK_MAX), kb
+
+
+def _lk_manage(chat, note=""):
+    """The ⚙️ Link management screen: every link, and the add / edit / delete buttons."""
+    cid = chat.id
+    main, extras = _lk_load(cid)
+    lines = []
+    if main:
+        lines.append(f"🔗 <b>{html.escape(_lk_label(cid, 1))}</b>: " +
+                     (f"<code>{html.escape(main)}</code>" if main != "auto" else L.t("lk2.main_auto", cid)))
+    lines += [f"🔗 <b>{html.escape(_lk_label(cid, s, n))}</b>: <code>{html.escape(u)}</code>" for s, (u, n) in extras.items()]
+    rows = []
+    if len(extras) < LK_MAX:
+        rows.append([InlineKeyboardButton(L.t("lk2.btn_add", cid), callback_data="lk:a")])
+    if main or extras:
+        rows.append([InlineKeyboardButton(L.t("lk2.btn_edit", cid), callback_data="lk:e"),
+                     InlineKeyboardButton(L.t("lk2.btn_del", cid), callback_data="lk:d")])
+    rows.append([_lk_back(cid, "lk:m")])
+    text = L.t("lk2.manage", cid, list="\n".join(lines) or L.t("lk2.manage_none", cid))
+    return (note + "\n\n" if note else "") + text, InlineKeyboardMarkup(rows)
+
+
+def _lk_pick(chat, act):
+    """Which link? One button per link (act: e = edit, d = delete)."""
+    cid = chat.id
+    main, extras = _lk_load(cid)
+    buttons = []
+    if main:
+        buttons.append(InlineKeyboardButton(_lk_label(cid, 1), callback_data=f"lk:{act}:1"))
+    buttons += [InlineKeyboardButton(_lk_label(cid, s, n)[:LK_LABEL_MAX], callback_data=f"lk:{act}:{s}") for s, (_u, n) in extras.items()]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)] + [[_lk_back(cid)]]
+    return L.t("lk2.pick_edit" if act == "e" else "lk2.pick_del", cid), InlineKeyboardMarkup(rows)
+
+
+def _lk_one(cid, main, extras, slot):
+    """(label, url) of one slot, or None when it does not exist."""
+    if slot == 1:
+        return (_lk_label(cid, 1), main) if main else None
+    return (_lk_label(cid, slot, extras[slot][1]), extras[slot][0]) if slot in extras else None
+
+
+def _lk_edit_menu(chat, slot):
+    cid = chat.id
+    main, extras = _lk_load(cid)
+    one = _lk_one(cid, main, extras, slot)
+    if one is None:
+        return None
+    rows = [[InlineKeyboardButton(L.t("lk2.btn_link", cid), callback_data=f"lk:el:{slot}")]]
+    if slot > 1:
+        rows = [[InlineKeyboardButton(L.t("lk2.btn_name", cid), callback_data=f"lk:en:{slot}"), rows[0][0]],
+                [InlineKeyboardButton(L.t("lk2.btn_both", cid), callback_data=f"lk:eb:{slot}")]]
+    rows.append([_lk_back(cid, "lk:e")])
+    return L.t("lk2.edit_menu", cid, label=html.escape(one[0]), url=html.escape(one[1])), InlineKeyboardMarkup(rows)
+
+
+def _lk_del_menu(chat, slot):
+    cid = chat.id
+    main, extras = _lk_load(cid)
+    one = _lk_one(cid, main, extras, slot)
+    if one is None:
+        return None
+    return (L.t("lk2.confirm_del", cid, label=html.escape(one[0]), url=html.escape(one[1])),
+            InlineKeyboardMarkup([[InlineKeyboardButton(L.t("lk2.btn_yes_del", cid), callback_data=f"lk:dy:{slot}"),
+                                   InlineKeyboardButton(L.t("lk2.btn_cancel", cid), callback_data="lk:g")]]))
+
+
+async def _lk_ask(q, chat, user, kind, slot):
+    """Shows what to send and waits (LK_ASK_SECS) for the admin's next message in this chat."""
+    cid = chat.id
+    main, extras = _lk_load(cid)
+    label = _lk_label(cid, slot, extras[slot][1] if slot in extras else "")
+    if len(_lk_pending) > 500:
+        now = time.monotonic()
+        for k in [k for k, v in _lk_pending.items() if v["until"] < now]:
+            del _lk_pending[k]
+    _lk_pending[(cid, user.id)] = {"kind": kind, "slot": slot, "panel": (cid, q.message.message_id),
+                                   "until": time.monotonic() + LK_ASK_SECS}
+    await q.answer()
+    await _ac_edit(q, L.t("lk2.ask_" + kind, cid, label=html.escape(label), default=html.escape(L.t("lk2.n", cid, n=max(slot, 2)))),
+                   InlineKeyboardMarkup([[_lk_back(cid)]]))
+
+
+async def _lk_admin_action(q, chat, user, act, slot):
+    """The ⚙️ buttons: g screen · a add · e edit · en/el/eb name/link/both · d delete · dy confirmed delete."""
+    cid = chat.id
+    _lk_pending.pop((cid, user.id), None)                       # any tap leaves a waiting step
+    main, extras = _lk_load(cid)
+    if act == "g":
+        await q.answer()
+        await _ac_edit(q, *_lk_manage(chat))
+    elif act == "a":
+        if len(extras) >= LK_MAX:
+            await q.answer(L.t("lk2.full", cid, max=LK_MAX), show_alert=True)
+            return
+        await _lk_ask(q, chat, user, "add", 0)
+    elif act in ("e", "d") and not slot:
+        await q.answer()
+        await _ac_edit(q, *_lk_pick(chat, act))
+    elif act in ("e", "d", "en", "el", "eb", "dy"):
+        if _lk_one(cid, main, extras, slot) is None or (act in ("en", "eb") and slot == 1):
+            await q.answer(L.t("lk2.gone", cid), show_alert=True)
+            await _ac_edit(q, *_lk_manage(chat))
+            return
+        if act == "e":
+            await q.answer()
+            await _ac_edit(q, *_lk_edit_menu(chat, slot))
+        elif act == "d":
+            await q.answer()
+            await _ac_edit(q, *_lk_del_menu(chat, slot))
+        elif act == "dy":
+            label = _lk_label(cid, slot, extras[slot][1] if slot in extras else "")
+            if slot == 1:
+                D.set_setting(cid, LK_MAIN_KEY, "")
+                _lk_auto.pop(cid, None)
+            else:
+                del extras[slot]
+                _lk_save(cid, extras)
+            await q.answer()
+            await _ac_edit(q, *_lk_manage(chat, L.t("lk2.removed", cid, label=html.escape(label))))
+        else:
+            await _lk_ask(q, chat, user, {"en": "name", "el": "link", "eb": "both"}[act], slot)
+    else:
+        await q.answer()
 
 
 async def lk_callback(update, context):
-    """"lk:m" panel · "lk:c" commands (copyable) · "lk:s" show the main link · "lk:l" all links."""
+    """"lk:m" panel · "lk:c" commands (copyable) · "lk:s" / "lk:l" show every link (old buttons) · "lk:g" and the rest: ⚙️ management (admins)."""
     q = update.callback_query
     chat, user = (q.message.chat if q.message else None), q.from_user
     if chat is None:
@@ -6664,26 +6862,213 @@ async def lk_callback(update, context):
         return
     if await extra.menu_not_owner(q):
         return
-    cid, act = chat.id, ((q.data or "").split(":") + [""])[1]
+    cid = chat.id
+    parts = (q.data or "").split(":") + ["", ""]
+    act, arg = parts[1], parts[2]
     if act == "m":
         await q.answer()
         await _ac_edit(q, *_lk_panel(chat))
     elif act == "c":
         await q.answer()
-        await _ac_edit(q, L.t("lk.cmd_page", cid), InlineKeyboardMarkup([[InlineKeyboardButton(L.t("pick.back", cid), callback_data="lk:m")]]))
+        await _ac_edit(q, L.t("lk2.cmd_page", cid), InlineKeyboardMarkup([[_lk_back(cid, "lk:m")]]))
     elif act in ("s", "l"):
         if chat.type == "private":
             await q.answer(L.t("lk.group_only"), show_alert=True)
             return
         await q.answer()
-        send = lambda t, m: context.bot.send_message(cid, t, parse_mode="HTML", reply_markup=m)
-        if act == "s":
-            await _lk_show(chat, user, context.bot, "", send)
-        else:
-            left = await _lk_slow(chat, user)
-            await (send(L.t("lk.slow", cid, secs=left), None) if left else _lk_list(chat, context.bot, send))
+        send = lambda t, m: context.bot.send_message(cid, t, parse_mode="HTML", reply_markup=m, disable_web_page_preview=True)
+        await _lk_show(chat, user, context.bot, "", send)
+    elif act in ("g", "a", "e", "d", "en", "el", "eb", "dy"):
+        if chat.type == "private":
+            await q.answer(L.t("lk.group_only"), show_alert=True)
+            return
+        if not await _is_admin(chat, user):
+            await q.answer(L.t("lk.admin_only", cid), show_alert=True)
+            return
+        await _lk_admin_action(q, chat, user, act, int(arg) if arg.isdigit() else 0)
     else:
         await q.answer()
+
+
+async def lk_input(update, context):
+    """group=-15, cheap: only acts when an admin tapped ➕ / ✏️ in ⚙️ Link management and now sends the text (or "cancel")."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user or not _lk_pending:
+        return
+    key = (chat.id, user.id)
+    pending = _lk_pending.get(key)
+    if pending is None:
+        return
+    if time.monotonic() > pending["until"]:
+        _lk_pending.pop(key, None)
+        return
+    if not await _is_admin(chat, user):
+        _lk_pending.pop(key, None)
+        return
+    cid, kind, slot, text = chat.id, pending["kind"], pending["slot"], (msg.text or "").strip()
+    if text.lower() in ("cancel", "stop"):
+        _lk_pending.pop(key, None)
+        await _rp_note(msg, "lk2.cancelled", 10)
+        raise ApplicationHandlerStop
+    main, extras = _lk_load(cid)
+    url = name = None
+    if kind in ("add", "both"):
+        parsed = _lk_parse(text)
+        if parsed is None:
+            await _rp_note(msg, "lk2.err_link", 15)
+            raise ApplicationHandlerStop
+        url, name = parsed
+    elif kind == "link":
+        url = lk_norm(text)
+        if url is None:
+            await _rp_note(msg, "lk2.err_link", 15)
+            raise ApplicationHandlerStop
+    else:                                                       # name: "-" goes back to "Link N"
+        name = "" if text == "-" else _lk_clean_name(text)
+        if not name and text != "-":
+            await _rp_note(msg, "lk2.err_name", 15, max=LK_LABEL_MAX)
+            raise ApplicationHandlerStop
+    if kind == "add":
+        if any(u == url for u, _n in extras.values()):
+            _lk_pending.pop(key, None)
+            await _rp_note(msg, "lk2.dup", 15, label=html.escape(_lk_label(cid, next(s for s, (u, _n) in extras.items() if u == url),
+                                                                          next(n for s, (u, n) in extras.items() if u == url))))
+            raise ApplicationHandlerStop
+        slot = next((s for s in range(2, LK_LAST_SLOT + 1) if s not in extras), None)
+        if slot is None:
+            _lk_pending.pop(key, None)
+            await _rp_note(msg, "lk2.full", 15, max=LK_MAX)
+            raise ApplicationHandlerStop
+        extras[slot] = (url, name)
+        note_key = "lk2.added"
+    elif _lk_one(cid, main, extras, slot) is None:
+        _lk_pending.pop(key, None)
+        await _rp_note(msg, "lk2.gone", 15)
+        raise ApplicationHandlerStop
+    elif slot == 1:                                             # the Main link: only its link can change
+        D.set_setting(cid, LK_MAIN_KEY, url)
+        _lk_auto.pop(cid, None)
+        note_key = "lk2.changed"
+    else:
+        old_url, old_name = extras[slot]
+        extras[slot] = (url or old_url, old_name if (kind == "both" and not name) else (name if name is not None else old_name))
+        note_key = "lk2.changed"
+    if kind == "add" or slot > 1:
+        _lk_save(cid, extras)
+    _lk_pending.pop(key, None)
+    label = _lk_label(cid, slot, extras[slot][1] if slot in extras else "")
+    try:
+        await msg.delete()
+    except TelegramError:
+        pass
+    try:
+        panel_chat, panel_id = pending["panel"]
+        screen, kb = _lk_manage(chat, L.t(note_key, cid, label=html.escape(label)))
+        await context.bot.edit_message_text(screen, chat_id=panel_chat, message_id=panel_id, parse_mode="HTML", reply_markup=kb,
+                                            disable_web_page_preview=True)
+    except TelegramError:
+        await _rp_note(msg, note_key, 10, label=html.escape(label))
+    raise ApplicationHandlerStop
+
+
+# ------------------------------------------------------------------ texts of the links (English + Hinglish)
+# Merged into the language tables in register(); same keys and same {placeholders} in both. Sent as HTML: no raw < or >.
+LK_TEXTS_EN = {
+    "lk2.main": "Main link",
+    "lk2.n": "Link {n}",
+    "lk2.main_none": "not set",
+    "lk2.main_auto": "an invite link made by the bot",
+    "lk2.none": "🔗 No links have been set for this group yet.",
+    "lk2.none_admin": "\n\nAdmins: tap the button below to add one.",
+    "lk2.not_found": "❌ No link called <b>{name}</b>. Send /link to see all links.",
+    "lk2.btn_manage": "⚙️ Link management",
+    "lk2.btn_cmd": "⌨️ Commands",
+    "lk2.btn_add": "➕ Add new link",
+    "lk2.btn_edit": "✏️ Edit a link",
+    "lk2.btn_del": "🗑 Delete a link",
+    "lk2.btn_name": "✏️ Name",
+    "lk2.btn_link": "🔗 Link",
+    "lk2.btn_both": "✏️🔗 Name and link",
+    "lk2.btn_yes_del": "🗑 Yes, delete",
+    "lk2.btn_cancel": "❌ Cancel",
+    "lk2.panel": "🔗 <b>Group links</b>\n\nMain link: {main}\nOther links: {count} of {max}\n\nMembers send /link to see the links. Admins: tap ⚙️ Link management to add, edit or delete links.",
+    "lk2.manage": "⚙️ <b>Link management</b>\n\n{list}\n\nChoose what you want to do.",
+    "lk2.manage_none": "No links yet.",
+    "lk2.pick_edit": "✏️ <b>Which link do you want to edit?</b>",
+    "lk2.pick_del": "🗑 <b>Which link do you want to delete?</b>",
+    "lk2.edit_menu": "✏️ <b>{label}</b>\n<code>{url}</code>\n\nWhat do you want to change?",
+    "lk2.confirm_del": "🗑 Delete <b>{label}</b>?\n<code>{url}</code>",
+    "lk2.ask_add": "➕ <b>Add a new link</b>\n\nSend the link, and a name if you want. Example:\n<code>https://t.me/mychannel My Channel</code>\n\nSend <code>cancel</code> to stop.",
+    "lk2.ask_name": "✏️ <b>New name for {label}</b>\n\nSend the new name. Send <code>-</code> to go back to <b>{default}</b>.\nSend <code>cancel</code> to stop.",
+    "lk2.ask_link": "🔗 <b>New link for {label}</b>\n\nSend the new link, for example <code>https://t.me/mychannel</code>.\nSend <code>cancel</code> to stop.",
+    "lk2.ask_both": "✏️🔗 <b>New link and name for {label}</b>\n\nSend the link, then the name. Example:\n<code>https://t.me/mychannel My Channel</code>\nSend <code>cancel</code> to stop.",
+    "lk2.cancelled": "Cancelled.",
+    "lk2.err_link": "❌ That is not a Telegram link. Use one like <code>https://t.me/mychannel</code>. Try again, or send <code>cancel</code>.",
+    "lk2.err_name": "❌ Send a name (up to {max} characters), or <code>-</code> for the default. Try again, or send <code>cancel</code>.",
+    "lk2.full": "❌ You already have {max} other links (Link 2 to Link 10). Delete one first.",
+    "lk2.dup": "ℹ️ That link is already saved as <b>{label}</b>.",
+    "lk2.added": "✅ Saved as <b>{label}</b>.",
+    "lk2.changed": "✅ <b>{label}</b> updated.",
+    "lk2.removed": "✅ <b>{label}</b> deleted.",
+    "lk2.gone": "That link does not exist any more.",
+    "lk2.del_main": "The Main link is removed with <code>/setlink off</code>.",
+    "lk2.use_set": "🔗 <b>Main link</b>\nNow: {main}\n\nSend the command and the link:\n<code>/setlink https://t.me/yourgroup</code>\n\nOther options: <code>/setlink auto</code> (the bot makes an invite link) or <code>/setlink off</code>.",
+    "lk2.use_add": "➕ <b>Add a link</b>\nSend the command and the link. Add a name if you want:\n<code>/addlink https://t.me/mychannel</code>\n<code>/addlink https://t.me/mychannel My Channel</code>\n\nThe first one becomes Link 2, the next Link 3, and so on up to Link 10.",
+    "lk2.use_del": "🗑 <b>Delete a link</b>\nSend the command and the link number or name:\n<code>/dellink 3</code>\nSend /link to see them.",
+    "lk2.cmd_page": "⌨️ <b>Link commands</b>\nTap a command to copy it.\n\n<b>Everybody</b>\n<code>/link</code> show all links\n<code>/link 2</code> show one link (number or name)\n\n<b>Admins</b>\n<code>/setlink https://t.me/yourgroup</code> set the Main link\n<code>/setlink auto</code> the bot makes an invite link\n<code>/setlink off</code> remove the Main link\n<code>/addlink https://t.me/mychannel</code> add Link 2, then Link 3 ... up to Link 10\n<code>/addlink https://t.me/mychannel My Channel</code> add it with a name\n<code>/dellink 3</code> delete Link 3\n\nTo change a name or a link, use ⚙️ Link management.",
+}
+LK_TEXTS_HI = {
+    "lk2.main": "Main link",
+    "lk2.n": "Link {n}",
+    "lk2.main_none": "set nahi hai",
+    "lk2.main_auto": "bot ka banaya invite link",
+    "lk2.none": "🔗 Is group ke liye abhi koi link set nahi hai.",
+    "lk2.none_admin": "\n\nAdmins: link jodne ke liye neeche ka button dabao.",
+    "lk2.not_found": "❌ <b>{name}</b> naam ka koi link nahi mila. Saare links dekhne ke liye /link bhejo.",
+    "lk2.btn_manage": "⚙️ Link management",
+    "lk2.btn_cmd": "⌨️ Commands",
+    "lk2.btn_add": "➕ Naya link jodo",
+    "lk2.btn_edit": "✏️ Link edit karo",
+    "lk2.btn_del": "🗑 Link delete karo",
+    "lk2.btn_name": "✏️ Naam",
+    "lk2.btn_link": "🔗 Link",
+    "lk2.btn_both": "✏️🔗 Naam aur link",
+    "lk2.btn_yes_del": "🗑 Haan, delete karo",
+    "lk2.btn_cancel": "❌ Cancel",
+    "lk2.panel": "🔗 <b>Group ke links</b>\n\nMain link: {main}\nDoosre links: {max} mein se {count}\n\nMembers /link bhejkar links dekh sakte hain. Admins: links jodne, edit ya delete karne ke liye ⚙️ Link management dabao.",
+    "lk2.manage": "⚙️ <b>Link management</b>\n\n{list}\n\nKya karna hai, chuno.",
+    "lk2.manage_none": "Abhi koi link nahi hai.",
+    "lk2.pick_edit": "✏️ <b>Kaun sa link edit karna hai?</b>",
+    "lk2.pick_del": "🗑 <b>Kaun sa link delete karna hai?</b>",
+    "lk2.edit_menu": "✏️ <b>{label}</b>\n<code>{url}</code>\n\nKya badalna hai?",
+    "lk2.confirm_del": "🗑 <b>{label}</b> delete karna hai?\n<code>{url}</code>",
+    "lk2.ask_add": "➕ <b>Naya link jodo</b>\n\nLink bhejo, aur chaho to naam bhi. Jaise:\n<code>https://t.me/mychannel My Channel</code>\n\nRokne ke liye <code>cancel</code> bhejo.",
+    "lk2.ask_name": "✏️ <b>{label} ka naya naam</b>\n\nNaya naam bhejo. <b>{default}</b> par wapas jaane ke liye <code>-</code> bhejo.\nRokne ke liye <code>cancel</code> bhejo.",
+    "lk2.ask_link": "🔗 <b>{label} ka naya link</b>\n\nNaya link bhejo, jaise <code>https://t.me/mychannel</code>.\nRokne ke liye <code>cancel</code> bhejo.",
+    "lk2.ask_both": "✏️🔗 <b>{label} ka naya link aur naam</b>\n\nPehle link, phir naam bhejo. Jaise:\n<code>https://t.me/mychannel My Channel</code>\nRokne ke liye <code>cancel</code> bhejo.",
+    "lk2.cancelled": "Cancel ho gaya.",
+    "lk2.err_link": "❌ Yeh Telegram link nahi hai. Aisa link bhejo: <code>https://t.me/mychannel</code>. Dobara try karo, ya <code>cancel</code> bhejo.",
+    "lk2.err_name": "❌ Naam bhejo ({max} akshar tak), ya default ke liye <code>-</code>. Dobara try karo, ya <code>cancel</code> bhejo.",
+    "lk2.full": "❌ Tumhare paas pehle se {max} doosre links hain (Link 2 se Link 10). Pehle ek delete karo.",
+    "lk2.dup": "ℹ️ Yeh link pehle se <b>{label}</b> ke naam se saved hai.",
+    "lk2.added": "✅ <b>{label}</b> ke roop mein save ho gaya.",
+    "lk2.changed": "✅ <b>{label}</b> update ho gaya.",
+    "lk2.removed": "✅ <b>{label}</b> delete ho gaya.",
+    "lk2.gone": "Yeh link ab maujood nahi hai.",
+    "lk2.del_main": "Main link hatane ke liye <code>/setlink off</code> use karo.",
+    "lk2.use_set": "🔗 <b>Main link</b>\nAbhi: {main}\n\nCommand ke saath link bhejo:\n<code>/setlink https://t.me/yourgroup</code>\n\nAur options: <code>/setlink auto</code> (bot invite link banata hai) ya <code>/setlink off</code>.",
+    "lk2.use_add": "➕ <b>Link jodo</b>\nCommand ke saath link bhejo. Chaho to naam bhi:\n<code>/addlink https://t.me/mychannel</code>\n<code>/addlink https://t.me/mychannel My Channel</code>\n\nPehla Link 2 banega, agla Link 3, aise Link 10 tak.",
+    "lk2.use_del": "🗑 <b>Link delete karo</b>\nCommand ke saath link ka number ya naam bhejo:\n<code>/dellink 3</code>\nLinks dekhne ke liye /link bhejo.",
+    "lk2.cmd_page": "⌨️ <b>Link commands</b>\nCommand dabao to copy ho jayegi.\n\n<b>Sabke liye</b>\n<code>/link</code> saare links dekho\n<code>/link 2</code> ek link dekho (number ya naam)\n\n<b>Admins ke liye</b>\n<code>/setlink https://t.me/yourgroup</code> Main link set karo\n<code>/setlink auto</code> bot invite link banata hai\n<code>/setlink off</code> Main link hatao\n<code>/addlink https://t.me/mychannel</code> Link 2 jodo, phir Link 3 ... Link 10 tak\n<code>/addlink https://t.me/mychannel My Channel</code> naam ke saath jodo\n<code>/dellink 3</code> Link 3 delete karo\n\nNaam ya link badalne ke liye ⚙️ Link management use karo.",
+}
+
+
+def _lk_register_texts():
+    """Adds the texts above to the language tables (never replaces a key that already exists)."""
+    for table, texts in ((getattr(L, "EN", None), LK_TEXTS_EN), (getattr(L, "HINGLISH", None), LK_TEXTS_HI)):
+        if isinstance(table, dict):
+            for k, v in texts.items():
+                table.setdefault(k, v)
 
 
 # ======================================================================================================
@@ -7238,10 +7623,12 @@ def register(app, deps):
     app.add_handler(CommandHandler(["backup", "bk"], backup_cmd))
     app.add_handler(CommandHandler(["restore", "rs"], restore_cmd))
     app.add_handler(CallbackQueryHandler(bk_callback, pattern=r"^bk:"))
-    # group links (section 4c): /link /links for everybody, /setlink /addlink /dellink for admins, the 🔗 panel
+    # group links (section 4c): /link /links for everybody, /setlink /addlink /dellink for admins, the 🔗 panel and ⚙️ management
+    _lk_register_texts()
     for _name, _fn in (("link", link_cmd), ("links", links_cmd), ("setlink", setlink_cmd), ("addlink", addlink_cmd), ("dellink", dellink_cmd)):
         app.add_handler(CommandHandler(_name, _fn))
     app.add_handler(CallbackQueryHandler(lk_callback, pattern=r"^lk:"))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, lk_input), group=-15)   # ➕ / ✏️: the next message
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.Document.ALL, bk_file), group=108)
 
     # broadcast (Bot Staff panel): buttons + the message the staff member sends
