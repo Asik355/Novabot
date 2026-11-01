@@ -956,6 +956,9 @@ HELP_SECTIONS = {
             "/tmute time [reason]: Silence a user for a set time (time required).",
             "/dmute [time] [reason]: Like /mute, and also deletes their message.",
             "/unmute: Lift a user's mute.",
+            "/unpin: Unpin the replied-to message, or the newest pinned one.",
+            "/unpin 10: Unpin the newest 10 pinned messages.",
+            "/unpin all: Unpin every pinned message. Add a time to do it later, like /unpin all 2d or /unpin 5m.",
         ]),
     ),
     "warn": (

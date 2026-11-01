@@ -16,6 +16,7 @@ group.py: all group-management logic in ONE file (merged from autoclose.py, clea
   MOD LOG             /modlog [@user]   (history page with filters; nova's /modlog calls modlog_command)
   WARN LADDER         /warnladder [on|off|clear|<count> <action> [time]|remove <count>]   (a different action per warning count)
   LANGUAGE            /lang  (English / Hinglish; the texts live in the lang/ folder)
+  UNPIN               /unpin  /unpin 10  /unpin all  /unpin all 2d  /unpin 2d  /unpin cancel   (unpin now or after a delay)
   CLEAN SERVICE       /cleanservice <type>  /keepservice <type>  /nocleanservice <type>  /cleanservicetypes
   CLEAN COMMANDS      /clean <type or /command>  /keep <type or /command>  /cleancommandtypes
                       (the old names /cleancommand and /keepcommand still work; + the ➕ Add Command and ➖ Remove
@@ -352,7 +353,8 @@ async def run_once(bot):
                       ("rules gate", _gate_round(bot)),             # Rules gate (section 2j): members who didn't accept in time
                       ("shout-out", _shout_round(bot)),             # Weekly shout-out (section 2l)
                       ("anniversaries", _anniv_round(bot)),         # Join anniversaries (section 2m)
-                      ("scheduled messages", _sched_round(bot))):   # Scheduled messages (section 2n)
+                      ("scheduled messages", _sched_round(bot)),   # Scheduled messages (section 2n)
+                      ("scheduled unpins", _unpin_round(bot))):    # /unpin all 2d (section 2o)
         try:
             await job
         except asyncio.CancelledError:
@@ -7525,6 +7527,222 @@ async def bc_message(update, context):
 
 
 # ======================================================================================================
+# 2o. UNPIN  (/unpin now or after a delay)
+# ======================================================================================================
+#   /unpin                 unpins the replied-to message, or the newest pinned message
+#   /unpin 10              unpins the newest 10 pinned messages (a bare number is a count; 5m / 2d is a time)
+#   /unpin 10 2d           the same, 2 days from now
+#   /unpin all             unpins every pinned message now
+#   /unpin all 2d          unpins every pinned message in 2 days
+#   /unpin 2d              (reply to a message, or alone for the newest pin) unpins that message in 2 days
+#   /unpin cancel          cancels every unpin waiting in this group
+# Time: 5m, 12h, 2d, 1w or a mix like 1d12h (1 minute to 365 days). Waiting unpins are kept in the database (setting
+# unpin_jobs = JSON [{"id", "due" (unix time), "mid" (message id, 0 = all, None = the newest n pins), "n"}]), so a restart loses nothing. The 30-second
+# loop (run_once -> _unpin_round) runs them. The member needs the "Pin messages" right, the bot too.
+UNPIN_KEY = "unpin_jobs"
+UNPIN_MIN, UNPIN_MAX, UNPIN_MAX_JOBS = 60, 365 * 86400, 20
+UNPIN_MAX_COUNT = 50         # /unpin 10: at most this many messages in one command
+UNPIN_GIVE_UP = 86400        # a due unpin that keeps failing is dropped after a day
+_UNIT_SECS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def _parse_unpin_time(text):
+    """'2d', '12h', '1d12h', '30m' -> seconds, or None when it is not a time between 1 minute and 365 days."""
+    text = str(text).replace(" ", "").lower()
+    if not re.fullmatch(r"(\d{1,6}[smhdw])+", text):
+        return None
+    secs = sum(int(n) * _UNIT_SECS[u] for n, u in re.findall(r"(\d{1,6})([smhdw])", text))
+    return secs if UNPIN_MIN <= secs <= UNPIN_MAX else None
+
+
+def _unpin_load(chat_id):
+    try:
+        data = json.loads(D.get_setting(chat_id, UNPIN_KEY, "") or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [j for j in data if isinstance(j, dict) and "due" in j and "mid" in j] if isinstance(data, list) else []
+
+
+def _unpin_save(chat_id, jobs):
+    D.set_setting(chat_id, UNPIN_KEY, json.dumps(jobs) if jobs else "")
+
+
+async def _unpin_now(bot, chat_id, mid, n=1):
+    """Unpins one message (mid > 0), the newest n pins (mid is None) or everything (mid == 0).
+    Returns (\"ok\" | \"gone\", how many were unpinned); \"gone\" = nothing to unpin. Raises TelegramError on a real failure."""
+    try:
+        if mid == 0:
+            await bot.unpin_all_chat_messages(chat_id)
+            return "ok", 0
+        if mid is not None:
+            await bot.unpin_chat_message(chat_id, message_id=int(mid))
+            return "ok", 1
+        if n <= 1:
+            await bot.unpin_chat_message(chat_id)
+            return "ok", 1
+        done = 0
+        for _ in range(n):                       # Telegram only shows the newest pin: unpin it, then look again
+            try:
+                pinned = (await bot.get_chat(chat_id)).pinned_message
+                if pinned is None:
+                    break
+                await bot.unpin_chat_message(chat_id, message_id=pinned.message_id)
+            except TelegramError:
+                if done:
+                    break                          # report what was done
+                raise
+            done += 1
+            await asyncio.sleep(0.3)
+        return ("ok" if done else "gone"), done
+    except BadRequest as e:
+        low = str(e).lower()
+        if "not found" in low or "not modified" in low or "not pinned" in low:
+            return "gone", 0
+        raise
+
+
+async def _can_pin(update, context):
+    """The member needs the 'Pin messages' right (the owner and anonymous admins always have it)."""
+    user, chat = update.effective_user, update.effective_chat
+    if user is None or update.effective_message.sender_chat is not None:
+        return True
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+    except TelegramError:
+        return True                                     # group_only already checked that they are an admin
+    return getattr(member, "can_pin_messages", None) is not False
+
+
+async def unpin_cmd(update, context):
+    if not await D.group_only(update):                   # group only + admin only, with its own reply
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    if not await _can_pin(update, context):
+        await msg.reply_html(L.t("un.need_right", chat.id))
+        return
+    words = [w.lower() for a in context.args for w in re.split(r"[,\s]+", a) if w]
+    jobs = _unpin_load(chat.id)
+
+    if words[:1] == ["cancel"]:
+        _unpin_save(chat.id, [])
+        await msg.reply_html(L.t("un.cancelled", chat.id, n=len(jobs)) if jobs else L.t("un.none_waiting", chat.id))
+        return
+
+    everything = words[:1] == ["all"]
+    rest = words[1:] if everything else words
+    count = None                                          # /unpin 10: a bare number is a count of messages
+    if not everything and rest and re.fullmatch(r"\d{1,4}", rest[0]) and (len(rest) == 1 or rest[1] not in _UNIT_SECS):
+        count, rest = int(rest[0]), rest[1:]
+        if count < 1 or count > UNPIN_MAX_COUNT:
+            await msg.reply_html(L.t("un.bad_count", chat.id, max=UNPIN_MAX_COUNT))
+            return
+        if count > 1 and msg.reply_to_message is not None:
+            await msg.reply_html(L.t("un.count_reply", chat.id))
+            return
+        if count == 1:
+            count = None                                  # /unpin 1 is the same as /unpin
+    secs = None
+    if rest:
+        secs = _parse_unpin_time("".join(rest))
+        if secs is None:
+            await msg.reply_html(L.t("un.bad_time", chat.id))
+            return
+
+    # which message: everything (0), the replied-to one, the newest `count` pins, or the newest pin
+    n = count or 1
+    if everything:
+        mid = 0
+    elif msg.reply_to_message is not None:
+        mid = msg.reply_to_message.message_id
+    else:
+        mid = None
+        if secs is not None and count is None:            # a delay needs the message id: read the newest pin
+            try:
+                pinned = (await context.bot.get_chat(chat.id)).pinned_message
+            except TelegramError:
+                pinned = None
+            if pinned is None:
+                await msg.reply_html(L.t("un.no_pin", chat.id))
+                return
+            mid = pinned.message_id                       # (with a count the pins are picked when the time comes)
+
+    if secs is None:                                      # now
+        try:
+            result, done = await _unpin_now(context.bot, chat.id, mid, n)
+        except TelegramError as e:
+            log.debug("unpin: couldn't unpin in %s: %s", chat.id, e)
+            await msg.reply_html(L.t("un.fail", chat.id))
+            return
+        if result == "gone":
+            await msg.reply_html(L.t("un.no_pin" if mid is None else "un.not_pinned", chat.id))
+        elif mid == 0:
+            await msg.reply_html(L.t("un.done_all", chat.id))
+        elif count is None:
+            await msg.reply_html(L.t("un.done", chat.id))
+        elif done < n:
+            await msg.reply_html(L.t("un.done_n_part", chat.id, n=done, total=n))
+        else:
+            await msg.reply_html(L.t("un.done_n", chat.id, n=done))
+        return
+
+    if len(jobs) >= UNPIN_MAX_JOBS:
+        await msg.reply_html(L.t("un.too_many", chat.id, max=UNPIN_MAX_JOBS))
+        return
+    jobs = [j for j in jobs if (j["mid"], j.get("n", 1)) != (mid, n)]   # the same target twice: the new time wins
+    jobs.append({"id": int(time.time() * 1000), "due": int(time.time()) + secs, "mid": mid, "n": n})
+    _unpin_save(chat.id, jobs)
+    dur = _esc(extra.fmt_duration(secs))
+    if mid == 0:
+        await msg.reply_html(L.t("un.sched_all", chat.id, dur=dur))
+    elif count is not None:
+        await msg.reply_html(L.t("un.sched_n", chat.id, n=count, dur=dur))
+    else:
+        await msg.reply_html(L.t("un.sched_one", chat.id, dur=dur))
+
+
+async def _unpin_round(bot):
+    """Part of run_once (every 30 seconds): runs the unpins that are due."""
+    for chat_id, value in await asyncio.to_thread(_scheduled_groups, UNPIN_KEY):
+        try:
+            if not value or chat_id >= 0 or D.is_paused(chat_id):
+                continue
+            jobs, now, keep, changed = _unpin_load(chat_id), time.time(), [], False
+            for job in jobs:
+                if job["due"] > now:
+                    keep.append(job)
+                    continue
+                if time.monotonic() < _retry_at.get((chat_id, "unpin%s" % job["id"]), 0):
+                    keep.append(job)
+                    continue
+                try:
+                    result, done = await _unpin_now(bot, chat_id, job["mid"], int(job.get("n", 1) or 1))
+                except TelegramError as e:
+                    log.debug("unpin: scheduled unpin failed in %s: %s", chat_id, e)
+                    if now - job["due"] > UNPIN_GIVE_UP:             # no right or no access for a day: give up
+                        changed = True
+                        continue
+                    _retry_at[(chat_id, "unpin%s" % job["id"])] = time.monotonic() + RETRY_AFTER
+                    keep.append(job)
+                    continue
+                changed = True
+                if result == "ok":
+                    if job["mid"] == 0:
+                        text = L.t("un.fired_all", chat_id)
+                    elif job["mid"] is None and int(job.get("n", 1) or 1) > 1:
+                        text = L.t("un.fired_n", chat_id, n=done)
+                    else:
+                        text = L.t("un.fired_one", chat_id)
+                    try:
+                        await bot.send_message(chat_id, text, parse_mode="HTML")
+                    except TelegramError:
+                        pass
+            if changed:
+                _unpin_save(chat_id, keep)
+        except Exception:
+            log.exception("scheduled unpins: the round failed for %s", chat_id)
+
+
+# ======================================================================================================
 # 6. REGISTRATION (single entry point)
 # ======================================================================================================
 def register(app, deps):
@@ -7596,6 +7814,7 @@ def register(app, deps):
     commands = {
         "cleanservice": cleanservice_cmd, "keepservice": keepservice_cmd, "nocleanservice": keepservice_cmd,
         "cleanservicetypes": cleanservicetypes_cmd,
+        "unpin": unpin_cmd,
         "clean": cleancommand_cmd, "keep": keepcommand_cmd,                       # the new names
         "cleancommand": cleancommand_cmd, "keepcommand": keepcommand_cmd,         # the old names keep working
         "cleancommandtypes": cleancommandtypes_cmd,
