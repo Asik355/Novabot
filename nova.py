@@ -1050,6 +1050,9 @@ HELP_SECTIONS = {
         "<b>Commands:</b>\n"
         "- /filter &lt;trigger&gt; &lt;reply&gt;: Every time someone says \"trigger\", the bot will reply with "
         "\"sentence\". For multiple word filters, quote the trigger.\n"
+        "- /filter &lt;trigger&gt; (as a reply to a photo, video, GIF, sticker, voice, file or text): saves that "
+        "message as the reply. Every time someone says \"trigger\", the bot sends it. Text after the trigger "
+        "becomes the caption.\n"
         "- /filters: List all chat filters.\n"
         "- /stop &lt;trigger&gt;: Stop the bot from replying to \"trigger\".\n"
         "- /stopall: Stop ALL filters in the current chat. This cannot be undone.",
@@ -1466,7 +1469,7 @@ ESSENTIAL_COMMANDS = [
     ("get", "Get a saved note"),
     ("notes", "List saved notes"),
     ("clear", "Delete a saved note"),
-    ("filter", "Add a chat filter"),
+    ("filter", "Add a filter (reply to a photo/video/GIF/sticker to save it as the reply)"),
     ("filters", "List chat filters"),
     ("stop", "Remove a chat filter"),
     ("blocklist", "Show the blocklist"),
@@ -1652,7 +1655,10 @@ USAGE_GUIDES = {
         "<b>Add a filter</b>\n"
         "• <code>/filter hello Hi there!</code>: replies when someone says \"hello\"\n"
         "• Phrases need quotes: <code>/filter \"good morning\" Morning {first}!</code>\n"
-        "• Or reply to a message with <code>/filter hello</code> to use that message as the reply\n\n"
+        "• Or reply to a message with <code>/filter hello</code> to use that message as the reply\n"
+        "• <b>Photo, video, GIF, sticker, voice or file</b>: reply to it with <code>/filter photo</code>. "
+        "When someone says \"photo\", the bot sends it. Add text after the trigger "
+        "(<code>/filter photo Look at this!</code>) to use it as the caption.\n\n"
         "<b>Manage</b>\n"
         "• List: <code>/filters</code>\n"
         "• Remove one: <code>/stop hello</code>\n"
@@ -3539,13 +3545,17 @@ async def add_filter(update, context):
         return
     msg = update.effective_message
     keyword, reply = split_keyword(msg.text.partition(" ")[2])
-    if not reply and msg.reply_to_message:
-        reply = msg.reply_to_message.text or msg.reply_to_message.caption or ""
+    replied = msg.reply_to_message
+    media = note_media_from(replied, reply) if replied is not None else None   # photo/GIF/video/sticker/file/voice
+    if media:
+        reply = media                       # text after the trigger (if any) is used as the caption
+    elif not reply and replied is not None:
+        reply = replied.text or replied.caption or ""
     if not keyword or not reply:
         await msg.reply_text(
             'Usage: /filter keyword reply text\n'
             'Phrases: /filter "good morning" Hello {first}!\n'
-            "Or reply to a message with /filter keyword.\n"
+            "Or reply to a message (text, photo, video, GIF, sticker, voice, file) with /filter keyword.\n"
             f"Placeholders: {PLACEHOLDERS}"
         )
         return
@@ -3571,7 +3581,7 @@ async def stop_filter(update, context):
 
 async def list_filters(update, context):
     rows = store.filter_rows(update.effective_chat.id)
-    text = "\n".join(f"- {r[0]}" for r in rows) or "No filters set."
+    text = "\n".join(f"- {r[0]}" + (" 🖼" if str(r[1]).startswith(NOTE_MEDIA_PREFIX) else "") for r in rows) or "No filters set."
     await update.effective_message.reply_text(text)
 
 
@@ -4758,7 +4768,7 @@ async def watcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # keyword filters
     for keyword, reply in store.filter_rows(chat.id):
         if word_match(keyword, text):
-            await reply_rendered(update, reply)
+            await send_note(update, context, reply)    # text or saved media
             break
 
 
