@@ -5594,7 +5594,7 @@ ANON_ADMIN_ID = 1087968824  # Telegram's "Group" anonymous-admin account
 
 # module -> the per-group setting keys it owns (exact names; "prefixes" cover families such as lock_<type>)
 MODULES = {
-    "admin": {"keys": ("auto_approve", "autoclose", "autoclose_msg_close", "autoclose_msg_open", "night")},
+    "admin": {"keys": ("auto_approve", "join_mode", "autoclose", "autoclose_msg_close", "autoclose_msg_open", "night")},
     "antiflood": {"keys": ("flood_limit", "flood_secs", "flood_mode", "repeat_limit", "mention_limit",
                            "antispam", "spam_mode")},
     "blocklists": {"keys": ("blocklist_mode", "block_ads", "block_promo", "block_promo_auth", "block_punish",

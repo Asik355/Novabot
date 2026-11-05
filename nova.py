@@ -1211,17 +1211,20 @@ HELP_SECTIONS = {
             "/unapprove: Remove that exemption.",
             "/approved: List everyone approved in this chat.",
             "/unapproveall: Remove every approval in this chat (chat creator only, asks to confirm).",
-        ]) + (
-            "\n\n<b>Auto join approval</b>\n\n"
-            "Groups with \"Approve new members\" send the bot a join request. Turn this on and I approve people "
-            "automatically (they don't need to send /start). During an antiraid, requests are declined instead.\n\n"
-            "- /joinon (or /autoapprove on, /join on): Approve join requests automatically.\n"
-            "- /joinoff (or /autoapprove off, /join off): Stop; requests wait for an admin.\n"
-            "- /autoapprove: Show the current setting.\n"
-            "- /setjoinmsg &lt;text&gt;: Customize the welcome message sent when someone is approved.\n\n"
-            "Tap <b>⚙️ Auto Approve</b> below to change these with buttons.\n\n"
-            "I need the \"Invite users\" admin right."),
+        ]),
     ),
+    "join": (
+        "Join",
+        "<b>➕ Join</b>\n\n"
+        "Groups with \"Approve new members\" send the bot a join request. With Join on, I approve people "
+        "automatically (they don't need to send /start). During an antiraid, requests are declined instead. "
+        "With Join off, each request is posted in the group with Accept and Decline buttons for admins.\n\n"
+        "- /joinon (or /join on): Approve join requests automatically.\n"
+        "- /joinoff (or /join off): Stop; each request waits for an admin to accept or decline it.\n"
+        "- /join: Show the current setting.\n"
+        "- /setjoinmsg &lt;text&gt;: Customize the welcome message sent when someone is approved.\n\n"
+        "Tap <b>⚙️ Join</b> below to change these with buttons (inside a group).\n\n"
+        "I need the \"Invite users\" admin right."),
     "groupedit": (
         "👥 Group Edit",
         "<b>Group Edit</b>\n\n" + _numbered([
@@ -1749,11 +1752,20 @@ USAGE_GUIDES = {
         "• Approve: reply <code>/approve</code>\n"
         "• Remove: reply <code>/unapprove</code>\n"
         "• Check: <code>/approval</code>   List: <code>/approved</code>\n"
-        "• Remove everyone: <code>/unapproveall</code> (group creator only)\n\n"
-        "<b>Join requests</b>\n"
-        "• <code>/joinon</code>: approve requests automatically   <code>/joinoff</code>: stop\n"
-        "• <code>/setjoinmsg Welcome!</code>: message sent to approved people\n"
-        "• Or tap Auto Approve on the previous page. The bot needs the \"Invite users\" right."),
+        "• Remove everyone: <code>/unapproveall</code> (group creator only)"),
+    "join": (
+        "<b>Let people in</b>\n"
+        "• Turn on: <code>/joinon</code>   Turn off: <code>/joinoff</code>   Check: <code>/join</code>\n"
+        "• Or tap <b>⚙️ Join</b> on this page (inside the group)\n\n"
+        "<b>Wait before approving</b>\n"
+        "• On the Join screen pick Instant, 10 minutes, 30 minutes or 1 hour\n\n"
+        "<b>When Join is off</b>\n"
+        "• Each request is posted in the group with the person's name, @username and ID\n"
+        "• An admin taps ✅ Accept or ❌ Decline\n\n"
+        "<b>Welcome message</b>\n"
+        "• <code>/setjoinmsg Welcome {name} to {chat}!</code>\n"
+        "• Back to the default: <code>/setjoinmsg reset</code>\n\n"
+        "The bot needs the \"Invite users\" admin right."),
     "other": (
         "• Switch every automatic protection off in this group: <code>/pause</code>, for a while: <code>/pause 30m</code>, "
         "check: <code>/pause status</code>\n"
@@ -1840,7 +1852,8 @@ def help_main_keyboard(chat=None, user_id=None):
                  InlineKeyboardButton("🎮 Games", callback_data="help:games"),
                  InlineKeyboardButton("🐙 GitHub", callback_data="gt:h")])  # github.py's panel (its Back returns to this page)
     rows.append([InlineKeyboardButton("📥 Download", callback_data="help:dl"),
-                 InlineKeyboardButton("📦 Import & Export", callback_data="help:ie")])
+                 InlineKeyboardButton("📦 Import & Export", callback_data="help:ie"),
+                 InlineKeyboardButton("➕ Join", callback_data="help:join")])
     rows.append([InlineKeyboardButton("More Features ➡️", callback_data="help:more")])  # full width, changes the page
     if user_id in OWNER_IDS or (user_id and is_super_admin(user_id)):  # 🛡 Bot Staff: just above the Suggestion Bar, owner + bot staff only
         rows.append([InlineKeyboardButton("🛡 Bot Staff", callback_data="own:m")])
@@ -1876,8 +1889,8 @@ def help_section_keyboard(key=None, chat=None):
     if key == "ie":  # Import and Export side by side on ONE row
         rows.append([InlineKeyboardButton("📥 Import", callback_data="ie:imp"),
                      InlineKeyboardButton("📤 Export", callback_data="ie:exp")])
-    if key == "approval" and chat is not None and chat.type != "private":
-        rows.append([InlineKeyboardButton("⚙️ Auto Approve", callback_data="jn:m")])
+    if key == "join" and chat is not None and chat.type != "private":
+        rows.append([InlineKeyboardButton("⚙️ Join", callback_data="jn:m")])
     if key == "rules" and chat is not None and chat.type != "private":
         rows.append([group.gate_button(chat)])  # 📜 new members must accept the rules before chatting
     if key == "greet" and chat is not None and chat.type != "private":
@@ -1907,13 +1920,140 @@ def admin_section_text(chat=None):
     return text
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ------------------------------------------------- /help in a group opens in private chat, for THAT group
+# The deep link carries the group's id (https://t.me/<bot>?start=help_<chat id>). The menu sent in private chat is
+# remembered (private chat id + message id -> group id, in the settings store, so it survives a restart). While a button
+# of such a menu is handled, the handler sees the GROUP as update.effective_chat / callback_query.message.chat
+# (pm_group_wrap, installed on every CallbackQueryHandler in main()), so Auto Close, Night Mode, Join, the suggestion
+# bar and the rest change that group. Replies and edits still go to the private message.
+PM_MENUS_KEEP = 30
+_pm_chat_cache = {}  # group id -> (time, Chat)
+
+
+def _pm_menus(pm_chat_id) -> dict:
+    raw = get_setting(pm_chat_id, "pm_menus", "") or ""
+    if isinstance(raw, dict):
+        return raw
+    try:
+        data = json.loads(raw) if raw else {}
+        return data if isinstance(data, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _pm_menu_group(pm_chat_id, message_id) -> int:
+    try:
+        return int(_pm_menus(pm_chat_id).get(str(message_id), 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pm_menu_remember(pm_chat_id, message_id, group_id):
+    data = _pm_menus(pm_chat_id)
+    data[str(message_id)] = int(group_id)
+    for k in list(data)[:-PM_MENUS_KEEP]:
+        data.pop(k, None)
+    set_setting(pm_chat_id, "pm_menus", json.dumps(data))
+
+
+async def _pm_group_chat(context, gid):
+    hit = _pm_chat_cache.get(gid)
+    if hit and time.monotonic() - hit[0] < 600:
+        return hit[1]
+    chat = await context.bot.get_chat(gid)
+    _pm_chat_cache[gid] = (time.monotonic(), chat)
+    return chat
+
+
+class _View:
+    """Read-through proxy: every attribute comes from the real object except the ones given as overrides."""
+
+    def __init__(self, real, **over):
+        self.__dict__["_real"] = real
+        self.__dict__["_over"] = over
+
+    def __getattr__(self, name):
+        d = self.__dict__
+        if name in d["_over"]:
+            return d["_over"][name]
+        return getattr(d["_real"], name)
+
+
+def pm_group_wrap(cb):
+    """Wraps a button handler: a button on a group's help menu in private chat is handled as if it was pressed in the group."""
+    @functools.wraps(cb)
+    async def inner(update, context, *a, **k):
+        try:
+            q = update.callback_query
+            msg = q.message if q is not None else None
+            if msg is not None and msg.chat.type == "private":
+                gid = _pm_menu_group(msg.chat.id, msg.message_id)
+                if gid:
+                    grp = await _pm_group_chat(context, gid)
+                    update = _View(update, effective_chat=grp, callback_query=_View(q, message=_View(msg, chat=grp)))
+        except Exception:  # never block a button because of this
+            logging.exception("group help in private chat")
+        return await cb(update, context, *a, **k)
+    return inner
+
+
+def install_pm_group_links():
+    """Called first in main(): every CallbackQueryHandler created afterwards (here, group.py, extra.py ...) is wrapped."""
+    if getattr(CallbackQueryHandler, "_pm_group_patched", False):
+        return
+    orig = CallbackQueryHandler.__init__
+
+    def init(self, callback, *a, **k):
+        orig(self, pm_group_wrap(callback), *a, **k)
+
+    CallbackQueryHandler.__init__ = init
+    CallbackQueryHandler._pm_group_patched = True
+
+
+def help_main_text(group=None):
+    head = f"<b>{html.escape(extra.bot_name())}</b>\n\n"
+    if group is not None:
+        head += (f"📍 <b>{html.escape(group.title or 'Group')}</b>\n"
+                 "Every button here works on this group only, and only its admins can change settings. "
+                 "To manage another group, send /help in that group.\n\n")
+    return head + HELP_INTRO
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, group=None):
+    chat = update.effective_chat
+    if group is None and chat is not None and chat.type != "private":
+        # in a group: a button that opens the menu in private chat, for this group only
+        username = await bot_username(context)
+        await update.effective_message.reply_html(
+            "📬 Tap the button below to open the help menu in private chat.\n"
+            f"There you can change the settings of <b>{html.escape(chat.title or 'this group')}</b> only.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "📬 Open help in private chat", url=f"https://t.me/{username}?start=help_{chat.id}")]]),
+        )
+        return
+    user_id = update.effective_user.id if update.effective_user else None
     sent = await update.effective_message.reply_html(
-        f"<b>{html.escape(extra.bot_name())}</b>\n\n{HELP_INTRO}",
-        reply_markup=help_main_keyboard(update.effective_chat, update.effective_user.id if update.effective_user else None),
+        help_main_text(group),
+        reply_markup=help_main_keyboard(group or chat, user_id),
         disable_web_page_preview=True,
     )
-    extra.remember_menu_owner(sent, update.effective_user.id if update.effective_user else None)
+    if group is not None:
+        _pm_menu_remember(sent.chat_id, sent.message_id, group.id)
+    extra.remember_menu_owner(sent, user_id)
+
+
+async def open_group_help(update, context, raw):
+    """/start help_<group id> in private chat: the help menu of that group."""
+    msg, user = update.effective_message, update.effective_user
+    try:
+        grp = await _pm_group_chat(context, int(raw))
+    except (ValueError, TelegramError):
+        await msg.reply_text("I couldn't find that group. Send /help in the group again.")
+        return
+    if grp.type == "private" or await get_role(grp, user.id) in (None, ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+        await msg.reply_text("You need to be a member of that group to open its help.")
+        return
+    await help_cmd(update, context, grp)
 
 
 async def action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1976,7 +2116,9 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if key == "more":  # ➡️ page 2: the whole menu changes to More Features (edited in place)
         text, markup = MORE_FEATURES_TEXT, help_more_keyboard(update.effective_chat)
     elif key == "main" or key not in HELP_SECTIONS:
-        text = f"<b>{html.escape(extra.bot_name())}</b>\n\n{HELP_INTRO}"
+        _c, _m = update.effective_chat, update.effective_message
+        text = help_main_text(_c if (_c is not None and _c.type != "private" and _m is not None
+                                     and _m.chat.type == "private") else None)
         markup = help_main_keyboard(update.effective_chat, update.effective_user.id if update.effective_user else None)
     else:
         label, body = HELP_SECTIONS[key]
@@ -2890,6 +3032,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if chat.type == "private" and arg.startswith("note_"):
         await deliver_note_pm(update, context, arg[len("note_"):])
+        return
+    if chat.type == "private" and arg.startswith("help_"):  # the button /help shows in a group
+        await open_group_help(update, context, arg[len("help_"):])
+        return
+    if chat.type == "private" and arg == "help":
+        await help_cmd(update, context)
         return
     if chat.type != "private":
         await update.effective_message.reply_text(
@@ -6290,7 +6438,8 @@ async def stats_callback(update, context):
 #   raid_time         how long /antiraid (or auto antiraid) stays on, seconds (default 6h)
 #   raid_action_time  how long each raider is banned for, seconds (default 1h)
 #   auto_raid         joins per minute that switch antiraid on by itself (0 = off)
-#   auto_approve      "True" = approve join requests automatically (never during a raid)
+#   join_mode         "True" = approve join requests automatically (never during a raid); "False" = post an
+#                     Accept/Decline card in the group for every request (older groups: the old auto_approve key)
 RAID_TIME_DEFAULT = group.RAID_TIME_BAN_DEFAULT  # 6h (ban mode); the Raid Shield (group.py 2f) has its own mode defaults
 RAID_ACTION_DEFAULT = group.RAID_ACTION_DEFAULT
 RAID_MAX_SECS = group.RAID_MAX_SECS
@@ -6385,20 +6534,30 @@ async def autoantiraid_cmd(update, context):
         await msg.reply_text("Usage: /autoantiraid <number of joins per minute | off>\nExample: /autoantiraid 15")
 
 
-async def autoapprove_cmd(update, context):
-    """/autoapprove on|off: approve join requests automatically."""
+def _join_on(chat_id) -> bool:
+    """Join on/off. Reads join_mode; groups set up before the rename still have it in the old auto_approve key."""
+    v = get_setting(chat_id, "join_mode", "")
+    if v in ("", None):
+        v = get_setting(chat_id, "auto_approve", "False")
+    return v == "True"
+
+
+async def join_cmd(update, context):
+    """/join on|off: approve join requests automatically. Off: every request is posted as an Accept/Decline card."""
     if not await group_only(update) or not await admin_only(update):
         return
     chat, msg = update.effective_chat, update.effective_message
     flag = parse_yes_no(context.args)
     if flag is None:
-        on = get_setting(chat.id, "auto_approve", "False") == "True"
-        await msg.reply_text(f"Auto-approve join requests: {'ON' if on else 'OFF'}.\n"
-                             "Change it with /autoapprove on|off. I need the 'Invite users' admin right.")
+        on = _join_on(chat.id)
+        await msg.reply_text(f"Join: {'ON' if on else 'OFF'}.\n"
+                             "On: join requests are approved automatically. Off: each request is posted here "
+                             "for an admin to accept or decline.\n"
+                             "Change it with /join on|off. I need the 'Invite users' admin right.")
         return
-    set_setting(chat.id, "auto_approve", "True" if flag else "False")
-    await msg.reply_text("✅ Join requests will be approved automatically (never during a raid)." if flag
-                         else "Auto-approve is OFF. Join requests wait for an admin.")
+    set_setting(chat.id, "join_mode", "True" if flag else "False")
+    await msg.reply_text("✅ Join is ON. Requests will be approved automatically (never during a raid)." if flag
+                         else "Join is OFF. Each join request will be posted here with Accept and Decline buttons for admins.")
 
 
 JOIN_DELAYS = (0, 600, 1800, 3600)  # seconds: instant, 10 minutes, 30 minutes, 1 hour
@@ -6428,14 +6587,15 @@ def _join_dm_text(chat_id) -> str:
 
 
 def _join_screen(chat_id):
-    on = get_setting(chat_id, "auto_approve", "False") == "True"
+    on = _join_on(chat_id)
     dm = _join_dm_on(chat_id)
     custom = get_setting(chat_id, "join_dm_text", "")
     text = (
-        "<b>⚙️ Auto Approve</b>\n\n"
+        "<b>⚙️ Join</b>\n\n"
         "When this group uses \"Approve new members\", I can approve join requests for you. "
-        "People never need to send /start. During an antiraid, requests are declined instead.\n\n"
-        f"Auto approve: <b>{'ON ✅' if on else 'OFF ❌'}</b>\n"
+        "People never need to send /start. During an antiraid, requests are declined instead. "
+        "When Join is OFF, every request is posted in the group for an admin to accept or decline.\n\n"
+        f"Join: <b>{'ON ✅' if on else 'OFF ❌'}</b>\n"
         f"Welcome message in private chat: <b>{'ON ✅' if dm else 'OFF ❌'}</b>\n"
         f"Wait before approving: <b>{_delay_label(_join_delay(chat_id))}</b>\n\n"
         "<b>Welcome message:</b>\n" + html.escape(_join_dm_text(chat_id)) +
@@ -6443,7 +6603,7 @@ def _join_screen(chat_id):
         "Change it with /setjoinmsg &lt;text&gt;. You can use {name} and {chat}.\n"
         "I need the \"Invite users\" admin right.")
     rows = [
-        [InlineKeyboardButton(f"{'🟢' if on else '🔴'} Auto Approve: {'ON' if on else 'OFF'}", callback_data="jn:t")],
+        [InlineKeyboardButton(f"{'🟢' if on else '🔴'} Join: {'ON' if on else 'OFF'}", callback_data="jn:t")],
         [InlineKeyboardButton(f"💬 Welcome message: {'ON' if dm else 'OFF'}", callback_data="jn:d")],
     ]
     cur = _join_delay(chat_id)
@@ -6451,12 +6611,13 @@ def _join_screen(chat_id):
                                       callback_data=f"jn:w:{d}") for d in JOIN_DELAYS])
     if custom:
         rows.append([InlineKeyboardButton("♻️ Reset message to default", callback_data="jn:r")])
-    rows.append([InlineKeyboardButton("« Back", callback_data="help:approval")])
+    rows.append([InlineKeyboardButton("« Back", callback_data="help:join")])
     return text, InlineKeyboardMarkup(rows)
 
 
 async def join_callback(update, context):
-    """Buttons of the ⚙️ Auto Approve screen: jn:m (open), jn:t (on/off), jn:d (welcome on/off), jn:r (reset text)."""
+    """Buttons of the ⚙️ Join screen: jn:m (open), jn:t (on/off), jn:d (welcome on/off), jn:w:<secs> (delay), jn:r (reset text),
+    and the request cards: jn:a:<user id> (Accept), jn:x:<user id> (Decline)."""
     q = update.callback_query
     chat = q.message.chat if q.message else None
     if chat is None or chat.type == "private":
@@ -6466,9 +6627,11 @@ async def join_callback(update, context):
         await q.answer("Admins only.", show_alert=True)
         return
     action = (q.data or "").partition(":")[2]
+    if action[:2] in ("a:", "x:"):
+        await _join_card_decide(update, context, chat, action)
+        return
     if action == "t":
-        on = get_setting(chat.id, "auto_approve", "False") == "True"
-        set_setting(chat.id, "auto_approve", "False" if on else "True")
+        set_setting(chat.id, "join_mode", "False" if _join_on(chat.id) else "True")
     elif action == "d":
         set_setting(chat.id, "join_dm", "False" if _join_dm_on(chat.id) else "True")
     elif action.startswith("w:"):
@@ -6486,6 +6649,69 @@ async def join_callback(update, context):
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     except TelegramError:
         pass
+
+
+_join_pending = {}  # (chat id, user id) -> (first name, private chat id): lets ✅ Accept send the welcome message
+JOIN_PENDING_MAX = 500
+
+
+async def _join_post_card(context, req):
+    """Join is OFF: post the request in the group with the person's details and Accept / Decline buttons."""
+    chat, user = req.chat, req.from_user
+    name = ((user.first_name or "") + " " + (user.last_name or "")).strip() or "Unknown"
+    uname = f"@{user.username}" if user.username else "none"
+    text = ("🔔 <b>New join request</b>\n\n"
+            f"👤 Name: <a href=\"tg://user?id={user.id}\">{html.escape(name)}</a>\n"
+            f"🔗 Username: {html.escape(uname)}\n"
+            f"🆔 User ID: <code>{user.id}</code>\n\n"
+            "Admins: tap a button below.")
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Accept", callback_data=f"jn:a:{user.id}"),
+                                    InlineKeyboardButton("❌ Decline", callback_data=f"jn:x:{user.id}")]])
+    await context.bot.send_message(chat.id, text, parse_mode="HTML", reply_markup=markup)
+    _join_pending[(chat.id, user.id)] = (user.first_name or "", req.user_chat_id)
+    while len(_join_pending) > JOIN_PENDING_MAX:
+        _join_pending.pop(next(iter(_join_pending)))
+
+
+async def _join_card_decide(update, context, chat, action):
+    """✅ Accept / ❌ Decline on a request card (admins only, checked by join_callback)."""
+    q = update.callback_query
+    approve = action.startswith("a:")
+    try:
+        uid = int(action[2:])
+    except ValueError:
+        await q.answer("This request is no longer valid.", show_alert=True)
+        return
+    pending = _join_pending.pop((chat.id, uid), None)
+    try:
+        if approve:
+            await context.bot.approve_chat_join_request(chat.id, uid)
+        else:
+            await context.bot.decline_chat_join_request(chat.id, uid)
+    except TelegramError as e:
+        logging.warning("join card in %s: %s", chat.id, e)
+        done = any(w in str(e).upper() for w in ("HIDE_REQUESTER_MISSING", "USER_ALREADY_PARTICIPANT"))
+        if done:  # someone else already handled it (or the person cancelled)
+            await q.answer("This request was already handled.", show_alert=True)
+            try:
+                await q.edit_message_reply_markup(None)
+            except TelegramError:
+                pass
+        else:
+            await q.answer("I couldn't do that. I need the 'Invite users' admin right.", show_alert=True)
+            if pending:
+                _join_pending[(chat.id, uid)] = pending
+        return
+    await q.answer("Approved ✅" if approve else "Declined ❌")
+    try:
+        await q.edit_message_text(
+            q.message.text_html + f"\n\n{'✅ Approved' if approve else '❌ Declined'} by {q.from_user.mention_html()}",
+            parse_mode="HTML", reply_markup=None)
+    except TelegramError:
+        pass
+    if approve:
+        name, user_chat_id = pending if pending else ("", uid)
+        await _join_hello_to(context, chat, name, user_chat_id)
 
 
 async def setjoinmsg_cmd(update, context):
@@ -6506,17 +6732,17 @@ async def setjoinmsg_cmd(update, context):
         await msg.reply_text("Welcome message reset to the default.")
         return
     set_setting(chat.id, "join_dm_text", text[:500])
-    await msg.reply_text("✅ Welcome message saved. Open /help → Approval → Auto Approve to see it.")
+    await msg.reply_text("✅ Welcome message saved. Open /help → Join to see it.")
 
 
 async def joinon_cmd(update, context):
     context.args = ["on"]
-    await autoapprove_cmd(update, context)
+    await join_cmd(update, context)
 
 
 async def joinoff_cmd(update, context):
     context.args = ["off"]
-    await autoapprove_cmd(update, context)
+    await join_cmd(update, context)
 
 
 async def raid_new_members(update, context):
@@ -6526,8 +6752,8 @@ async def raid_new_members(update, context):
 
 
 async def on_join_request(update, context):
-    """Join requests (groups with 'Approve new members'): approve automatically when /autoapprove is on,
-    decline during a raid. The person never has to send /start."""
+    """Join requests (groups with 'Approve new members'): approve automatically when /join is on (after the chosen wait),
+    post an Accept / Decline card in the group when it is off, decline during a raid. The person never has to send /start."""
     req = update.chat_join_request
     if req is None:
         return
@@ -6538,7 +6764,8 @@ async def on_join_request(update, context):
         if raid_left(chat.id):
             await req.decline()
             return
-        if get_setting(chat.id, "auto_approve", "False") != "True":
+        if not _join_on(chat.id):
+            await _join_post_card(context, req)
             return
         delay = _join_delay(chat.id)
         if delay:
@@ -6554,12 +6781,16 @@ async def on_join_request(update, context):
 
 
 async def _approve_later(context, req, delay):
-    """Waits, then approves (or declines if a raid started meanwhile). Skipped if auto approve was switched off."""
+    """Waits, then approves (or declines if a raid started meanwhile). If Join was switched off meanwhile, the request
+    is posted as an Accept / Decline card instead."""
     await asyncio.sleep(delay)
     chat = req.chat
     try:
-        if is_paused(chat.id) or get_setting(chat.id, "auto_approve", "False") != "True":
+        if is_paused(chat.id):
             return  # request stays pending for an admin
+        if not _join_on(chat.id):
+            await _join_post_card(context, req)
+            return
         if raid_left(chat.id):
             await req.decline()
             return
@@ -6571,18 +6802,22 @@ async def _approve_later(context, req, delay):
 
 
 async def _join_hello(context, req):
-    chat, user = req.chat, req.from_user
+    await _join_hello_to(context, req.chat, req.from_user.first_name, req.user_chat_id)
+
+
+async def _join_hello_to(context, chat, name, user_chat_id):
     if not _join_dm_on(chat.id):
         return
     try:  # a short hello in private chat (allowed for a limited time after the request; ignored if refused)
-        dm = _join_dm_text(chat.id).replace("{name}", user.first_name or "friend").replace(
+        dm = _join_dm_text(chat.id).replace("{name}", name or "friend").replace(
             "{chat}", chat.title or "the group")
-        await context.bot.send_message(req.user_chat_id, dm[:1000])
+        await context.bot.send_message(user_chat_id, dm[:1000])
     except TelegramError:
         pass
 
 
 def main():
+    install_pm_group_links()  # buttons of a group's help menu in private chat act on that group
     extra.start_web_server()  # Render: open the port first (health check / keep-alive)
     logging.warning("OWNER_IDS loaded: %s (the 🛡 Bot Staff button shows for these IDs and for the bot's staff)", OWNER_IDS)
     missing = [n for n in ("BOT_TOKEN", "MONGO_URI") if not (os.getenv(n) or "").strip()]
@@ -6630,8 +6865,8 @@ def main():
         "warnmode": warnmode, "warntime": warntime,
         "flood": flood, "setflood": setflood, "floodmode": floodmode,
         "antiraid": antiraid_cmd, "raidtime": raidtime_cmd, "raidactiontime": raidactiontime_cmd,
-        "autoantiraid": autoantiraid_cmd, "autoapprove": autoapprove_cmd,
-        "join": autoapprove_cmd, "joinon": joinon_cmd, "joinoff": joinoff_cmd, "setjoinmsg": setjoinmsg_cmd,
+        "autoantiraid": autoantiraid_cmd,
+        "join": join_cmd, "joinon": joinon_cmd, "joinoff": joinoff_cmd, "setjoinmsg": setjoinmsg_cmd,
         "antispam": antispam, "spammode": spammode,
         "repeatlimit": repeatlimit, "mentionlimit": mentionlimit,
         "blocklistmode": blocklistmode, "report": report_cmd, "reports": reports_toggle,
