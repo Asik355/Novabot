@@ -347,7 +347,8 @@ async def run_once(bot):
     """One pass of the 30-second loop. Every job runs on its own: one that fails (a database hiccup, one odd group) is logged and
     never stops the others, so Night Mode keeps working even when something else in the loop is broken."""
     now = _now_minutes()
-    for name, job in (("auto close", _auto_close_round(bot, now)),
+    for name, job in (("admin only", _adminonly_round(bot)),           # Admin Only (section 2p): ends the timed ones
+                      ("auto close", _auto_close_round(bot, now)),
                       ("night mode", _night_round(bot, now)),       # Night Mode (section 2b) uses the same loop
                       ("raid shield", _raid_round(bot)),            # Raid Shield (section 2f): lifts the lock when the raid is over
                       ("rules gate", _gate_round(bot)),             # Rules gate (section 2j): members who didn't accept in time
@@ -366,8 +367,9 @@ async def run_once(bot):
 async def _auto_close_round(bot, now):
     for chat_id, raw in await asyncio.to_thread(_scheduled_groups):
         sched = load_schedule(raw)
-        if not sched or chat_id >= 0 or D.is_paused(chat_id) or D.get_setting(chat_id, RAID_LOCK_KEY, "") == "on":
-            continue                                     # (a raid lock holds the group: section 2f)
+        if (not sched or chat_id >= 0 or D.is_paused(chat_id) or D.get_setting(chat_id, RAID_LOCK_KEY, "") == "on"
+                or D.get_setting(chat_id, AO_KEY, "") == "on"):
+            continue                                     # (a raid lock or Admin Only holds the group: sections 2f, 2p)
         close, open_ = sched
         want_closed = is_closed_at(now, close, open_)
         is_closed = D.get_setting(chat_id, STATE_KEY, "open") == "closed"
@@ -995,8 +997,9 @@ async def night_off(bot, chat_id):
 async def _night_round(bot, now):
     for chat_id, raw in await asyncio.to_thread(_scheduled_groups, NIGHT_KEY):
         sched = load_schedule(raw)
-        if not sched or chat_id >= 0 or D.is_paused(chat_id) or D.get_setting(chat_id, RAID_LOCK_KEY, "") == "on":
-            continue                                     # (a raid lock holds the group: section 2f)
+        if (not sched or chat_id >= 0 or D.is_paused(chat_id) or D.get_setting(chat_id, RAID_LOCK_KEY, "") == "on"
+                or D.get_setting(chat_id, AO_KEY, "") == "on"):
+            continue                                     # (a raid lock or Admin Only holds the group: sections 2f, 2p)
         start, end = sched
         want = is_closed_at(now, start, end)             # "inside the window", same maths as Auto Close
         active = D.get_setting(chat_id, NIGHT_STATE_KEY, "") == "on"
@@ -7740,6 +7743,108 @@ async def _unpin_round(bot):
                 _unpin_save(chat_id, keep)
         except Exception:
             log.exception("scheduled unpins: the round failed for %s", chat_id)
+
+
+# ======================================================================================================
+# 2p. ADMIN ONLY: /adminonly [time|off|status] (the command is in nova.py; switching and ending are here)
+# ======================================================================================================
+# Only admins can write, right now: the group's default permissions are switched off exactly like Raid Shield does it
+# and handed back as they were. With a time (/adminonly 20m) the 30-second loop ends it by itself; without one it lasts
+# until /adminonly off. Auto Close and Night Mode leave the group alone while it is on. The bot needs "Ban users".
+# Settings per group: adminonly_state = "on", adminonly_until = end time in epoch seconds (0 = until /adminonly off),
+# adminonly_saved = the permissions to give back ("night", "default", JSON, or "" = nothing to give back).
+AO_KEY, AO_SAVED_KEY, AO_UNTIL_KEY = "adminonly_state", "adminonly_saved", "adminonly_until"
+
+
+def adminonly_info(chat_id):
+    """(is it on, end time in epoch seconds or 0 for no end)."""
+    if D.get_setting(chat_id, AO_KEY, "") != "on":
+        return False, 0
+    try:
+        return True, int(float(D.get_setting(chat_id, AO_UNTIL_KEY, 0) or 0))
+    except (TypeError, ValueError):
+        return True, 0
+
+
+async def adminonly_on(bot, chat_id, secs=None):
+    """Only admins can write. Calling it again while it is on just sets the new end time. True when it is on."""
+    if not adminonly_info(chat_id)[0]:
+        saved = ""
+        try:
+            if (D.get_setting(chat_id, STATE_KEY, "open") != "closed"            # not already closed by Auto Close
+                    and D.get_setting(chat_id, RAID_LOCK_KEY, "") != "on"):      # nor by a raid lock
+                chat = await bot.get_chat(chat_id)
+                perms = getattr(chat, "permissions", None)
+                if perms is None or getattr(perms, "can_send_messages", True) is not False:   # nor closed by hand
+                    night_on = D.get_setting(chat_id, NIGHT_STATE_KEY, "") == "on"
+                    saved = "night" if night_on else (_saved_perms(chat) or "default")
+                    await bot.set_chat_permissions(chat_id, CLOSED_PERMS)
+        except TelegramError as e:
+            log.warning("admin only: couldn't close %s: %s", chat_id, e)
+            return False
+        D.set_setting(chat_id, AO_SAVED_KEY, saved)
+        D.set_setting(chat_id, AO_KEY, "on")
+    D.set_setting(chat_id, AO_UNTIL_KEY, int(time.time()) + int(secs) if secs else 0)
+    return True
+
+
+async def adminonly_off(bot, chat_id, announce=False):
+    """Everyone can write again, as before. True when done (or it was not on); False when Telegram refused."""
+    if not adminonly_info(chat_id)[0]:
+        return True
+    saved = D.get_setting(chat_id, AO_SAVED_KEY, "") or ""
+    perms = None
+    if saved == "night":                                                    # Night Mode was on: media stays off
+        perms = None if D.get_setting(chat_id, NIGHT_SAVED_KEY, "") == NIGHT_PASSIVE else _night_variant(_night_saved_perms(chat_id))
+    elif saved == "default":
+        perms = D.default_perms
+    elif saved:
+        try:
+            perms = ChatPermissions(**json.loads(saved))
+        except (TypeError, ValueError):
+            perms = D.default_perms
+        if perms.can_send_messages is False:                                # never give back a closed state
+            perms = D.default_perms
+    if perms is not None:
+        try:
+            await _set_perms(bot, chat_id, perms)
+        except TelegramError as e:
+            log.warning("admin only: couldn't open %s: %s", chat_id, e)
+            return False                                                    # stays on: the loop tries again
+    store.del_setting(chat_id, AO_KEY)
+    store.del_setting(chat_id, AO_SAVED_KEY)
+    store.del_setting(chat_id, AO_UNTIL_KEY)
+    if announce:
+        try:
+            await bot.send_message(chat_id, "🔓 <b>Admin only is over.</b> Everyone can write again.", parse_mode="HTML")
+        except TelegramError:
+            pass
+    return True
+
+
+async def _adminonly_round(bot):
+    """Part of run_once (every 30 seconds): ends every admin-only time that has run out."""
+    for chat_id, value in await asyncio.to_thread(_scheduled_groups, AO_KEY):
+        try:
+            if value != "on":
+                continue
+            until = adminonly_info(chat_id)[1]
+            if not until or time.time() < until or time.monotonic() < _retry_at.get((chat_id, "adminonly-end"), 0):
+                continue
+            if await adminonly_off(bot, chat_id, announce=True):
+                continue
+            _retry_at[(chat_id, "adminonly-end")] = time.monotonic() + RETRY_AFTER
+            last = _notice_at.get(chat_id)
+            if last is None or time.monotonic() - last >= NOTICE_EVERY:
+                _notice_at[chat_id] = time.monotonic()
+                try:
+                    await bot.send_message(chat_id, "⚠️ The admin-only time is over, but I couldn't let everyone write again. "
+                                                    "I need the 'Ban users' admin right. I'll try again in a few minutes, "
+                                                    "or send /adminonly off.")
+                except TelegramError:
+                    pass
+        except Exception:
+            log.exception("admin only: ending it failed in %s", chat_id)
 
 
 # ======================================================================================================

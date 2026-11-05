@@ -959,6 +959,8 @@ HELP_SECTIONS = {
             "/unpin: Unpin the replied-to message, or the newest pinned one.",
             "/unpin 10: Unpin the newest 10 pinned messages.",
             "/unpin all: Unpin every pinned message. Add a time to do it later, like /unpin all 2d or /unpin 5m.",
+            "/adminonly [time] [reason]: Only admins can write in the group, now or for a set time, like /adminonly 20m.",
+            "/adminonly off: Let everyone write again (also /adminonly status).",
         ]),
     ),
     "warn": (
@@ -1236,7 +1238,7 @@ HELP_SECTIONS = {
     "botedit": (
         "🤖 Bot Edit",
         "<b>Bot Edit</b>\n\n" + _numbered([
-            "/bot: Change the bot's name, username, photo or bio "
+            "/bot: Change the bot's name, username, photo, description (120 characters) or intro (512 characters) "
             "(Bot Owner only).",
             "/addstaff: Add a Bot Staff member - reply to a user, or give an ID or @username "
             "(Primary Bot Owner only).",
@@ -1576,6 +1578,8 @@ USAGE_GUIDES = {
         "• Mute until you unmute: reply <code>/mute</code>\n"
         "• Mute and delete their message: reply <code>/dmute 1d</code>\n"
         "• Undo: <code>/unmute</code> or <code>/unban</code>\n"
+        "• Only admins can write, now: <code>/adminonly</code>   for 20 minutes: <code>/adminonly 20m</code>\n"
+        "• With a reason: <code>/adminonly 1h announcement coming</code>   Let everyone write again: <code>/adminonly off</code>\n"
         "• Remove from the group (can rejoin): <code>/kick</code>\n"
         "• Make someone admin with a title: reply <code>/promote Helper</code>\n\n"
         "<b>Time format</b>: 30m, 2h, 1d, 1w.\n"
@@ -4184,6 +4188,78 @@ async def _pause_allowed(update) -> bool:
     return True
 
 
+ADMINONLY_MAX_SECS = 30 * 24 * 3600  # a timed admin-only can last at most 30 days
+ADMINONLY_REASON_MAX = 200
+ADMINONLY_USAGE = ("Usage:\n"
+                   "1. /adminonly: Only admins can write here, until /adminonly off.\n"
+                   "2. /adminonly 20m: Only admins can write for a set time (m, h, d, w; up to 30 days), "
+                   "then everyone can write again by itself.\n"
+                   "3. /adminonly 20m reason: Same, and the reason is shown to the group.\n"
+                   "4. /adminonly off: Let everyone write again now.\n"
+                   "5. /adminonly status: Show whether it is on and how long is left.")
+
+
+def _adminonly_end_text(secs_left):
+    """'(about 10:45 PM IST)' for a time that many seconds from now."""
+    end = datetime.now(group._tz()) + timedelta(seconds=secs_left)
+    day = "" if end.date() == datetime.now(group._tz()).date() else f" on {end.strftime('%d %b')}"
+    return f"{group.fmt_12h(end.hour * 60 + end.minute)} {end.strftime('%Z')}".strip() + day
+
+
+def adminonly_status_text(chat_id):
+    on, until = group.adminonly_info(chat_id)
+    if not on:
+        return "🔓 Admin only is off. Everyone can write in this group."
+    if not until:
+        return "🔒 Admin only is ON. Only admins can write, until an admin sends /adminonly off."
+    left = max(0, until - int(time.time()))
+    return (f"🔒 Admin only is ON. Only admins can write for another {fmt_duration(left)} "
+            f"(until {_adminonly_end_text(left)}), or until /adminonly off.")
+
+
+async def adminonly_cmd(update, context):
+    """/adminonly [time] [reason] | off | status: only admins can write in this group, now or for a set time."""
+    if not await _pause_allowed(update):  # group only; Bot Owner, Bot Staff and group admins
+        return
+    chat, msg = update.effective_chat, update.effective_message
+    args = list(context.args)
+    first = args[0].lower() if args else ""
+    if first in ("status", "check"):
+        await msg.reply_text(adminonly_status_text(chat.id))
+        return
+    if first in ("off", "open", "stop", "end", "disable"):
+        if not group.adminonly_info(chat.id)[0]:
+            await msg.reply_text("🔓 Admin only is already off. Everyone can write in this group.")
+            return
+        if await group.adminonly_off(context.bot, chat.id):
+            await msg.reply_text("🔓 Admin only is off. Everyone can write again.")
+        else:
+            await msg.reply_text("⚠️ I couldn't let everyone write again. Please make sure I'm an admin with the "
+                                 "'Ban users' right, then send /adminonly off again.")
+        return
+    secs = None
+    if first and first[0].isdigit():  # a time: 20m, 2h, 1d, 1w
+        secs = parse_duration(first)
+        if not secs or secs > ADMINONLY_MAX_SECS:
+            await msg.reply_text("❌ That time isn't valid.\n\n" + ADMINONLY_USAGE)
+            return
+        args = args[1:]
+    reason = " ".join(args).strip()
+    if len(reason) > ADMINONLY_REASON_MAX:
+        await msg.reply_text(f"⚠️ The reason is too long.\nLimit: {ADMINONLY_REASON_MAX} characters\n"
+                             f"Your text: {len(reason)} characters ({len(reason) - ADMINONLY_REASON_MAX} too many)")
+        return
+    if not await group.adminonly_on(context.bot, chat.id, secs):
+        await msg.reply_text("⚠️ I couldn't change the group's permissions, so nothing was changed. Please make sure "
+                             "I'm an admin with the 'Ban users' right.")
+        return
+    when = (f"for {fmt_duration(secs)} (until {_adminonly_end_text(secs)})" if secs
+            else "until an admin sends /adminonly off")
+    await msg.reply_html(f"🔒 <b>Admin only</b>\nOnly admins can write in this group {when}."
+                         + (f"\n📝 Reason: {html.escape(reason)}" if reason else "")
+                         + ("\n\nSend /adminonly off to let everyone write again." if secs else ""))
+
+
 async def pause_cmd(update, context):
     """/pause [time|status]: every automatic function off in this group (locks, flood, spam, blocklist,
     ads/promotion, NSFW protection, captcha, welcome/goodbye, filters, notes, message counting...).
@@ -5428,6 +5504,10 @@ AWAITING_BOT_NAME = "AWAITING_BOT_NAME"
 AWAITING_BOT_USERNAME = "AWAITING_BOT_USERNAME"
 AWAITING_BOT_PHOTO = "AWAITING_BOT_PHOTO"
 AWAITING_BOT_BIO = "AWAITING_BOT_BIO"
+AWAITING_BOT_INTRO = "AWAITING_BOT_INTRO"
+
+BOT_DESC_LIMIT = 120    # Telegram: the Description under the bot's name (short description / "About")
+BOT_INTRO_LIMIT = 512   # Telegram: the intro shown as "What can this bot do?" (long description)
 
 # (chat_id, user_id) -> {"state", "kind", "ts", "task"}
 edit_sessions = {}
@@ -5470,7 +5550,12 @@ EDIT_ACTIONS = {
     ),
     ("bot", "bio"): (
         AWAITING_BOT_BIO,
-        "Please send the new bio or description you would like to set for the bot.",
+        f"Please send the new Description for the bot: the text under its name. Telegram allows up to {BOT_DESC_LIMIT} characters.",
+    ),
+    ("bot", "intro"): (
+        AWAITING_BOT_INTRO,
+        f"Please send the new intro for the bot: the text shown as \"What can this bot do?\". "
+        f"Telegram allows up to {BOT_INTRO_LIMIT} characters.",
     ),
 }
 
@@ -5502,7 +5587,9 @@ def edit_menu_keyboard(kind):
         [InlineKeyboardButton(
             f"🖼️ Change {label} " + ("Profile Photo" if kind == "bot" else "Photo"),
             callback_data=f"{p}:photo")],
-        [InlineKeyboardButton(f"📝 Change {label} Bio / Description", callback_data=f"{p}:bio")],
+        [InlineKeyboardButton(f"📝 Change {label} " + ("Description" if kind == "bot" else "Bio / Description"),
+                              callback_data=f"{p}:bio")],
+    ] + ([[InlineKeyboardButton("📖 Change Bot Intro", callback_data=f"{p}:intro")]] if kind == "bot" else []) + [
         [InlineKeyboardButton("🔙 Back", callback_data="help:main")],
     ])
 
@@ -5565,9 +5652,10 @@ async def _session_watchdog(bot, key, session):
         pass
 
 
-def start_session(bot, key, kind, state):
+def start_session(bot, key, kind, state, target=None):
+    """target: the group a Group Edit session changes when the menu was opened in private chat (else None)."""
     end_session(key)
-    session = {"state": state, "kind": kind, "ts": time.time(), "task": None}
+    session = {"state": state, "kind": kind, "ts": time.time(), "task": None, "target": target}
     edit_sessions[key] = session
     session["task"] = asyncio.create_task(_session_watchdog(bot, key, session))
 
@@ -5621,7 +5709,12 @@ async def edit_callback(update, context):
         await q.answer(err, show_alert=True)
         return
     await q.answer()
-    key = (chat.id, user.id)
+    # Menu opened in private chat for a group (see pm_group_wrap): the session lives in the private chat, where the
+    # person types their answer; a Group Edit session remembers which group it changes.
+    real = update.effective_message.chat if update.effective_message is not None else chat
+    linked = real.type == "private" and chat.type != "private"
+    key = (real.id, user.id) if linked else (chat.id, user.id)
+    target = chat if (linked and kind == "group") else None
 
     if action == "cancel":
         end_session(key)
@@ -5636,7 +5729,7 @@ async def edit_callback(update, context):
     if (kind, action) not in EDIT_ACTIONS:
         return
     state, prompt = EDIT_ACTIONS[(kind, action)]
-    start_session(context.bot, key, kind, state)
+    start_session(context.bot, key, kind, state, target)
     await q.edit_message_text(prompt, reply_markup=cancel_keyboard(kind))
 
 
@@ -5802,23 +5895,56 @@ async def h_bot_name(update, context, s):
     return True
 
 
+def _too_long_text(what, limit, n):
+    return (f"⚠️ {what} is too long.\n"
+            f"Limit: {limit} characters\n"
+            f"Your text: {n} characters ({n - limit} too many)\n"
+            "Please send a shorter text.")
+
+
 async def h_bot_bio(update, context, s):
+    """Bot Edit > Description: the text under the bot's name (Telegram's short description, 120 characters)."""
     msg = update.effective_message
     value = _text_or_none(msg)
-    if not value or len(value) > 512:
-        await msg.reply_text("⚠️ Invalid Description: Please send text between 1 and 512 characters.")
+    if not value:
+        await msg.reply_text(f"⚠️ Invalid Description: please send text of 1 to {BOT_DESC_LIMIT} characters.")
+        return False
+    if len(value) > BOT_DESC_LIMIT:
+        await msg.reply_text(_too_long_text("That Description", BOT_DESC_LIMIT, len(value)))
+        return False
+    try:
+        await context.bot.set_my_short_description(value)
+        set_setting(0, "bot_short_description", value)
+    except TelegramError as e:
+        logging.warning("Set bot description failed: %s", e)
+        await msg.reply_text(f"⚠️ Telegram rejected that Description ({len(value)}/{BOT_DESC_LIMIT} characters): "
+                             f"{_api_error_text(e)}")
+        return True
+    await msg.reply_html(card("Bot description updated",
+                              f"{html.escape(value)}\n\n{len(value)}/{BOT_DESC_LIMIT} characters"))
+    return True
+
+
+async def h_bot_intro(update, context, s):
+    """Bot Edit > Intro: the long text shown as "What can this bot do?" (512 characters)."""
+    msg = update.effective_message
+    value = _text_or_none(msg)
+    if not value:
+        await msg.reply_text(f"⚠️ Invalid intro: please send text of 1 to {BOT_INTRO_LIMIT} characters.")
+        return False
+    if len(value) > BOT_INTRO_LIMIT:
+        await msg.reply_text(_too_long_text("That intro", BOT_INTRO_LIMIT, len(value)))
         return False
     try:
         await context.bot.set_my_description(value)
         set_setting(0, "bot_description", value)
-        if len(value) <= 120:  # also fits the short "About" line on the bot's profile
-            await context.bot.set_my_short_description(value)
-            set_setting(0, "bot_short_description", value)
     except TelegramError as e:
-        logging.warning("Set bot description failed: %s", e)
-        await msg.reply_text("⚠️ Telegram rejected that description. Please try again.")
+        logging.warning("Set bot intro failed: %s", e)
+        await msg.reply_text(f"⚠️ Telegram rejected that intro ({len(value)}/{BOT_INTRO_LIMIT} characters): "
+                             f"{_api_error_text(e)}")
         return True
-    await msg.reply_html(card("Bot bio / description updated", html.escape(value)))
+    await msg.reply_html(card("Bot intro updated",
+                              f"{html.escape(value)}\n\n{len(value)}/{BOT_INTRO_LIMIT} characters"))
     return True
 
 
@@ -5882,6 +6008,7 @@ EDIT_HANDLERS = {
     AWAITING_BOT_USERNAME: h_bot_username,
     AWAITING_BOT_PHOTO: h_bot_photo,
     AWAITING_BOT_BIO: h_bot_bio,
+    AWAITING_BOT_INTRO: h_bot_intro,
 }
 
 
@@ -5899,12 +6026,15 @@ async def edit_input(update, context):
         end_session(key)
         await msg.reply_text(MSG_TIMEOUT)
         raise ApplicationHandlerStop
-    err = await edit_perm_error(s["kind"], chat, user.id)
+    target = s.get("target")
+    err = await edit_perm_error(s["kind"], target or chat, user.id)
     if err:
         end_session(key)
         await msg.reply_text(err)
         raise ApplicationHandlerStop
     s["ts"] = time.time()
+    if target is not None:  # Group Edit started from private chat: the handler works on that group
+        update = _View(update, effective_chat=target)
     if await EDIT_HANDLERS[s["state"]](update, context, s):
         end_session(key)
     raise ApplicationHandlerStop
@@ -6024,7 +6154,7 @@ async def _startup_sync(app):
         # Only an owner edit (Bot Edit) may change the Telegram name; a restart never does (see _sync_saved_bot_name).
         await _sync_saved_bot_name(app)
         await extra.refresh_identity(app.bot, force=True)
-        # Same rule as the name: the saved text (Bot Edit > Bio / Description) is re-applied on every start, and the
+        # Same rule as the name: the saved texts (Bot Edit > Description and Intro) are re-applied on every start, and the
         # generic default is used only while Telegram has no text at all, so it never replaces one you set yourself.
         short_default = "Group moderation: warnings, mutes, filters, welcomes and join verification."
         long_default = ("I help admins keep groups tidy: warnings, mutes, blocklists, antiflood and "
@@ -6891,7 +7021,7 @@ def main():
         "save": save_note, "get": get_note, "notes": list_notes, "saved": list_notes, "clear": clear_note,
         "clearall": clearall_cmd, "stopall": stopall_cmd, "privatenotes": privatenotes_cmd,
         "filter": add_filter, "stop": stop_filter, "filters": list_filters,
-        "pause": pause_cmd, "resume": resume_cmd,
+        "pause": pause_cmd, "resume": resume_cmd, "adminonly": adminonly_cmd,
         "lock": lock, "unlock": unlock, "pin": pin, "purge": purge, "spurge": spurge, "del": del_cmd,
         "purgefrom": purgefrom, "purgeto": purgeto,
         "addblocklist": addblocklist, "unblocklist": unblocklist, "blocklist": blocklist_cmd,
