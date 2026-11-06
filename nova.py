@@ -2140,20 +2140,18 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 OWNER_DEFAULTS = {
     "ads":   {"label": "📢 Ads & Promotion", "kind": "split", "keys": ("block_punish", "block_punish_secs"),
               "options": ("mute", "kick", "ban", "delete")},
-    "prot":  {"label": "🔞 Protection", "kind": "split", "keys": ("nsfw_action", "nsfw_secs"),
-              "options": ("delete", "mute", "kick", "ban")},
     "flood": {"label": "🌊 Flood", "kind": "mode", "keys": ("flood_mode",),
               "options": ("warn", "mute", "tmute", "kick", "ban")},
     "spam":  {"label": "📨 Spam", "kind": "mode", "keys": ("spam_mode",),
               "options": ("delete", "warn", "mute", "tmute", "kick", "ban")},
-    "block": {"label": "🚫 Blocklist", "kind": "mode", "keys": ("blocklist_mode",),
+    "block": {"label": "🚫 Blocklist & Protection", "kind": "mode", "keys": ("blocklist_mode",),
               "options": ("nothing", "delete", "warn", "mute", "tmute", "kick", "ban")},
     "warn":  {"label": "⚠️ Warnings (at the limit)", "kind": "mode", "keys": ("warn_mode",),
               "options": ("ban", "kick", "mute", "tmute")},
     "cap":   {"label": "🤖 Captcha (if failed)", "kind": "mode", "keys": ("captcha_action",),
               "options": ("kick", "mute", "ban")},
 }
-OWNER_CAT_ORDER = ("ads", "prot", "flood", "spam", "block", "warn", "cap")
+OWNER_CAT_ORDER = ("ads", "flood", "spam", "block", "warn", "cap")
 OWNER_TIMES = (300, 1800, 3600, 86400, 604800)  # 5 minutes, 30 minutes, 1 hour, 1 day, 7 days
 OWNER_OPT_LABEL = {"mute": "🔇 Mute (permanent)", "tmute": "⏱ Timed mute", "kick": "👢 Kick", "ban": "🚫 Ban",
                    "delete": "🗑 Delete only", "warn": "⚠️ Warn", "nothing": "Do nothing"}
@@ -3737,36 +3735,72 @@ async def list_filters(update, context):
     await update.effective_message.reply_text(text)
 
 
+_BL_TOKEN_RE = re.compile(r'"([^"]+)"|\'([^\']+)\'|([^\s,;]+)')
+BLOCKLIST_BATCH_MAX = 50  # words per command
+
+
+def parse_block_words(text):
+    """'spam scam, "free money" bad*' -> ['spam', 'scam', 'free money', 'bad*'] (lowercase, no duplicates)."""
+    out = []
+    for a, b, c in _BL_TOKEN_RE.findall(text or ""):
+        if c and "/" in c and "." not in c and ":" not in c:
+            parts = c.split("/")  # hello/hi -> hello and hi (links like t.me/spam stay in one piece)
+        else:
+            parts = [a or b or c]
+        for p in parts:
+            w = p.strip().lower()
+            if w and w not in out:
+                out.append(w)
+    return out[:BLOCKLIST_BATCH_MAX]
+
+
 async def addblocklist(update, context):
     if not await admin_only(update):
         return
-    word, _ = split_keyword(update.effective_message.text.partition(" ")[2])
-    if not word:
+    words = parse_block_words(update.effective_message.text.partition(" ")[2])
+    if not words:
         await update.effective_message.reply_text(
-            'Usage: /addblocklist word  (quotes for phrases, * as wildcard: spam*)'
+            'Usage: /addblocklist word1 word2 "two words" spam*\n'
+            "You can add many at once (separate with spaces, commas or new lines). "
+            "Quotes for phrases, * as wildcard."
         )
         return
-    store.block_add(update.effective_chat.id, word)
-    await update.effective_message.reply_text(
-        f"'{word}' added to the blocklist "
-        f"(action: {describe_mode(get_setting(update.effective_chat.id, 'blocklist_mode', 'delete'))})."
-    )
-    await log_action(update.effective_chat, "blocklist", f"➕ {update.effective_user.mention_html()} blocklisted '{word}'.")
+    existing = {str(w).lower() for w in store.block_words(update.effective_chat.id)}
+    added = [w for w in words if w not in existing]
+    already = [w for w in words if w in existing]
+    for w in added:
+        store.block_add(update.effective_chat.id, w)
+    lines = []
+    if added:
+        lines.append("✅ Added to the blocklist: " + ", ".join(added))
+    if already:
+        lines.append("ℹ️ Already blocklisted: " + ", ".join(already))
+    await update.effective_message.reply_text("\n".join(lines))
+    if added:
+        await log_action(update.effective_chat, "blocklist",
+                         f"➕ {update.effective_user.mention_html()} blocklisted: {html.escape(', '.join(added))}.")
 
 
 async def unblocklist(update, context):
     if not await admin_only(update):
         return
-    word, _ = split_keyword(update.effective_message.text.partition(" ")[2])
-    if not word:
-        await update.effective_message.reply_text("Usage: /unblocklist word")
+    words = parse_block_words(update.effective_message.text.partition(" ")[2])
+    if not words:
+        await update.effective_message.reply_text(
+            'Usage: /unblocklist word1 word2 "two words"\nYou can remove many at once.'
+        )
         return
-    removed = store.block_remove(update.effective_chat.id, word)
-    await update.effective_message.reply_text(
-        "Removed from the blocklist." if removed else "That word isn't blocklisted."
-    )
+    removed = [w for w in words if store.block_remove(update.effective_chat.id, w)]
+    missing = [w for w in words if w not in removed]
+    lines = []
     if removed:
-        await log_action(update.effective_chat, "blocklist", f"➖ {update.effective_user.mention_html()} removed '{word}' from the blocklist.")
+        lines.append("✅ Removed from the blocklist: " + ", ".join(removed))
+    if missing:
+        lines.append("❌ Not on the blocklist: " + ", ".join(missing))
+    await update.effective_message.reply_text("\n".join(lines))
+    if removed:
+        await log_action(update.effective_chat, "blocklist",
+                         f"➖ {update.effective_user.mention_html()} removed from the blocklist: {html.escape(', '.join(removed))}.")
 
 
 async def blocklist_cmd(update, context):
@@ -3776,14 +3810,8 @@ async def blocklist_cmd(update, context):
     mode = get_setting(chat_id, "blocklist_mode", "delete")
     words = "\n".join(f"- {w}" for w in store.block_words(chat_id)) or "The blocklist is empty."
     await update.effective_message.reply_text(
-        f"Blocklist action: {describe_mode(mode)}\n\n{words}"
-    )
-
-
-async def blocklistmode(update, context):
-    await _mode_cmd(
-        update, context, "blocklistmode", "blocklist_mode", "delete",
-        ("nothing", "delete", "warn", "mute", "tmute", "kick", "ban"), "Blocklist action",
+        f"Blocklist action: {describe_mode(mode)}\n"
+        f"(/blocklistmode and /protection set the same action.)\n\n{words}"
     )
 
 
@@ -4972,7 +5000,9 @@ async def watcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hit = next((w for w in words if word_match(w, text)), None)
     if hit and not await is_admin(chat, user.id) and not is_approved(chat.id, user.id):
         mode = get_setting(chat.id, "blocklist_mode", "delete")
-        if mode != "nothing":
+        if mode == "delete":
+            await try_delete(msg)  # action is "delete": remove the message silently, no notice
+        elif mode != "nothing":    # warn / mute / tmute / kick / ban: apply it and announce as before
             await try_delete(msg)
             await announce(
                 chat,
@@ -6999,7 +7029,7 @@ def main():
         "join": join_cmd, "joinon": joinon_cmd, "joinoff": joinoff_cmd, "setjoinmsg": setjoinmsg_cmd,
         "antispam": antispam, "spammode": spammode,
         "repeatlimit": repeatlimit, "mentionlimit": mentionlimit,
-        "blocklistmode": blocklistmode, "report": report_cmd, "reports": reports_toggle,
+        "report": report_cmd, "reports": reports_toggle,  # /blocklistmode is an alias of /protection (extra.py)
         "groupedit": groupedit_cmd, "bot": bot_cmd, "cancel": cancel_cmd,
         "addstaff": addadmin_cmd, "removestaff": removeadmin_cmd, "stafflist": adminlist_cmd,
         "addadmin": addadmin_cmd, "removeadmin": removeadmin_cmd, "adminlist": adminlist_cmd,  # the old names still work
@@ -7044,7 +7074,8 @@ def main():
         is_admin=is_admin, lock_exempt=lock_exempt, load_allow=load_allow, url_allowed=url_allowed,
         log_action=log_action, MUTED=MUTED, is_super_admin=is_super_admin, owner_ids=OWNER_IDS,
         is_paused=is_paused, is_bot_owner=is_bot_owner, get_setting=store.get_setting, set_setting=store.set_setting,
-        block_words=store.block_words))  # the Blocklist is the shared word source for NSFW Word
+        block_words=store.block_words,  # the Blocklist is the shared word source for NSFW Word
+        enforce=enforce, announce=announce))  # Protection uses the blocklist action (one action for both)
     group.register(app, SimpleNamespace(
         group_only=group_only, get_setting=get_setting, set_setting=set_setting, is_paused=is_paused,
         default_perms=DEFAULT_PERMS, fun_names=fun_systems._fun_names, is_admin=is_admin,

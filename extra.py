@@ -3651,14 +3651,16 @@ BL_MENU_TEXT = ("<b>🔒 Ads &amp; NSFW</b>\n\n"
                 "<b>⚖️ Punishment for ads &amp; promotion</b> (admins)\n\n"
                 "1. /adpunish: Set the punishment for ads and promotion in this group, "
                 "for example /adpunish mute 1h\n"
-                "2. /protection: Set the action for Protection (Word and Content) in this group, for example /protection mute 10m\n\n"
+                "2. /protection: Set the action for Protection (Word and Content) and the blocklist in this group, "
+                "for example /protection mute 10m\n"
+                "3. /blocklistmode: The same action as /protection. Change either one and the other matches.\n\n"
                 "<b>🚫 Words</b> (admins)\n\n"
-                "3. /addblocklist word: Auto-delete messages with this word.\n"
-                "4. /unblocklist word: Remove a blocklisted word.\n"
-                "5. /blocklist: List all blocklisted words.\n"
-                "6. /okword word: Allow a built-in bad word in this group.\n"
-                "7. /unokword word: Block it again.\n"
-                "8. /okwords: List the allowed words.")
+                "4. /addblocklist word: Auto-delete messages with this word. Add many at once: /addblocklist word1 word2 \"two words\"\n"
+                "5. /unblocklist word: Remove blocklisted words (many at once too).\n"
+                "6. /blocklist: List all blocklisted words.\n"
+                "7. /okword word: Allow a built-in bad word in this group.\n"
+                "8. /unokword word: Block it again.\n"
+                "9. /okwords: List the allowed words.")
 
 
 _BL_CATEGORY_CMDS = {  # "📖 Commands" footer of the Ads / Promotion screens (plain /commands show up highlighted)
@@ -4012,12 +4014,12 @@ NSFW_CATEGORIES = {
              "It is a local check that uses no AI. Normal conversation, jokes, names, questions about what "
              "a word means and rule reminders are left alone, and the message is only removed when two "
              "checks agree. Every word on this group's /blocklist is applied too, and words you allow with /okword are skipped. "
-             "Removes it and applies the action set with /protection. Independent of Content."),
+             "Removes it and applies the action set with /protection (the same action as /blocklistmode). Independent of Content."),
     "content": ("🖼️ Content", NSFW_CONTENT_KEY,
                 "Checks photos, videos, GIFs, animations and links for explicit 18+ material. Links are "
                 "matched against known adult sites; images are verified twice by the AI vision check, and "
                 "if no reliable result is available the message is allowed. Removes it and applies the "
-                "action set with /protection. Independent of Word."),
+                "action set with /protection (the same action as /blocklistmode). Independent of Word."),
 }
 
 # ------------------------------------------------------------ local wordlists
@@ -4369,19 +4371,23 @@ def _nsfw_on(chat_id, key):
         return False
 
 
-def nsfw_punishment(chat_id):
-    """(action, mute_secs) for this group, with safe defaults for missing/bad values."""
-    action, secs = "delete", NSFW_DEFAULT_SECS
+BLOCKLIST_MODE_KEY = "blocklist_mode"  # the ONE action: Protection and the blocklist share it (/protection = /blocklistmode)
+BLOCKLIST_MODES = ("nothing", "delete", "warn", "mute", "tmute", "kick", "ban")
+
+
+def nsfw_mode(chat_id):
+    """The group's single action as a stored mode string ('delete', 'warn', 'mute', 'tmute:600', 'kick', 'ban',
+    'nothing'), with a safe default for missing/bad values."""
     try:
-        a = str(_BD.get_setting(chat_id, NSFW_ACTION_KEY, "delete") or "delete").strip().lower()
-        if a in NSFW_ACTIONS:
-            action = a
-        v = int(_BD.get_setting(chat_id, NSFW_SECS_KEY, NSFW_DEFAULT_SECS) or NSFW_DEFAULT_SECS)
-        if NSFW_MIN_SECS <= v <= NSFW_MAX_SECS:
-            secs = v
+        raw = str(_BD.get_setting(chat_id, BLOCKLIST_MODE_KEY, "delete") or "delete").strip().lower()
+        kind, _, arg = raw.partition(":")
+        if kind == "tmute" and arg.isdigit() and int(arg) > 0:
+            return raw
+        if kind in BLOCKLIST_MODES and kind != "tmute":
+            return kind
     except Exception:
         log.exception("NSFW: couldn't read the action for chat %s; using the default", chat_id)
-    return action, secs
+    return "delete"
 
 
 def _nsfw_human(secs):
@@ -4393,10 +4399,20 @@ def _nsfw_human(secs):
 
 
 def _nsfw_summary(chat_id):
-    action, secs = nsfw_punishment(chat_id)
-    return {"delete": "delete the message", "mute": f"delete the message and mute for {_nsfw_human(secs)}",
-            "ban": "delete the message and ban the member",
-            "kick": "delete the message and remove the member (they can rejoin)"}[action]
+    mode = nsfw_mode(chat_id)
+    kind, secs = mode_kind(mode)
+    if mode == "nothing":
+        return "do nothing for your own blocklist words (the built-in 18+ filter still deletes the message)"
+    if mode == "delete":
+        return "delete the message silently (no notice)"
+    if mode == "warn":
+        return "delete the message and warn the member"
+    if kind == "mute":
+        return (f"delete the message and mute for {_nsfw_human(secs)}" if secs
+                else "delete the message and mute permanently")
+    if kind == "ban":
+        return "delete the message and ban the member"
+    return "delete the message and remove the member (they can rejoin)"
 
 
 def parse_nsfw_duration(text):
@@ -4417,16 +4433,21 @@ def parse_nsfw_duration(text):
 
 
 # ------------------------------------------------------------ the /protection command (was /nsfw)
-_NSFW_USAGE = ("Usage:\n"
-               "1. /protection: Show the current Protection action.\n"
-               "2. /protection delete: Only delete the message.\n"
-               "3. /protection mute 10m: Delete it and mute the member (m, h, d or y, for example 10m, 1h, 30d, 1y).\n"
-               "4. /protection ban: Delete it and ban the member.\n"
-               "5. /protection kick: Delete it and remove the member; they can rejoin.")
+_NSFW_USAGE = ("/protection and /blocklistmode set the same action.\n\n"
+               "Usage:\n"
+               "1. /protection: Show the current action.\n"
+               "2. /protection delete: Only delete the message (silently, no notice).\n"
+               "3. /protection warn: Delete it and warn the member.\n"
+               "4. /protection mute: Delete it and mute the member permanently.\n"
+               "5. /protection mute 10m: Delete it and mute for a time (m, h, d or y, for example 10m, 1h, 30d, 1y).\n"
+               "6. /protection kick: Delete it and remove the member; they can rejoin.\n"
+               "7. /protection ban: Delete it and ban the member.\n"
+               "8. /protection nothing: Your own blocklist words do nothing (the built-in 18+ filter still deletes).")
 
 
 async def nsfw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/protection [delete | mute <10m|1h|30d|1y> | ban | kick]  - what happens to someone who breaks Protection here."""
+    """/protection [nothing | delete | warn | mute [10m] | tmute 10m | kick | ban]  - the group's single action;
+    the same setting as /blocklistmode, so the two always match."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if msg is None or chat is None or user is None:
         return
@@ -4439,39 +4460,38 @@ async def nsfw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     args = [a.strip() for a in (context.args or []) if a.strip()]
     if not args:
-        action, secs = nsfw_punishment(chat.id)
         await msg.reply_html(
-            f"🔞 <b>Protection action:</b> {_nsfw_summary(chat.id)}.\n"
-            f"Mute duration: <b>{_nsfw_human(secs)}</b>"
-            + ("" if action == "mute" else " (only used when the action is mute)")
-            + f"\nWord: {'🟢 ON' if _nsfw_on(chat.id, NSFW_WORD_KEY) else '🔴 OFF'} | "
-              f"Content: {'🟢 ON' if _nsfw_on(chat.id, NSFW_CONTENT_KEY) else '🔴 OFF'}\n\n" + _NSFW_USAGE)
+            f"🔞 <b>Action:</b> {_nsfw_summary(chat.id)}.\n"
+            f"Word: {'🟢 ON' if _nsfw_on(chat.id, NSFW_WORD_KEY) else '🔴 OFF'} | "
+            f"Content: {'🟢 ON' if _nsfw_on(chat.id, NSFW_CONTENT_KEY) else '🔴 OFF'}\n\n" + _NSFW_USAGE)
         return
     action = args[0].lower()
-    if action not in NSFW_ACTIONS:
-        await msg.reply_text(f"❌ \"{action[:30]}\" isn't a valid action. Choose delete, mute, ban or kick.\n\n" + _NSFW_USAGE)
+    if action not in BLOCKLIST_MODES:
+        await msg.reply_text(f"❌ \"{action[:30]}\" isn't a valid action. Choose nothing, delete, warn, mute, tmute, kick or ban.\n\n" + _NSFW_USAGE)
         return
-    secs = None
-    if action == "mute":
-        if len(args) != 2:
+    mode = action
+    if action in ("mute", "tmute"):
+        if len(args) > 2 or (action == "tmute" and len(args) != 2):
             await msg.reply_text("❌ Please give a duration, for example /protection mute 10m.\n\n" + _NSFW_USAGE)
             return
-        secs, err = parse_nsfw_duration(args[1])
-        if err:
-            await msg.reply_text("❌ " + err)
-            return
+        if len(args) == 2:  # a duration: 'mute 10m' and 'tmute 10m' both mean a timed mute
+            secs, err = parse_nsfw_duration(args[1])
+            if err:
+                await msg.reply_text("❌ " + err)
+                return
+            mode = f"tmute:{secs}"
+        else:
+            mode = "mute"  # permanent, exactly like /blocklistmode mute
     elif len(args) > 1:
         await msg.reply_text(f"❌ /protection {action} doesn't take anything after it.\n\n" + _NSFW_USAGE)
         return
     try:
-        if secs is not None:
-            _BD.set_setting(chat.id, NSFW_SECS_KEY, str(secs))
-        _BD.set_setting(chat.id, NSFW_ACTION_KEY, action)
+        _BD.set_setting(chat.id, BLOCKLIST_MODE_KEY, mode)  # the same key /blocklistmode writes
     except Exception:
         log.exception("NSFW: couldn't save the action in chat %s", chat.id)
         await msg.reply_text("⚠️ I couldn't save that right now, so nothing was changed. Please try again.")
         return
-    await msg.reply_html(f"✅ Protection action is now: <b>{_nsfw_summary(chat.id)}</b>.")
+    await msg.reply_html(f"✅ Action is now: <b>{_nsfw_summary(chat.id)}</b>.\n(Same as /blocklistmode.)")
 
 
 # ------------------------------------------------------------ the 🔞 Protection menu (same design as Ads Settings)
@@ -4479,11 +4499,12 @@ def _bl_nsfw_menu_screen():
     text = ("<b>🔞 Protection</b>\n\n"
             "Choose what to manage. Settings apply to this group only. Word and Content are separate "
             "switches.\n\n<b>⚖️ Action</b> (admins)\n\n"
-            "1. /protection: Show or set the action, for example /protection mute 10m\n\n"
+            "1. /protection: Show or set the action, for example /protection mute 10m\n"
+            "2. /blocklistmode: The same action as /protection. Change either one and the other matches.\n\n"
             "<b>✅ Allowed words</b> (admins)\n\n"
-            "2. /okword word: Allow a built-in bad word in this group.\n"
-            "3. /unokword word: Block it again.\n"
-            "4. /okwords: List the allowed words.")
+            "3. /okword word: Allow a built-in bad word in this group.\n"
+            "4. /unokword word: Block it again.\n"
+            "5. /okwords: List the allowed words.")
     rows = [[InlineKeyboardButton(NSFW_CATEGORIES[k][0], callback_data=f"bl:nc:{k}") for k in ("word", "content")],
             [InlineKeyboardButton("✅ Allowed Words", callback_data="bl:nw:n")],
             [InlineKeyboardButton("🔙 Back", callback_data="bl:menu")]]
@@ -4495,13 +4516,15 @@ def _bl_nsfw_category_screen(chat, key):
     on = _nsfw_on(chat.id, setting)
     cmds = ("<b>📖 Commands</b> (admins)\n"
             "/protection: Show or set the action, for example /protection mute 10m.\n"
-            "/addblocklist word: Block a word of your own.\n"
-            "/unblocklist word: Remove a blocklisted word.\n"
+            "/blocklistmode: The same action as /protection (both always match).\n"
+            "/addblocklist word: Block a word of your own (many at once are fine).\n"
+            "/unblocklist word: Remove blocklisted words (many at once are fine).\n"
             "/blocklist: List the blocklisted words.\n"
             "/okword word: Allow a built-in bad word in this group.\n"
             "/unokword word: Block it again.\n"
             "/okwords: List the allowed words.\n\n") if key == "word" else (
-            "<b>📖 Commands</b> (admins)\n/protection: Show or set the action, for example /protection mute 10m.\n\n")
+            "<b>📖 Commands</b> (admins)\n/protection: Show or set the action, for example /protection mute 10m.\n"
+            "/blocklistmode: The same action as /protection (both always match).\n\n")
     text = f"<b>{label} Settings</b>\n\n{cmds}{html.escape(desc)}\n\nStatus: {'🟢 ON' if on else '🔴 OFF'}"
     text += f"\nAction: {html.escape(_nsfw_summary(chat.id))}"
     toggle = (InlineKeyboardButton("🔴 Turn OFF", callback_data=f"bl:ns:{key}:0") if on
@@ -4815,55 +4838,39 @@ async def nsfw_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if exempt is None and await _BD.lock_exempt(chat, msg, user, context.bot.id):
         return  # admins, the owner, anonymous admins, approved users and the bot are exempt
-    action, secs = nsfw_punishment(chat.id)
-    log.info("NSFW: chat=%s kind=%s action=%s reason=%s", chat.id, kind, action, reason)
+    mode = nsfw_mode(chat.id)  # the ONE action, shared with /blocklistmode
+    own_word = reason == "blocklisted word"
+    if own_word and mode == "nothing":
+        return  # action "nothing": the group's own blocklist words do nothing (the built-in 18+ filter still deletes)
+    log.info("NSFW: chat=%s kind=%s mode=%s reason=%s", chat.id, kind, mode, reason)
     deleted = False
     try:
         await msg.delete()
         deleted = True
     except TelegramError as e:
         log.warning("NSFW: couldn't delete in chat %s: %s", chat.id, e)
-    punished = False
-    failed = False
-    if action != "delete" and msg.sender_chat is None and user.id not in (777000, context.bot.id):
-        try:
-            if action == "mute":
-                await chat.restrict_member(user.id, _BD.MUTED, until_date=int(time.time()) + secs)
-            elif action == "ban":
-                await chat.ban_member(user.id)
-            else:  # kick = remove, but they can rejoin
-                await chat.ban_member(user.id)
-                await chat.unban_member(user.id)
-            punished = True
-        except TelegramError as e:
-            failed = True
-            log.warning("NSFW: couldn't %s %s in chat %s: %s", action, user.id, chat.id, e)
     mention = user.mention_html() if msg.sender_chat is None else html.escape(
         getattr(msg.sender_chat, "title", None) or "that channel")
     label_why = "inappropriate language" if kind == "word" else "18+ content"
-    if deleted:
-        why = f"Protection rule: {reason} ({label_why})"
-        if punished:
-            label, punish = ACTION_LABEL[action], punishment_text(action, secs if action == "mute" else None)
-        else:
-            label, punish = ACTION_LABEL["delete"], punishment_text("delete")
-            if failed:
-                punish = f"Message deleted only. I couldn't {action} the user: please give me the 'Restrict members' admin right"
-        text = action_notice(mention, label, why, punish, chat_id=chat.id)
-    else:
-        text = None
-        if time.time() - _nsfw_notice.get(chat.id, 0) > 600:
+    punish_kind = mode.partition(":")[0]
+    punished = False
+    if punish_kind not in ("delete", "nothing") and msg.sender_chat is None and user.id not in (777000, context.bot.id):
+        if deleted or not own_word:  # an own word that couldn't be deleted is left to the blocklist handler in nova.py
+            why = f"Protection rule: {reason} ({label_why})"
+            # nova.py applies the action (warn / mute / timed mute / kick / ban) and builds the notice
+            text = await _BD.enforce(chat, user.id, mention, mode, why, "blocklist")
+            await _BD.announce(chat, text, user.id)
+            punished = bool(text)
+    if not deleted:
+        if not own_word and time.time() - _nsfw_notice.get(chat.id, 0) > 600:
             _nsfw_notice[chat.id] = time.time()
             text = ("⚠️ I spotted 18+ content but couldn't delete it. "
                     "Please give me the 'Delete messages' and 'Restrict members' admin rights.")
-    if text:
-        await track_notice(await _bl_send(context.bot, chat.id, text), bl_notice_secs(chat.id))  # stays 5h/10h/1d (group's choice)
-    if deleted:
-        await record_action(chat.id, user.id, mention, label, why, punish, category="protection")
-    if not deleted:
+            await track_notice(await _bl_send(context.bot, chat.id, text), bl_notice_secs(chat.id))
         return  # nothing was removed: let the other handlers run as usual
+    # action "delete" (or "nothing" for 18+): the message is removed silently, no notice in the group
     await _BD.log_action(chat, "spam", f"🔞 Protection ({kind}): deleted a message from {mention}"
-                         + (f" and applied: {action}." if punished else "."))
+                         + (f" and applied: {punish_kind}." if punished else "."))
     raise ApplicationHandlerStop
 
 
@@ -4880,8 +4887,8 @@ def register_blocking(app, deps):
     app.add_handler(CommandHandler("adpunish", adpunish_command, filters=filters.ChatType.GROUPS))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, bl_pending_input),
                     group=-6)  # -5..-1 are already used by nova.py; PTB runs only one handler per group
-    # "nsfw" is a hidden compatibility alias of /protection: same single handler, not shown in help or the "/" menu
-    app.add_handler(CommandHandler(["protection", "nsfw"], nsfw_command, filters=filters.ChatType.GROUPS))
+    # /blocklistmode is an alias of /protection (same single handler, same action). "nsfw" is a hidden old alias too.
+    app.add_handler(CommandHandler(["protection", "blocklistmode", "nsfw"], nsfw_command, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("okword", allowword_cmd, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("unokword", unallowword_cmd, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("okwords", allowedwords_cmd, filters=filters.ChatType.GROUPS))
