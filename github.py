@@ -1126,47 +1126,92 @@ async def giteditfile_cmd(update, context):
     await _say(msg, _t("gt.edit_ask", cid, path=html.escape(path), max=MAX_TEXT_INPUT))
 
 
-async def _put_file_direct(msg, bot, uid, token, q: str) -> bool:
-    """/gitput nova.py with no repo open: a name WITH an extension (.py .js .java ...) goes straight to the file. The repo
-    called like the file (nova) is looked at first, then the newest repos; it must be exactly one file in one repo.
-    False (so the normal way runs) for a name without extension, owner/repo, an exact repo name, or no single match."""
-    if "/" in q or q.startswith(("+", ".")) or not re.search(r"\.[A-Za-z0-9]{1,8}$", q):
-        return False
-    repos = await _run(api_all_repos, token)
-    if any(r.get("name", "").lower() == q.lower() for r in repos):          # it is a repo's name: open that repo
-        return False
-    stem = q.rsplit(".", 1)[0].lower()
-    first = [r for r in repos if r.get("name", "").lower() == stem]
-    others = [r for r in repos if r not in first][:8]
-    found = []
-    for group in (first, others):
-        for r in group:
-            rp = parse_repo(r.get("full_name", ""))
-            if rp is None:
-                continue
-            try:
-                tree, _cut = await _repo_files(token, rp[0], rp[1])
-            except GitError:
-                continue
-            hits = _match_file(list(tree), q)
-            if len(hits) == 1:
-                found.append((rp, hits[0]))
-        if found:
-            break
-    if len(found) != 1:
-        return False
-    (o, n), hit = found[0]
-    path = safe_path(hit)
-    if path is None:
-        return False
-    cid, full = msg.chat.id, f"{o}/{n}"
+async def _open_put_target(msg, bot, uid, token, full: str, path: str) -> None:
+    """Opens the repo, sends the current file as a backup and waits for the new version."""
+    o, n = full.split("/")
+    cid = msg.chat.id
     _inputs.pop(uid, None)
     _sel_set(uid, full)
     await _say(msg, _t("gt.in_now", cid, repo=html.escape(full)))
     await _send_current(bot, cid, token, o, n, path)
     _wait_for(uid, "upload", repo=full, path=path, pre=True)
     await _say(msg, _t("gt.upload_ask", cid, path=html.escape(path), mb=MAX_SINGLE // MB))
+
+
+def _put_options_text(cid, name: str, options: list) -> str:
+    """The list of repos that hold the file (or, when one repo holds it in several folders, the paths)."""
+    if len({o["repo"] for o in options}) == 1:
+        return _t("gt.pf_paths", cid, name=html.escape(name), repo=html.escape(options[0]["repo"]),
+                  list=_code_list([o["path"] for o in options]))
+    lines, seen = [], set()
+    for o in options:
+        if o["repo"] in seen:
+            continue
+        seen.add(o["repo"])
+        lines.append(_repo_line(o["info"]))
+    return _t("gt.pf_many", cid, name=html.escape(name), list="\n".join(lines))
+
+
+def _pick_put_options(options: list, text: str) -> list:
+    """What the person typed -> the options it points to: repo name, owner/repo, a path, or part of a repo name."""
+    t = text.strip().strip("/").lower()
+    exact = [o for o in options if t in (o["repo"].lower(), o["repo"].split("/")[1].lower(), o["path"].lower())]
+    if exact:
+        return exact
+    tn = _norm(text)
+    return [o for o in options if tn and (tn in _norm(o["repo"].split("/")[1]) or tn == _norm(o["path"]))]
+
+
+async def _put_file_direct(msg, bot, uid, token, q: str) -> bool:
+    """/gitput nova.py with no repo open: a name WITH an extension (.py .js .java ...) goes straight to the file.
+    One repo has it: opened. Several repos have it: the person types the repo name. None has it: a clear message.
+    False (so the normal way runs) for a name without extension, owner/repo, +newfile, or the exact name of a repo."""
+    if "/" in q or q.startswith(("+", ".")) or not re.search(r"\.[A-Za-z0-9]{1,8}$", q):
+        return False
+    cid = msg.chat.id
+    repos = await _run(api_all_repos, token)
+    if any(r.get("name", "").lower() == q.lower() for r in repos):          # it is a repo's name: open that repo
+        return False
+    stem = q.rsplit(".", 1)[0].lower()
+    writable = [r for r in repos if (r.get("permissions") or {}).get("push")]
+    first = [r for r in writable if r.get("name", "").lower() == stem]       # the repo called like the file counts too
+    cands = first + [r for r in writable if r not in first][:AUTO_REPOS]
+    trees = await asyncio.gather(*[_run(_tree_paths, token, r) for r in cands])
+    options = []
+    for r, paths in zip(cands, trees):
+        for hit in _match_file(list(paths), q):
+            clean = safe_path(hit)
+            if clean and parse_repo(r.get("full_name", "")):
+                options.append({"repo": r["full_name"], "path": clean, "info": r})
+    if not options:
+        _inputs.pop(uid, None)
+        await _say(msg, _t("gt.pf_none", cid, name=html.escape(q)))
+        return True
+    if len(options) == 1:
+        await _open_put_target(msg, bot, uid, token, options[0]["repo"], options[0]["path"])
+        return True
+    _wait_for(uid, "putrepo", name=q, options=options)
+    await _say(msg, _put_options_text(cid, q, options))
     return True
+
+
+async def _got_putrepo(msg, bot, uid, token, want) -> None:
+    """The person typed which repo (or path) to use for the file that exists in several places."""
+    cid = msg.chat.id
+    text = (msg.text or "").strip()[:200]
+    if not text:
+        return
+    options, name = want["options"], want["name"]
+    hits = _pick_put_options(options, text)
+    if not hits:
+        _wait_for(uid, "putrepo", name=name, options=options)
+        await _say(msg, _t("gt.pf_nomatch", cid, q=html.escape(text)) + "\n\n" + _put_options_text(cid, name, options))
+        return
+    if len(hits) > 1:
+        _wait_for(uid, "putrepo", name=name, options=hits)
+        await _say(msg, _put_options_text(cid, name, hits))
+        return
+    await _open_put_target(msg, bot, uid, token, hits[0]["repo"], hits[0]["path"])
 
 
 @_guarded
@@ -1203,15 +1248,18 @@ async def gituploadfile_cmd(update, context):
         if exact:
             await _enter_repo(msg, context.bot, uid, token, exact[0], "put")
             return
-    if inside and not text.startswith("+"):                     # a file name: the one file it points to, else a new file
-        tree, _cut = await _repo_files(token, o, n)
+    if not text.startswith("+"):                                # a file name: it must be a file that already exists
+        tree, cut = await _repo_files(token, o, n)
         hits = _match_file(list(tree), text)
         if len(hits) > 1:
             await _say(msg, _t("gt.fl_many", cid, list=_code_list(hits)))
             return
+        if not hits and not cut:                                # new files are only created with +filename
+            await _say(msg, _t("gt.pf_none_in", cid, name=html.escape(text[:100]), repo=html.escape(full)))
+            return
         path = safe_path(hits[0] if hits else text)
     else:
-        path = safe_path(text[1:].strip() if text.startswith("+") else text)
+        path = safe_path(text[1:].strip())
     if path is None:
         await _say(msg, _t("gt.bad_path", cid))
         return
@@ -1660,7 +1708,7 @@ async def git_input(update, context):
     if not msg or not user or not chat or chat.type != "private":
         return
     want = _inputs.get(user.id)
-    if want and want["kind"] in ("getfiles", "pickfile", "pickrepo", "selrepo") and msg.document is not None:
+    if want and want["kind"] in ("getfiles", "pickfile", "pickrepo", "selrepo", "putrepo") and msg.document is not None:
         # a file sent while a list or a name is being asked for is an upload: replace the file with the same name
         if want["kind"] == "pickfile" and want.get("repo"):
             _sel_set(user.id, want["repo"])                         # look only in the repo they were just working in
@@ -1698,7 +1746,9 @@ async def git_input(update, context):
             await _choose_sel(msg, context.bot, user.id, token, msg.text.strip()[:100], want.get("then", ""))
         elif kind == "getfiles" and msg.text:
             await _got_getfiles(msg, context.bot, user.id, token, want)
-        elif kind in ("pickrepo", "pickfile", "visrepo", "selrepo", "getfiles"):
+        elif kind == "putrepo" and msg.text:
+            await _got_putrepo(msg, context.bot, user.id, token, want)
+        elif kind in ("pickrepo", "pickfile", "visrepo", "selrepo", "getfiles", "putrepo"):
             await _say(msg, _t("gt.send_name", cid))
         elif kind in ("upload", "pushzip"):
             await _say(msg, _t("gt.send_file", cid))
@@ -2831,4 +2881,19 @@ TEXTS_HI.update({
     "gt.update_unset": "⚠️ /gitupdate abhi set up nahi hai. Bot owner ko server par GIT_UPDATE_REPO set karna hoga.",
     "gt.how": "<b>📖 Guide</b>\n\n1️⃣ <b>GitHub jodo:</b> /gittoken <code>yourtoken</code> bhejo (token guide dekho).\n2️⃣ <b>Repo kholo:</b> /gitrepo bhejo, phir repo ka naam. Main yaad rakhta hoon, aur har reply mein 📂 dikhta hai ki tum kahan ho.\n3️⃣ <b>Files dekho:</b> /gitls bhejo. Numbered list milegi. Number bhejo jaise <code>2</code>, ya kai jaise <code>1 3 5</code>, to main wo files document mein bhej dunga. /gitzip poori repo ZIP mein deta hai.\n4️⃣ <b>Files replace karo:</b> bas ek ya kai files bhej do. Repo mein bilkul same naam ki file purani ko replace karti hai. Main list dikhakar ek baar poochta hoon.\n5️⃣ <b>Repo ke andar aur kaam:</b> /gitget <code>nova.py</code> download, /gitput <code>nova.py</code> upload, /gitedit <code>nova.py</code> edit, /gitdel <code>nova.py</code> delete.\n6️⃣ <b>Poora project bhejo:</b> /gitpush bhejo, phir ZIP.\n\n/gitcancel kisi bhi step ko rokta hai aur repo se bahar nikalta hai.",
     "gt.cmds": "<b>⌨️ Saari commands</b>\nNeeli command dabao to chalegi. Grey example dabao to copy hoga.\n\n<b>Yahan se shuru karo</b>\n/git yeh GitHub menu kholo\n/gittoken <code>yourtoken</code> apna GitHub jodo\n/gitrepo wo repo kholo jisme kaam karna hai. Uske baad sirf file ka naam likhna hai.\n\n<b>Repos aur files dekho</b>\n/gitrepos tumhari repos\n/gitls repo ki files, numbered list mein. Number bhejo to wo file mil jayegi\n/gitls <code>src</code> ek folder ki files\n/gitinfo <code>novabot</code> repo ki details\n\n<b>Download</b>\n/gitget <code>nova.py</code> file yahan bhejo (kai naam: ek line mein ek)\n/gitzip poori repo ZIP mein\n\n<b>Files badlo</b>\n📎 Bas ek ya kai files bhej do: bilkul same naam ki files purani ko replace karti hain\n/gitput <code>nova.py</code> ek file upload ya replace\n/gitedit <code>nova.py</code> text file edit\n/gitdel <code>nova.py</code> file delete (pehle poochta hoon)\n/gitpush apne project ka ZIP GitHub par bhejo\n\n<b>Repos</b>\n/gitnew <code>mybot</code> private repo banao (public ke liye <code>public</code> jodo)\n/gitvis <code>novabot</code> repo public ya private karo\n/gitdelrepo <code>yourname/novabot</code> repo delete karo\n\n<b>Aur</b>\n/gitstatus connection check karo\n/gitoff apna GitHub hatao\n/gitundo apna aakhri badlav wapas lo (main aakhri 10 rakhta hoon)\n/gitcancel step rokho aur repo se bahar niklo\n/gitupdate bot ko update karo (sirf bot owner)",
+})
+
+TEXTS_EN.update({
+    "gt.pf_none": "❌ No file named <code>{name}</code> was found in your repos.\n\nTo add it as a new file, open a repo with /gitrepo, then send /gitput <code>+{name}</code>.",
+    "gt.pf_none_in": "❌ No file named <code>{name}</code> in <b>{repo}</b>.\n\nSend /gitls to see the file names. To add it as a new file, send /gitput <code>+{name}</code>.",
+    "gt.pf_many": "📎 <code>{name}</code> is in more than one repo:\n\n{list}\n\n✏️ Send the name of the repo that has {name}, for example <code>novabot</code>. /gitcancel to stop.",
+    "gt.pf_paths": "📎 <code>{name}</code> is in several places in <b>{repo}</b>. Send the full path:\n\n{list}\n\n/gitcancel to stop.",
+    "gt.pf_nomatch": "❌ None of these is like <code>{q}</code>.",
+})
+TEXTS_HI.update({
+    "gt.pf_none": "❌ Tumhari repos mein <code>{name}</code> naam ki koi file nahi mili.\n\nNayi file ke roop mein jodne ke liye /gitrepo se repo kholo, phir /gitput <code>+{name}</code> bhejo.",
+    "gt.pf_none_in": "❌ <b>{repo}</b> mein <code>{name}</code> naam ki koi file nahi hai.\n\nFile ke naam dekhne ke liye /gitls bhejo. Nayi file jodne ke liye /gitput <code>+{name}</code> bhejo.",
+    "gt.pf_many": "📎 <code>{name}</code> ek se zyada repo mein hai:\n\n{list}\n\n✏️ Jis repo mein {name} hai uska naam bhejo, jaise <code>novabot</code>. Rokne ke liye /gitcancel.",
+    "gt.pf_paths": "📎 <code>{name}</code> <b>{repo}</b> mein kai jagah hai. Poora path bhejo:\n\n{list}\n\nRokne ke liye /gitcancel.",
+    "gt.pf_nomatch": "❌ In mein se koi <code>{q}</code> jaisa nahi hai.",
 })
