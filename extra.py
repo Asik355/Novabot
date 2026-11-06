@@ -3646,7 +3646,7 @@ BLOCK_CATEGORIES = {
 _BL_EXTRA_BUTTONS = {  # extra rows on a category screen
     "promo": [[InlineKeyboardButton("⭐ Authorized Promotions", callback_data="bl:auth")]],
 }
-BL_MENU_TEXT = ("<b>🔒 Ads &amp; NSFW</b>\n\n"
+BL_MENU_TEXT = ("<b>🔒 Protect Group</b>\n\n"
                 "Choose what to manage. Settings apply to this group only.\n\n"
                 "<b>⚖️ Punishment for ads &amp; promotion</b> (admins)\n\n"
                 "1. /adpunish: Set the punishment for ads and promotion in this group, "
@@ -3671,7 +3671,7 @@ _BL_CATEGORY_CMDS = {  # "📖 Commands" footer of the Ads / Promotion screens (
 
 def blocking_menu_button():
     """The '🔒 Blocking' button for the main /help menu."""
-    return InlineKeyboardButton("🔒 Ads & NSFW", callback_data="bl:menu")
+    return InlineKeyboardButton("🔒 Protect Group", callback_data="bl:menu")
 
 
 def _bl_menu_screen():
