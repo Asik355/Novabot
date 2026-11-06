@@ -1126,6 +1126,49 @@ async def giteditfile_cmd(update, context):
     await _say(msg, _t("gt.edit_ask", cid, path=html.escape(path), max=MAX_TEXT_INPUT))
 
 
+async def _put_file_direct(msg, bot, uid, token, q: str) -> bool:
+    """/gitput nova.py with no repo open: a name WITH an extension (.py .js .java ...) goes straight to the file. The repo
+    called like the file (nova) is looked at first, then the newest repos; it must be exactly one file in one repo.
+    False (so the normal way runs) for a name without extension, owner/repo, an exact repo name, or no single match."""
+    if "/" in q or q.startswith(("+", ".")) or not re.search(r"\.[A-Za-z0-9]{1,8}$", q):
+        return False
+    repos = await _run(api_all_repos, token)
+    if any(r.get("name", "").lower() == q.lower() for r in repos):          # it is a repo's name: open that repo
+        return False
+    stem = q.rsplit(".", 1)[0].lower()
+    first = [r for r in repos if r.get("name", "").lower() == stem]
+    others = [r for r in repos if r not in first][:8]
+    found = []
+    for group in (first, others):
+        for r in group:
+            rp = parse_repo(r.get("full_name", ""))
+            if rp is None:
+                continue
+            try:
+                tree, _cut = await _repo_files(token, rp[0], rp[1])
+            except GitError:
+                continue
+            hits = _match_file(list(tree), q)
+            if len(hits) == 1:
+                found.append((rp, hits[0]))
+        if found:
+            break
+    if len(found) != 1:
+        return False
+    (o, n), hit = found[0]
+    path = safe_path(hit)
+    if path is None:
+        return False
+    cid, full = msg.chat.id, f"{o}/{n}"
+    _inputs.pop(uid, None)
+    _sel_set(uid, full)
+    await _say(msg, _t("gt.in_now", cid, repo=html.escape(full)))
+    await _send_current(bot, cid, token, o, n, path)
+    _wait_for(uid, "upload", repo=full, path=path, pre=True)
+    await _say(msg, _t("gt.upload_ask", cid, path=html.escape(path), mb=MAX_SINGLE // MB))
+    return True
+
+
 @_guarded
 async def gituploadfile_cmd(update, context):
     g = await _gate(update)
@@ -1137,7 +1180,9 @@ async def gituploadfile_cmd(update, context):
     tgt = _target(uid, args)
     if not tgt:                                                 # no repo open yet: pick one first
         if args:
-            await _choose_sel(msg, context.bot, uid, token, args[0][:100], "put")
+            if await _put_file_direct(msg, context.bot, uid, token, args[0][:100]):   # nova.py: the file itself
+                return
+            await _choose_sel(msg, context.bot, uid, token, args[0][:100], "put")     # nova: the repo first
         else:
             await _ask_repo(msg, uid, token, "put")
         return
@@ -1152,6 +1197,12 @@ async def gituploadfile_cmd(update, context):
         await _say(msg, _t("gt.put_ask", cid))
         return
     text = rest[0]
+    if inside and not text.startswith(("+", ".")) and "." not in text and "/" not in text:
+        repos = await _run(api_all_repos, token)                # a name without an extension ("nova") that is one of the
+        exact = [r for r in repos if r.get("name", "").lower() == text.lower()]   # repos: open that repo first (nova.py = the file)
+        if exact:
+            await _enter_repo(msg, context.bot, uid, token, exact[0], "put")
+            return
     if inside and not text.startswith("+"):                     # a file name: the one file it points to, else a new file
         tree, _cut = await _repo_files(token, o, n)
         hits = _match_file(list(tree), text)

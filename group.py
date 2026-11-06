@@ -7752,8 +7752,10 @@ async def _unpin_round(bot):
 # and handed back as they were. With a time (/adminonly 20m) the 30-second loop ends it by itself; without one it lasts
 # until /adminonly off. Auto Close and Night Mode leave the group alone while it is on. The bot needs "Ban users".
 # Settings per group: adminonly_state = "on", adminonly_until = end time in epoch seconds (0 = until /adminonly off),
-# adminonly_saved = the permissions to give back ("night", "default", JSON, or "" = nothing to give back).
+# adminonly_saved = the permissions to give back ("night", "default", JSON, or "" = nothing to give back),
+# adminonly_pin = the id of the message the bot pinned when it went on (it is unpinned again when it goes off).
 AO_KEY, AO_SAVED_KEY, AO_UNTIL_KEY = "adminonly_state", "adminonly_saved", "adminonly_until"
+AO_PIN_KEY = "adminonly_pin"
 
 
 def adminonly_info(chat_id):
@@ -7784,7 +7786,18 @@ async def adminonly_on(bot, chat_id, secs=None):
             return False
         D.set_setting(chat_id, AO_SAVED_KEY, saved)
         D.set_setting(chat_id, AO_KEY, "on")
+        newly_on = True
+    else:
+        newly_on = False
     D.set_setting(chat_id, AO_UNTIL_KEY, int(time.time()) + int(secs) if secs else 0)
+    if newly_on:                                                            # a pinned reminder, so nobody forgets it is on
+        try:
+            sent = await bot.send_message(chat_id, "🔒 <b>Admin only is ON.</b> Only admins can write right now.\n"
+                                                   "<i>This message is unpinned when it is over.</i>", parse_mode="HTML")
+            await bot.pin_chat_message(chat_id, sent.message_id, disable_notification=True)    # quietly
+            D.set_setting(chat_id, AO_PIN_KEY, str(sent.message_id))
+        except TelegramError as e:                                          # no "Pin messages" right: it is still on
+            log.debug("admin only: couldn't send or pin the message in %s: %s", chat_id, e)
     return True
 
 
@@ -7811,9 +7824,16 @@ async def adminonly_off(bot, chat_id, announce=False):
         except TelegramError as e:
             log.warning("admin only: couldn't open %s: %s", chat_id, e)
             return False                                                    # stays on: the loop tries again
+    raw = D.get_setting(chat_id, AO_PIN_KEY, "") or ""                      # unpin only the message this bot pinned
+    if str(raw).isdigit():
+        try:
+            await bot.unpin_chat_message(chat_id, message_id=int(raw))
+        except TelegramError as e:                                          # already unpinned or deleted, or no right
+            log.debug("admin only: couldn't unpin the message in %s: %s", chat_id, e)
     store.del_setting(chat_id, AO_KEY)
     store.del_setting(chat_id, AO_SAVED_KEY)
     store.del_setting(chat_id, AO_UNTIL_KEY)
+    store.del_setting(chat_id, AO_PIN_KEY)
     if announce:
         try:
             await bot.send_message(chat_id, "🔓 <b>Admin only is over.</b> Everyone can write again.", parse_mode="HTML")
