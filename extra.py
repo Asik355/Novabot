@@ -752,6 +752,153 @@ async def ai_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ask_engine(update, context, msg.text.strip(), prev=previous, chat=True)
 
 
+# ------------------------------------------------------------ /chat, /sleep and calling the bot by name
+# A member who sends /chat (or says the bot's CURRENT name) starts a chat session in that group: the bot answers their
+# plain messages without them replying to it, until /sleep or CHAT_IDLE_SECS of silence from that member. Sessions are
+# per member and per group, so nobody else is affected. Messages aimed at other people (a reply to someone else, a tag
+# of another member, a link, a forward) are left alone.
+CHAT_IDLE_SECS = 10 * 60
+_chat_sessions = {}  # (chat_id, user_id) -> monotonic time of the member's last chat message
+_NAME_STOPWORDS = frozenset({"the", "and", "bot", "miss", "mrs", "official", "group", "manager", "admin"})
+
+
+def _chat_active(chat_id, user_id) -> bool:
+    key = (chat_id, user_id)
+    last = _chat_sessions.get(key)
+    if last is None:
+        return False
+    if time.monotonic() - last > CHAT_IDLE_SECS:
+        _chat_sessions.pop(key, None)  # fell asleep by itself
+        return False
+    return True
+
+
+def _chat_touch(chat_id, user_id):
+    now = time.monotonic()
+    if len(_chat_sessions) > 5000:  # keep the dict small
+        for k in [k for k, t in _chat_sessions.items() if now - t > CHAT_IDLE_SECS]:
+            _chat_sessions.pop(k, None)
+    _chat_sessions[(chat_id, user_id)] = now
+
+
+def _name_words():
+    """Words of the bot's CURRENT Telegram display name (never a fixed name): 'Satoru Gojo' -> {'satoru', 'gojo'}."""
+    full = f"{_IDENTITY.get('name', '')} {_IDENTITY.get('last_name', '')}"
+    return {w.lower() for w in re.findall(r"[^\W\d_]{3,}", full)} - _NAME_STOPWORDS
+
+
+def _name_called(text) -> bool:
+    """True when the text says the bot's current name (whole word, any capitals) or its @username."""
+    text = text or ""
+    uname = (_IDENTITY.get("username") or "").lower()
+    if uname and re.search(r"(?<!\w)@" + re.escape(uname) + r"(?!\w)", text, re.I):
+        return True
+    words = _name_words()
+    if not words:
+        return False
+    pattern = r"(?<!\w)(?:" + "|".join(sorted((re.escape(w) for w in words), key=len, reverse=True)) + r")(?!\w)"
+    return re.search(pattern, text, re.I) is not None
+
+
+def _chat_lang_rule(chat_id) -> str:
+    """Reply in the language the member writes; when unclear use the group's /lang setting (English or Hinglish)."""
+    default = _chat_lang_default(chat_id)
+    return ("\n\nLANGUAGE RULE (this overrides any language or style mentioned above): reply in the same language and "
+            "script the user's latest message is written in. English: reply in English. Hinglish (Hindi written in "
+            "Roman letters, like 'kya kar rahi ho'): reply in Hinglish. Hindi in Devanagari: reply in Hindi "
+            "(Devanagari). Any other language: reply in that language. If the language is unclear (a very short "
+            f"message like 'ok' or an emoji), keep the language of the recent conversation, or {default} if there is "
+            "none. Keep the same casual persona and short replies in every language.")
+
+
+def _chat_entities(msg):
+    """(has_link, tags_someone_else) for a text message."""
+    has_link = tags_other = False
+    me = (_IDENTITY.get("username") or "").lower()
+    for e in msg.entities or ():
+        kind = str(getattr(e.type, "value", e.type))
+        if kind in ("url", "text_link", "email"):
+            has_link = True
+        elif kind == "mention":
+            try:
+                tagged = msg.parse_entity(e).lstrip("@").lower()
+            except Exception:
+                tagged = ""
+            if tagged != me:
+                tags_other = True
+        elif kind == "text_mention" and getattr(e, "user", None) is not None and e.user.id != _IDENTITY.get("id"):
+            tags_other = True
+    return has_link, tags_other
+
+
+async def ai_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Plain group text: answers a member in a chat session, or anyone who calls the bot by its current name."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not msg.text or not user or user.is_bot or chat is None or chat.type == "private":
+        return
+    if getattr(msg, "forward_origin", None) or getattr(msg, "forward_date", None):
+        return  # forwards are never answered
+    reply = msg.reply_to_message
+    if reply and reply.from_user and reply.from_user.id == context.bot.id:
+        return  # a reply to the bot is already handled by ai_reply_handler
+    await refresh_identity(context.bot)  # the CURRENT name, so a rename works at once
+    has_link, tags_other = _chat_entities(msg)
+    called = _name_called(msg.text) and not has_link
+    if not called:
+        if not _chat_active(chat.id, user.id):
+            return
+        if reply is not None or tags_other or has_link:
+            return  # talking to someone else: stay quiet, the session stays open
+    _chat_touch(chat.id, user.id)  # calling the name wakes the bot just like /chat
+    await ask_engine(update, context, msg.text.strip(), chat=True, quiet=not called)
+
+
+async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/chat: wake the bot for this member, so they can talk without replying to its messages."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user:
+        return
+    if chat.type == "private":
+        await msg.reply_text("Use this command in a group. Here in private, just message me.")
+        return
+    _chat_touch(chat.id, user.id)
+    mins = CHAT_IDLE_SECS // 60
+    if _chat_lang_default(chat.id) == "Hinglish":
+        text = (f"💬 Main jaag gayi! Ab mujhse seedha baat karo, mere msg ko reply karne ki zarurat nahi. "
+                f"Jab baat khatam ho to /sleep bhej dena (ya {mins} minute kuch na bolo to main so jaungi).")
+    else:
+        text = (f"💬 I'm awake! Talk to me directly, no need to reply to my messages. "
+                f"Send /sleep when you're done (I also fall asleep after {mins} minutes of silence from you).")
+    _remember_ai_message(await msg.reply_text(text))
+
+
+def _chat_lang_default(chat_id) -> str:
+    try:
+        return "English" if str(_BD.get_setting(chat_id, "lang", "en") or "en").lower().startswith("en") else "Hinglish"
+    except Exception:
+        return "Hinglish"
+
+
+async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sleep: end this member's chat session."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user:
+        return
+    if chat.type == "private":
+        await msg.reply_text("Use this command in a group.")
+        return
+    was_awake = _chat_active(chat.id, user.id)
+    _chat_sessions.pop((chat.id, user.id), None)
+    hinglish = _chat_lang_default(chat.id) == "Hinglish"
+    if was_awake:
+        text = ("😴 Okay, main so rahi hu. Dobara baat karni ho to /chat bhejo ya mera naam lo." if hinglish
+                else "😴 Okay, going to sleep. Send /chat or call my name to wake me up.")
+    else:
+        text = ("😴 Main to pehle se so rahi hu. Jagane ke liye /chat bhejo ya mera naam lo." if hinglish
+                else "😴 I'm already asleep for you. Send /chat or call my name to wake me up.")
+    await msg.reply_text(text)
+
+
 # =====================================================================
 #  AI ENGINES (rebuilt from scratch): ASK ENGINE, SEARCH ENGINE, IMAGE ENGINE
 #
@@ -1680,7 +1827,8 @@ def _friend_remember(chat_id, user_id, query, answer, chat=False):
         _friend_memory.popitem(last=False)
 
 
-async def ask_engine(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str, prev: str = "", chat: bool = False):
+async def ask_engine(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str, prev: str = "", chat: bool = False,
+                     quiet: bool = False):
     msg, user = update.effective_message, update.effective_user
     await refresh_identity(context.bot)  # always the CURRENT Telegram name / username
     query = _first_command_only(query) or query
@@ -1697,7 +1845,8 @@ async def ask_engine(update: Update, context: ContextTypes.DEFAULT_TYPE, query: 
         return
     left = _cooldown_left(user.id) if user else 0
     if left:
-        await msg.reply_text(f"Easy there! Try again in {int(left) + 1}s.")
+        if not quiet:  # quiet = a /chat session message that may not even be meant for the bot: no "Easy there"
+            await msg.reply_text(f"Easy there! Try again in {int(left) + 1}s.")
         return
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
@@ -1707,7 +1856,7 @@ async def ask_engine(update: Update, context: ContextTypes.DEFAULT_TYPE, query: 
         await _search_flow(msg, plan.intent, "", "ASK")
         return
     chat_id, uid = update.effective_chat.id, (user.id if user else 0)
-    prompt = ((_CHAT_RULES if chat else _ASK_NORMAL_RULES) + _friend_history(chat_id, uid, chat)
+    prompt = (((_CHAT_RULES + _chat_lang_rule(chat_id)) if chat else _ASK_NORMAL_RULES) + _friend_history(chat_id, uid, chat)
               + (f"\n\nYour previous message (the user is replying to it):\n{prev[:2000]}" if prev else "")
               + f"\n\nUser: {query}")
     token = _CHAT_MODE.set(bool(chat))
@@ -2299,6 +2448,8 @@ async def say_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 AI_HELP_LINES = [
     "/ai: Open the AI Commands menu.",
     "/ask: Ask the AI anything.",
+    "/chat: Wake the bot to chat with you without replying to its messages (also works if you say its name).",
+    "/sleep: End your chat with the bot (it also sleeps after 10 minutes of silence from you).",
     "/imagine: Generate an AI image from a prompt.",
     "/search: Live web search for a topic, year or date (answers only from verified results).",
     "/translate: Translate text into Hindi and English.",
@@ -2629,6 +2780,10 @@ def register_ai(app):
         MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, ai_reply_handler),
         group=1,
     )
+    # /chat and /sleep, and calling the bot by name. group=2 is a group of its own, so it runs next to the reply chat above.
+    app.add_handler(CommandHandler("chat", chat_command))
+    app.add_handler(CommandHandler("sleep", sleep_command))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, ai_chat_handler), group=2)
 
 # =============================================================================
 #  BLOCKING  (Auto-Ads blocker, Promotion blocker and the 🔒 Blocking help menu)
