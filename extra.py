@@ -976,13 +976,21 @@ def _mem_prompt(chat_id) -> str:
     return "\n".join(out)
 
 
+def _mem_is_owner(user_id) -> bool:
+    """The bot owner by ID (OWNER_IDS). Not tied to /power: Owner Power is OFF by default and would lock the owner out."""
+    try:
+        return user_id in (getattr(_BD, "owner_ids", None) or ()) or bool(_BD.is_bot_owner(user_id))
+    except Exception:
+        return False
+
+
 async def _mem_perm(chat, user, scope):
     """(allowed, reason): global = bot owner only; group = an admin of THIS group, the bot owner or Bot Staff."""
     if scope == "G":
-        return bool(_BD.is_bot_owner(user.id)), "🔒 Only the bot owner can manage global memories."
+        return _mem_is_owner(user.id), "🔒 Only the bot owner can manage global memories."
     if chat.type == "private":
         return False, "Open /ai inside a group to manage that group's memories."
-    return bool(await _bl_can_manage(chat, user.id)), "🔒 Only group admins can manage memories."
+    return (_mem_is_owner(user.id) or bool(await _bl_can_manage(chat, user.id))), "🔒 Only group admins can manage memories."
 
 
 def _mem_add(scope, chat, text):
@@ -1031,10 +1039,32 @@ def _mem_remove(scope, chat, ref):
     return "Removed: " + gone.split("\n")[0][:60]
 
 
-def _mem_numbered(items, limit=150):
+def _mem_numbered(items, limit=150, prefix=""):
     """A short one-line preview of every note (new lines shown as ' / ')."""
     flat = [t.replace("\n", " / ") for t in items]
-    return "\n".join(f"{i}. {html.escape(t if len(t) <= limit else t[:limit - 1] + '…')}" for i, t in enumerate(flat, 1))
+    return "\n".join(f"{prefix}{i}. {html.escape(t if len(t) <= limit else t[:limit - 1] + '…')}"
+                     for i, t in enumerate(flat, 1))
+
+
+async def _mem_view_rights(chat, user):
+    """(can edit this group's notes, can edit global notes). Group admins may also SEE the global notes (read-only)."""
+    can_G = _mem_is_owner(user.id)
+    can_g = chat.type != "private" and (await _mem_perm(chat, user, "g"))[0]
+    return can_g, can_G
+
+
+def _mem_all_text(chat, can_g, can_G, limit=80):
+    """Global notes and this group's notes in one list (G1, G2 ... for global, 1, 2 ... for the group)."""
+    parts = []
+    if can_g or can_G:
+        glob = _mem_load(0, MEM_KEY_GLOBAL)
+        parts.append(f"<b>🌍 Global</b> ({len(glob)}/{MEM_MAX})" + ("" if can_G else " (read-only)") + "\n"
+                     + (_mem_numbered(glob, limit, "G") if glob else "No notes yet."))
+    if chat.type != "private":
+        grp = _mem_load(chat.id, MEM_KEY_GROUP)
+        parts.append(f"<b>👥 This group</b> ({len(grp)}/{MEM_MAX})\n"
+                     + (_mem_numbered(grp, limit) if grp else "No notes yet."))
+    return "\n\n".join(parts)
 
 
 async def _mem_command(update, context, scope, action):
@@ -1100,22 +1130,46 @@ def _mem_main_screen():
             "When someone asks me, I answer from your notes.\n\n"
             "• 👥 <b>Group</b>: notes for this group (admins)\n"
             "• 🌍 <b>Global</b>: notes for every group (bot owner)\n"
+            "• 📋 <b>All</b>: every note in one list, add and remove\n"
             "• ⌨️ <b>Command</b>: all memory commands")
     rows = [[InlineKeyboardButton("👥 Group", callback_data="ai:mem:g"),
              InlineKeyboardButton("🌍 Global", callback_data="ai:mem:G")],
-            [InlineKeyboardButton("⌨️ Command", callback_data="ai:mem:c")],
+            [InlineKeyboardButton("📋 All", callback_data="ai:mem:a"),
+             InlineKeyboardButton("⌨️ Command", callback_data="ai:mem:c")],
             [InlineKeyboardButton("« Back", callback_data="ai:menu")]]
     return text, InlineKeyboardMarkup(rows)
 
 
-def _mem_list_screen(chat, scope):
+def _mem_sub_screen(chat, scope):
+    """👥 Group / 🌍 Global: a small menu with Memories (the list), Add and Remove."""
+    cid, key, title = _mem_target(chat, scope)
+    n = len(_mem_load(cid, key))
+    where = "this group only" if scope == "g" else "every group"
+    text = f"<b>{title}</b>\n\nNotes for {where} ({n}/{MEM_MAX}).\n\nChoose what to do:"
+    rows = [[InlineKeyboardButton("📋 Memories", callback_data=f"ai:mem:l:{scope}")],
+            [InlineKeyboardButton("➕ Add", callback_data=f"ai:mem:add:{scope}"),
+             InlineKeyboardButton("🗑 Remove", callback_data=f"ai:mem:r:{scope}")],
+            [_mem_back()]]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _mem_view_screen(chat, scope):
+    """📋 Memories: the list of notes (view only)."""
     cid, key, title = _mem_target(chat, scope)
     items = _mem_load(cid, key)
-    where = "this group only" if scope == "g" else "every group"
-    head = f"<b>{title}</b>\n\nNotes for {where} ({len(items)}/{MEM_MAX})."
-    body = (_mem_numbered(items) + "\n\nTap 🗑 and a number to remove a note.") if items else (
-        "No notes yet. Tap ➕ Add and send your first note, for example "
+    pre = "g" if scope == "G" else ""
+    body = (_mem_numbered(items) + f"\n\nSend /{pre}mems &lt;number&gt; to see a whole note.") if items else (
+        "No notes yet. Tap « Back, then ➕ Add, and send your first note, for example "
         "<code>My favourite anime is Bleach</code>.")
+    return f"<b>{title}</b> ({len(items)}/{MEM_MAX})\n\n{body}", InlineKeyboardMarkup([[_mem_back(f"ai:mem:{scope}")]])
+
+
+def _mem_list_screen(chat, scope):
+    """🗑 Remove: every note with a 🗑 button, and 🧹 Clear all."""
+    cid, key, title = _mem_target(chat, scope)
+    items = _mem_load(cid, key)
+    head = f"<b>{title}: Remove</b>\n\n({len(items)}/{MEM_MAX})"
+    body = (_mem_numbered(items) + "\n\nTap 🗑 and a number to remove a note.") if items else "No notes to remove."
     rows, cur = [], []
     for i, t in enumerate(items, 1):
         cur.append(InlineKeyboardButton(f"🗑 {i}", callback_data=f"ai:mem:del:{scope}:{zlib.crc32(t.encode()):08x}"))
@@ -1124,11 +1178,9 @@ def _mem_list_screen(chat, scope):
             cur = []
     if cur:
         rows.append(cur)
-    last = [InlineKeyboardButton("➕ Add", callback_data=f"ai:mem:add:{scope}")]
     if items:
-        last.append(InlineKeyboardButton("🧹 Clear all", callback_data=f"ai:mem:clr:{scope}"))
-    rows.append(last)
-    rows.append([_mem_back()])
+        rows.append([InlineKeyboardButton("🧹 Clear all", callback_data=f"ai:mem:clr:{scope}")])
+    rows.append([_mem_back(f"ai:mem:{scope}")])
     return f"{head}\n\n{body}", InlineKeyboardMarkup(rows)
 
 
@@ -1144,7 +1196,7 @@ def _mem_add_screen(scope):
 def _mem_clear_screen(scope):
     text = "<b>🧹 Clear all notes?</b>\n\nThis removes every note in this list and cannot be undone."
     return text, InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, clear", callback_data=f"ai:mem:clrok:{scope}"),
-                                        InlineKeyboardButton("❌ No", callback_data=f"ai:mem:{scope}")]])
+                                        InlineKeyboardButton("❌ No", callback_data=f"ai:mem:r:{scope}")]])
 
 
 def _mem_command_screen():
@@ -1154,29 +1206,89 @@ def _mem_command_screen():
             "A note can have many lines (a new line for each detail).\n"
             "2. /mems: Show this group's notes. /mems 2 shows the whole note 2.\n"
             "3. /delmem &lt;number&gt;: Remove one note.\n"
-            "4. /clearmem: Remove all notes of this group.\n\n"
+            "4. /clearmem: Remove all notes of this group.\n"
+            "5. /memories: Show every note in one list (global and this group).\n\n"
             "<b>🌍 Every group</b> (bot owner only)\n"
-            "5. /addgmem &lt;note&gt;: Add a global note.\n"
-            "6. /gmems: Show the global notes.\n"
-            "7. /delgmem &lt;number&gt;: Remove one global note.\n"
-            "8. /cleargmem: Remove all global notes.\n\n"
+            "6. /addgmem &lt;note&gt;: Add a global note.\n"
+            "7. /gmems: Show the global notes.\n"
+            "8. /delgmem &lt;number&gt;: Remove one global note.\n"
+            "9. /cleargmem: Remove all global notes.\n\n"
             f"Up to {MEM_MAX} notes of {MEM_LEN} characters in each list (many lines are fine). "
             "If a group note disagrees with a global note, the global note wins.")
     return text, InlineKeyboardMarkup([[_mem_back()]])
 
 
+async def _mem_all_screen(chat, user):
+    """📋 All: every note in one list, with 🗑 for what this person may remove and ➕ Add."""
+    can_g, can_G = await _mem_view_rights(chat, user)
+    text = "<b>📋 All Memories</b>\n\n" + _mem_all_text(chat, can_g, can_G)
+    if can_g or can_G:
+        text += "\n\nTap 🗑 and a number to remove a note, or ➕ Add to add one."
+    rows = []
+    for scope, label, allowed in (("G", "G", can_G), ("g", "", can_g)):
+        if not allowed:
+            continue
+        cid, key, _ = _mem_target(chat, scope)
+        cur = []
+        for i, t in enumerate(_mem_load(cid, key), 1):
+            cur.append(InlineKeyboardButton(f"🗑 {label}{i}", callback_data=f"ai:mem:dela:{scope}:{zlib.crc32(t.encode()):08x}"))
+            if len(cur) == 5:
+                rows.append(cur)
+                cur = []
+        if cur:
+            rows.append(cur)
+    if can_g or can_G:
+        rows.append([InlineKeyboardButton("➕ Add", callback_data="ai:mem:addw")])
+    rows.append([_mem_back()])
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _mem_where_screen(can_g, can_G):
+    text = "<b>➕ Add Memory</b>\n\nWhere should the new note go?"
+    row = []
+    if can_g:
+        row.append(InlineKeyboardButton("👥 This group", callback_data="ai:mem:add:g"))
+    if can_G:
+        row.append(InlineKeyboardButton("🌍 Global", callback_data="ai:mem:add:G"))
+    return text, InlineKeyboardMarkup([row, [_mem_back("ai:mem:a")]])
+
+
+async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/memories: every note in one list (global + this group)."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user:
+        return
+    can_g, can_G = await _mem_view_rights(chat, user)
+    if not (can_g or can_G):
+        await msg.reply_text("Open this in a group where you are an admin." if chat.type == "private"
+                             else "🔒 Only group admins can manage memories.")
+        return
+    tips = ["Remove: /delmem &lt;number&gt; (this group)"] + (["/delgmem &lt;number&gt; (global)"] if can_G else [])
+    await msg.reply_html("<b>📋 All Memories</b>\n\n" + _mem_all_text(chat, can_g, can_G, 150)
+                         + "\n\nAdd: /addmem &lt;note&gt;" + (" or /addgmem &lt;note&gt;" if can_G else "")
+                         + "\n" + ", ".join(tips) + "\nWhole note: /mems &lt;number&gt;")
+
+
 async def _mem_menu(update: Update, q, data: str):
-    """Buttons: ai:memories, ai:mem:c, ai:mem:<g|G>, ai:mem:add|addx|clr|clrok:<g|G>, ai:mem:del:<g|G>:<id>."""
+    """Buttons: ai:memories, ai:mem:c|a|addw, ai:mem:<g|G>, ai:mem:l|r|add|clr|clrok:<g|G>, ai:mem:del|dela:<g|G>:<id>."""
     try:
         chat, user = q.message.chat, q.from_user
         parts = data.split(":")  # 'memories' or 'mem', <action or scope>, ...
         action = parts[1] if len(parts) > 1 else ""
-        scope = parts[-1] if action in ("add", "clr", "clrok") else (parts[2] if action == "del" and len(parts) == 4 else action)
+        scope = parts[-1] if action in ("add", "clr", "clrok", "l", "r") else (parts[2] if action in ("del", "dela") and len(parts) == 4 else action)
         toast = None
         if data == "memories" or action == "":
             text, markup = _mem_main_screen()
         elif action == "c":
             text, markup = _mem_command_screen()
+        elif action in ("a", "addw"):  # 📋 All, and the "where should the note go?" step of its ➕ Add
+            can_g, can_G = await _mem_view_rights(chat, user)
+            if not (can_g or can_G):
+                await q.answer("Open /ai inside a group where you are an admin." if chat.type == "private"
+                               else "Only group admins can manage memories.", show_alert=True)
+                return
+            _mem_pending.pop((chat.id, user.id), None)
+            text, markup = await _mem_all_screen(chat, user) if action == "a" else _mem_where_screen(can_g, can_G)
         elif scope in ("g", "G"):
             ok, why = await _mem_perm(chat, user, scope)
             if not ok:
@@ -1185,6 +1297,10 @@ async def _mem_menu(update: Update, q, data: str):
             if action == "add":
                 _mem_pending[(chat.id, user.id)] = (scope, time.time() + MEM_PENDING_SECS)
                 text, markup = _mem_add_screen(scope)
+            elif action == "l":
+                text, markup = _mem_view_screen(chat, scope)
+            elif action == "r":
+                text, markup = _mem_list_screen(chat, scope)
             elif action == "clr":
                 text, markup = _mem_clear_screen(scope)
             elif action == "clrok":
@@ -1195,9 +1311,12 @@ async def _mem_menu(update: Update, q, data: str):
             elif action == "del":
                 toast = _mem_remove(scope, chat, parts[3])
                 text, markup = _mem_list_screen(chat, scope)
-            else:  # ai:mem:g / ai:mem:G (and ❌ Cancel)
+            elif action == "dela":  # removed from the 📋 All list: back to that list
+                toast = _mem_remove(scope, chat, parts[3])
+                text, markup = await _mem_all_screen(chat, user)
+            else:  # ai:mem:g / ai:mem:G (and ❌ Cancel): the Memories / Add / Remove menu
                 _mem_pending.pop((chat.id, user.id), None)
-                text, markup = _mem_list_screen(chat, scope)
+                text, markup = _mem_sub_screen(chat, scope)
         else:
             text, markup = _mem_main_screen()
         await q.answer(toast)
@@ -1224,10 +1343,17 @@ async def _mem_take_input(update: Update) -> bool:
     if item is None:
         return False
     scope, deadline = item
-    ok, _why = await _mem_perm(chat, user, scope)
-    if deadline < time.time() or not ok:
+    ok, why = await _mem_perm(chat, user, scope)
+    if deadline < time.time():
         _mem_pending.pop(key, None)
         return False
+    if not ok:  # say why, never stay silent
+        _mem_pending.pop(key, None)
+        try:
+            await msg.reply_text(why)
+        except TelegramError:
+            pass
+        return True
     saved, reply = _mem_add(scope, chat, msg.text)
     if saved:
         _mem_pending.pop(key, None)
@@ -3137,7 +3263,7 @@ def register_ai(app):
     # Memories: group admins (this group) and the bot owner (global). The menu lives in /ai > 🧠 Memories.
     for _name, _fn in (("addmem", addmem_command), ("mems", mems_command), ("delmem", delmem_command),
                        ("clearmem", clearmem_command), ("addgmem", addgmem_command), ("gmems", gmems_command),
-                       ("delgmem", delgmem_command), ("cleargmem", cleargmem_command)):
+                       ("delgmem", delgmem_command), ("cleargmem", cleargmem_command), ("memories", memories_command)):
         app.add_handler(CommandHandler(_name, _fn))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, mem_private_input), group=3)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, ai_chat_handler), group=2)
