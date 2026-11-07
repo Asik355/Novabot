@@ -781,23 +781,35 @@ def _chat_touch(chat_id, user_id):
     _chat_sessions[(chat_id, user_id)] = now
 
 
+_SMALL_CAPS = str.maketrans("ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡʏᴢ", "abcdefghijklmnopqrstuvwxyz".replace("x", ""))
+_ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍⁠﻿"))
+
+
+def _fold(text) -> str:
+    """Plain lowercase letters for matching names: a styled bot name like '𝐒𝐚𝐭𝐨𝐫𝐮 𝐆𝐨𝐣𝐨', 'ꜱᴀᴛᴏʀᴜ' or 'Ｓａｔｏｒｕ'
+    becomes 'satoru gojo' (and Gōjō becomes gojo), so members can type it normally."""
+    t = unicodedata.normalize("NFKD", text or "")
+    t = "".join(ch for ch in t if not unicodedata.combining(ch)).translate(_ZERO_WIDTH)
+    return t.translate(_SMALL_CAPS).lower()
+
+
 def _name_words():
     """Words of the bot's CURRENT Telegram display name (never a fixed name): 'Satoru Gojo' -> {'satoru', 'gojo'}."""
-    full = f"{_IDENTITY.get('name', '')} {_IDENTITY.get('last_name', '')}"
-    return {w.lower() for w in re.findall(r"[^\W\d_]{3,}", full)} - _NAME_STOPWORDS
+    full = _fold(f"{_IDENTITY.get('name', '')} {_IDENTITY.get('last_name', '')}")
+    return set(re.findall(r"[^\W\d_]{3,}", full)) - _NAME_STOPWORDS
 
 
 def _name_called(text) -> bool:
-    """True when the text says the bot's current name (whole word, any capitals) or its @username."""
-    text = text or ""
+    """True when the text says the bot's current name (whole word, any capitals or font) or its @username."""
+    text = _fold(text)
     uname = (_IDENTITY.get("username") or "").lower()
-    if uname and re.search(r"(?<!\w)@" + re.escape(uname) + r"(?!\w)", text, re.I):
+    if uname and re.search(r"(?<!\w)@" + re.escape(uname) + r"(?!\w)", text):
         return True
     words = _name_words()
     if not words:
         return False
     pattern = r"(?<!\w)(?:" + "|".join(sorted((re.escape(w) for w in words), key=len, reverse=True)) + r")(?!\w)"
-    return re.search(pattern, text, re.I) is not None
+    return re.search(pattern, text) is not None
 
 
 def _chat_lang_rule(chat_id) -> str:
@@ -834,7 +846,11 @@ def _chat_entities(msg):
 async def ai_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Plain group text: answers a member in a chat session, or anyone who calls the bot by its current name."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not msg or not msg.text or not user or user.is_bot or chat is None or chat.type == "private":
+    if not msg or not msg.text or not user or user.is_bot or chat is None:
+        return
+    if await _mem_take_input(update):  # the note someone sends after tapping ➕ Add in the Memories menu
+        return
+    if chat.type == "private":
         return
     if getattr(msg, "forward_origin", None) or getattr(msg, "forward_date", None):
         return  # forwards are never answered
@@ -887,9 +903,22 @@ async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type == "private":
         await msg.reply_text("Use this command in a group.")
         return
+    hinglish = _chat_lang_default(chat.id) == "Hinglish"
+    if context.args and context.args[0].lower() == "all":  # /sleep all: everyone's chat in this group ends (admins only)
+        if not await _bl_can_manage(chat, user.id):
+            await msg.reply_text("🔒 Only group admins can put everyone to sleep.")
+            return
+        awake = [k for k in _chat_sessions if k[0] == chat.id and _chat_active(*k)]
+        for k in [k for k in _chat_sessions if k[0] == chat.id]:
+            _chat_sessions.pop(k, None)
+        if hinglish:
+            text = "😴 Sab so gaye. Baat karni ho to /chat bhejo ya mera naam lo."
+        else:
+            text = "😴 Everyone is asleep now. Send /chat or call my name to wake me up."
+        await msg.reply_text(text + (f"\n({len(awake)} chatting)" if awake else ""))
+        return
     was_awake = _chat_active(chat.id, user.id)
     _chat_sessions.pop((chat.id, user.id), None)
-    hinglish = _chat_lang_default(chat.id) == "Hinglish"
     if was_awake:
         text = ("😴 Okay, main so rahi hu. Dobara baat karni ho to /chat bhejo ya mera naam lo." if hinglish
                 else "😴 Okay, going to sleep. Send /chat or call my name to wake me up.")
@@ -897,6 +926,322 @@ async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = ("😴 Main to pehle se so rahi hu. Jagane ke liye /chat bhejo ya mera naam lo." if hinglish
                 else "😴 I'm already asleep for you. Send /chat or call my name to wake me up.")
     await msg.reply_text(text)
+
+
+# ------------------------------------------------------------ Memories (custom notes the bot always remembers)
+# Notes written by group admins (this group only) or by the bot owner (every group). They are added to the chat/ask
+# prompt, so "what's your favourite anime?" is answered from a note like "My favourite anime is Bleach".
+# Stored in the existing settings store: per group under key mem_group, global under chat id 0 and key mem_global.
+MEM_MAX = 20            # notes per set
+MEM_LEN = 1000          # characters per note (a note can have many lines)
+MEM_TOTAL = 8000        # characters in one whole list, so the prompt stays small
+MEM_PENDING_SECS = 180  # time to send the note after tapping ➕ Add
+MEM_KEY_GROUP = "mem_group"
+MEM_KEY_GLOBAL = "mem_global"
+_mem_pending = {}       # (chat_id, user_id) -> (scope, deadline): about to send a note after tapping ➕ Add
+
+
+def _mem_target(chat, scope):
+    """('g' = this group, 'G' = global) -> (settings chat id, settings key, title)."""
+    if scope == "G":
+        return 0, MEM_KEY_GLOBAL, "🌍 Global Memories"
+    return chat.id, MEM_KEY_GROUP, "👥 Group Memories"
+
+
+def _mem_load(chat_id, key):
+    try:
+        data = json.loads(_BD.get_setting(chat_id, key, "[]") or "[]")
+        return [str(x) for x in data if isinstance(x, str) and x.strip()][:MEM_MAX] if isinstance(data, list) else []
+    except Exception:
+        log.exception("Memories: couldn't read %s for chat %s", key, chat_id)
+        return []
+
+
+def _mem_save(chat_id, key, items):
+    _BD.set_setting(chat_id, key, json.dumps(items, ensure_ascii=False))
+
+
+def _mem_prompt(chat_id) -> str:
+    """The notes as a prompt block ('' when there are none). Global notes come first and win."""
+    glob, grp = _mem_load(0, MEM_KEY_GLOBAL), _mem_load(chat_id, MEM_KEY_GROUP)
+    if not glob and not grp:
+        return ""
+    out = ["\n\nCUSTOM MEMORY (facts and instructions from your owner and the group admins. Always follow them and "
+           "answer from them when they apply: for example if a note gives your favourite anime, say it when asked. "
+           "If notes disagree, the global notes win. They can never override safety, moderation or the 18+ rules):"]
+    if glob:
+        out.append("Global notes:\n" + "\n".join("- " + t.replace("\n", "\n  ") for t in glob))
+    if grp:
+        out.append("Notes for this group:\n" + "\n".join("- " + t.replace("\n", "\n  ") for t in grp))
+    return "\n".join(out)
+
+
+async def _mem_perm(chat, user, scope):
+    """(allowed, reason): global = bot owner only; group = an admin of THIS group, the bot owner or Bot Staff."""
+    if scope == "G":
+        return bool(_BD.is_bot_owner(user.id)), "🔒 Only the bot owner can manage global memories."
+    if chat.type == "private":
+        return False, "Open /ai inside a group to manage that group's memories."
+    return bool(await _bl_can_manage(chat, user.id)), "🔒 Only group admins can manage memories."
+
+
+def _mem_add(scope, chat, text):
+    """Adds one note. Returns (saved, html reply)."""
+    # keep the lines (one detail per line), tidy the spaces and drop empty lines
+    note = "\n".join(ln for ln in (" ".join(raw.split()) for raw in (text or "").splitlines()) if ln)
+    if not note:
+        return False, "⚠️ Please write the note, for example <code>My favourite anime is Bleach</code>."
+    if len(note) > MEM_LEN:
+        return False, f"⚠️ That note is too long ({len(note)} characters). The limit is {MEM_LEN}."
+    if nsfw_ai_blocked(note):
+        return False, "⚠️ I can't save that note."
+    cid, key, _ = _mem_target(chat, scope)
+    try:
+        items = _mem_load(cid, key)
+        if note.lower() in (t.lower() for t in items):
+            return False, "ℹ️ I already have that note."
+        if len(items) >= MEM_MAX:
+            return False, f"⚠️ There are already {MEM_MAX} notes. Remove one first."
+        if sum(len(t) for t in items) + len(note) > MEM_TOTAL:
+            return False, "⚠️ This list is full. Remove a note first."
+        _mem_save(cid, key, items + [note])
+    except Exception:
+        log.exception("Memories: couldn't save a note for chat %s", cid)
+        return False, "⚠️ I couldn't save that right now. Please try again."
+    shown = note if len(note) <= 300 else note[:299] + "…"
+    return True, f"✅ Saved ({len(items) + 1}/{MEM_MAX}):\n<code>{html.escape(shown)}</code>"
+
+
+def _mem_remove(scope, chat, ref):
+    """Removes a note by 1-based number or by crc id. Returns a short toast/reply text."""
+    cid, key, _ = _mem_target(chat, scope)
+    items = _mem_load(cid, key)
+    idx = None
+    if ref.isdigit() and 1 <= int(ref) <= len(items) and len(ref) < 8:
+        idx = int(ref) - 1
+    else:
+        for i, t in enumerate(items):
+            if f"{zlib.crc32(t.encode()):08x}" == ref:
+                idx = i
+                break
+    if idx is None:
+        return "Already removed."
+    gone = items.pop(idx)
+    _mem_save(cid, key, items)
+    return "Removed: " + gone.split("\n")[0][:60]
+
+
+def _mem_numbered(items, limit=150):
+    """A short one-line preview of every note (new lines shown as ' / ')."""
+    flat = [t.replace("\n", " / ") for t in items]
+    return "\n".join(f"{i}. {html.escape(t if len(t) <= limit else t[:limit - 1] + '…')}" for i, t in enumerate(flat, 1))
+
+
+async def _mem_command(update, context, scope, action):
+    """/addmem /mems /delmem /clearmem (this group, admins) and /addgmem /gmems /delgmem /cleargmem (bot owner)."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user:
+        return
+    ok, why = await _mem_perm(chat, user, scope)
+    if not ok:
+        await msg.reply_text(why)
+        return
+    cid, key, title = _mem_target(chat, scope)
+    pre = "g" if scope == "G" else ""
+    parts = msg.text.split(None, 1)  # everything after the command, new lines kept
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if action == "add":
+        if not arg:
+            await msg.reply_html(f"Usage: <code>/add{pre}mem &lt;note&gt;</code>\nExample: "
+                                 f"<code>/add{pre}mem My favourite anime is Bleach</code>\n"
+                                 "A note can have many lines: start a new line for each detail.")
+            return
+        await msg.reply_html(_mem_add(scope, chat, arg)[1])
+    elif action == "list":
+        items = _mem_load(cid, key)
+        if arg.isdigit() and 1 <= int(arg) <= len(items):  # /mems 2 -> the whole note 2
+            await msg.reply_html(f"<b>{title}: note {arg}</b>\n\n{html.escape(items[int(arg) - 1])}")
+            return
+        body = (_mem_numbered(items) + f"\n\nSend /{pre}mems &lt;number&gt; to see a whole note.") if items else "No notes yet."
+        await msg.reply_html(f"<b>{title}</b> ({len(items)}/{MEM_MAX})\n\n{body}")
+    elif action == "del":
+        first = arg.split()[0] if arg else ""
+        if not first.isdigit():
+            await msg.reply_html(f"Usage: <code>/del{pre}mem &lt;number&gt;</code> (see /{pre}mems for the numbers)")
+            return
+        await msg.reply_text("🗑 " + _mem_remove(scope, chat, first) if _mem_load(cid, key) else "There are no notes.")
+    elif action == "clear":
+        try:
+            _mem_save(cid, key, [])
+            await msg.reply_text("🧹 All notes removed.")
+        except Exception:
+            log.exception("Memories: couldn't clear notes for chat %s", cid)
+            await msg.reply_text("⚠️ I couldn't do that right now. Please try again.")
+
+
+async def addmem_command(update, context): await _mem_command(update, context, "g", "add")
+async def mems_command(update, context): await _mem_command(update, context, "g", "list")
+async def delmem_command(update, context): await _mem_command(update, context, "g", "del")
+async def clearmem_command(update, context): await _mem_command(update, context, "g", "clear")
+async def addgmem_command(update, context): await _mem_command(update, context, "G", "add")
+async def gmems_command(update, context): await _mem_command(update, context, "G", "list")
+async def delgmem_command(update, context): await _mem_command(update, context, "G", "del")
+async def cleargmem_command(update, context): await _mem_command(update, context, "G", "clear")
+
+
+# ---- the 🧠 Memories menu inside /ai (same look as Auto Close / Night mode: a page, buttons, « Back)
+def _mem_back(to="ai:memories"):
+    return InlineKeyboardButton("« Back", callback_data=to)
+
+
+def _mem_main_screen():
+    text = ("<b>🧠 Memories</b>\n\n"
+            "Give me notes I should always remember, for example “My favourite anime is Bleach”. "
+            "When someone asks me, I answer from your notes.\n\n"
+            "• 👥 <b>Group</b>: notes for this group (admins)\n"
+            "• 🌍 <b>Global</b>: notes for every group (bot owner)\n"
+            "• ⌨️ <b>Command</b>: all memory commands")
+    rows = [[InlineKeyboardButton("👥 Group", callback_data="ai:mem:g"),
+             InlineKeyboardButton("🌍 Global", callback_data="ai:mem:G")],
+            [InlineKeyboardButton("⌨️ Command", callback_data="ai:mem:c")],
+            [InlineKeyboardButton("« Back", callback_data="ai:menu")]]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _mem_list_screen(chat, scope):
+    cid, key, title = _mem_target(chat, scope)
+    items = _mem_load(cid, key)
+    where = "this group only" if scope == "g" else "every group"
+    head = f"<b>{title}</b>\n\nNotes for {where} ({len(items)}/{MEM_MAX})."
+    body = (_mem_numbered(items) + "\n\nTap 🗑 and a number to remove a note.") if items else (
+        "No notes yet. Tap ➕ Add and send your first note, for example "
+        "<code>My favourite anime is Bleach</code>.")
+    rows, cur = [], []
+    for i, t in enumerate(items, 1):
+        cur.append(InlineKeyboardButton(f"🗑 {i}", callback_data=f"ai:mem:del:{scope}:{zlib.crc32(t.encode()):08x}"))
+        if len(cur) == 5:
+            rows.append(cur)
+            cur = []
+    if cur:
+        rows.append(cur)
+    last = [InlineKeyboardButton("➕ Add", callback_data=f"ai:mem:add:{scope}")]
+    if items:
+        last.append(InlineKeyboardButton("🧹 Clear all", callback_data=f"ai:mem:clr:{scope}"))
+    rows.append(last)
+    rows.append([_mem_back()])
+    return f"{head}\n\n{body}", InlineKeyboardMarkup(rows)
+
+
+def _mem_add_screen(scope):
+    where = "this group" if scope == "g" else "every group"
+    text = ("<b>➕ Add Memory</b>\n\n"
+            "Send the note as your next message, for example <code>My favourite anime is Bleach</code>.\n"
+            "One note can have many lines, for example a name, age and details: write each detail on a new line.\n"
+            f"It will be used in {where}. Up to {MEM_LEN} characters, and I'll wait {MEM_PENDING_SECS // 60} minutes.")
+    return text, InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"ai:mem:{scope}")]])
+
+
+def _mem_clear_screen(scope):
+    text = "<b>🧹 Clear all notes?</b>\n\nThis removes every note in this list and cannot be undone."
+    return text, InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, clear", callback_data=f"ai:mem:clrok:{scope}"),
+                                        InlineKeyboardButton("❌ No", callback_data=f"ai:mem:{scope}")]])
+
+
+def _mem_command_screen():
+    text = ("<b>⌨️ Memory Commands</b>\n\n"
+            "<b>👥 This group</b> (group admins)\n"
+            "1. /addmem &lt;note&gt;: Add a note, for example /addmem My favourite anime is Bleach. "
+            "A note can have many lines (a new line for each detail).\n"
+            "2. /mems: Show this group's notes. /mems 2 shows the whole note 2.\n"
+            "3. /delmem &lt;number&gt;: Remove one note.\n"
+            "4. /clearmem: Remove all notes of this group.\n\n"
+            "<b>🌍 Every group</b> (bot owner only)\n"
+            "5. /addgmem &lt;note&gt;: Add a global note.\n"
+            "6. /gmems: Show the global notes.\n"
+            "7. /delgmem &lt;number&gt;: Remove one global note.\n"
+            "8. /cleargmem: Remove all global notes.\n\n"
+            f"Up to {MEM_MAX} notes of {MEM_LEN} characters in each list (many lines are fine). "
+            "If a group note disagrees with a global note, the global note wins.")
+    return text, InlineKeyboardMarkup([[_mem_back()]])
+
+
+async def _mem_menu(update: Update, q, data: str):
+    """Buttons: ai:memories, ai:mem:c, ai:mem:<g|G>, ai:mem:add|addx|clr|clrok:<g|G>, ai:mem:del:<g|G>:<id>."""
+    try:
+        chat, user = q.message.chat, q.from_user
+        parts = data.split(":")  # 'memories' or 'mem', <action or scope>, ...
+        action = parts[1] if len(parts) > 1 else ""
+        scope = parts[-1] if action in ("add", "clr", "clrok") else (parts[2] if action == "del" and len(parts) == 4 else action)
+        toast = None
+        if data == "memories" or action == "":
+            text, markup = _mem_main_screen()
+        elif action == "c":
+            text, markup = _mem_command_screen()
+        elif scope in ("g", "G"):
+            ok, why = await _mem_perm(chat, user, scope)
+            if not ok:
+                await q.answer(why.replace("🔒 ", ""), show_alert=True)
+                return
+            if action == "add":
+                _mem_pending[(chat.id, user.id)] = (scope, time.time() + MEM_PENDING_SECS)
+                text, markup = _mem_add_screen(scope)
+            elif action == "clr":
+                text, markup = _mem_clear_screen(scope)
+            elif action == "clrok":
+                cid, key, _ = _mem_target(chat, scope)
+                _mem_save(cid, key, [])
+                toast = "All notes removed."
+                text, markup = _mem_list_screen(chat, scope)
+            elif action == "del":
+                toast = _mem_remove(scope, chat, parts[3])
+                text, markup = _mem_list_screen(chat, scope)
+            else:  # ai:mem:g / ai:mem:G (and ❌ Cancel)
+                _mem_pending.pop((chat.id, user.id), None)
+                text, markup = _mem_list_screen(chat, scope)
+        else:
+            text, markup = _mem_main_screen()
+        await q.answer(toast)
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    except TelegramError:
+        pass  # unchanged message (double tap) or too old to edit
+    except Exception:
+        log.exception("Memories menu failed")
+        try:
+            await q.answer("Something went wrong. Please try again.", show_alert=True)
+        except TelegramError:
+            pass
+
+
+async def _mem_take_input(update: Update) -> bool:
+    """The note someone sends after tapping ➕ Add. True when this message was that note (nothing else answers it)."""
+    if not _mem_pending:
+        return False
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not msg.text or not user or chat is None:
+        return False
+    key = (chat.id, user.id)
+    item = _mem_pending.get(key)
+    if item is None:
+        return False
+    scope, deadline = item
+    ok, _why = await _mem_perm(chat, user, scope)
+    if deadline < time.time() or not ok:
+        _mem_pending.pop(key, None)
+        return False
+    saved, reply = _mem_add(scope, chat, msg.text)
+    if saved:
+        _mem_pending.pop(key, None)
+    try:
+        await msg.reply_html(reply, reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🧠 Memories", callback_data=f"ai:mem:{scope}")]]))
+    except TelegramError as e:
+        log.warning("Memories: couldn't reply in chat %s: %s", chat.id, e)
+    return True
+
+
+async def mem_private_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Private chat: the bot owner sends a global note after tapping ➕ Add."""
+    await _mem_take_input(update)
 
 
 # =====================================================================
@@ -1856,7 +2201,8 @@ async def ask_engine(update: Update, context: ContextTypes.DEFAULT_TYPE, query: 
         await _search_flow(msg, plan.intent, "", "ASK")
         return
     chat_id, uid = update.effective_chat.id, (user.id if user else 0)
-    prompt = (((_CHAT_RULES + _chat_lang_rule(chat_id)) if chat else _ASK_NORMAL_RULES) + _friend_history(chat_id, uid, chat)
+    prompt = (((_CHAT_RULES + _chat_lang_rule(chat_id)) if chat else _ASK_NORMAL_RULES) + _mem_prompt(chat_id)
+              + _friend_history(chat_id, uid, chat)
               + (f"\n\nYour previous message (the user is replying to it):\n{prev[:2000]}" if prev else "")
               + f"\n\nUser: {query}")
     token = _CHAT_MODE.set(bool(chat))
@@ -2449,7 +2795,8 @@ AI_HELP_LINES = [
     "/ai: Open the AI Commands menu.",
     "/ask: Ask the AI anything.",
     "/chat: Wake the bot to chat with you without replying to its messages (also works if you say its name).",
-    "/sleep: End your chat with the bot (it also sleeps after 10 minutes of silence from you).",
+    "/sleep: End your chat with the bot (it also sleeps after 10 minutes of silence from you). Admins: /sleep all puts everyone in the group to sleep.",
+    "/addmem: Teach the bot a note it always remembers (more in /ai > 🧠 Memories).",
     "/imagine: Generate an AI image from a prompt.",
     "/search: Live web search for a topic, year or date (answers only from verified results).",
     "/translate: Translate text into Hindi and English.",
@@ -2485,6 +2832,7 @@ AI_PAGES = {
     "roll": ("🎲 Roll", "<b>🎲 Roll</b>\n\n/roll: roll a dice (1-6).", True),
     "flip": ("🪙 Flip", "<b>🪙 Flip</b>\n\n/flip: flip a coin (Heads or Tails).", True),
     "say": ("📢 Say", "<b>📢 Say</b>\n\n/say &lt;text&gt;\nI speak your text as a voice message (the first 300 characters). If the voice is unavailable I write it instead.", False),
+    "memories": ("🧠 Memories", "<b>🧠 Memories</b>", False),  # page and buttons come from _mem_main_screen (ai:memories)
 }
 _AI_RUNNERS = {
     "joke": "joke_command", "quote": "quote_command", "fact": "fact_command",
@@ -2556,6 +2904,9 @@ async def ai_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer()
             if name:
                 await globals()[name](update, context)  # replies under the menu message
+            return
+        if data == "memories" or data.startswith("mem:"):
+            await _mem_menu(update, q, data)
             return
         await q.answer()
         if data in AI_PAGES:
@@ -2783,6 +3134,12 @@ def register_ai(app):
     # /chat and /sleep, and calling the bot by name. group=2 is a group of its own, so it runs next to the reply chat above.
     app.add_handler(CommandHandler("chat", chat_command))
     app.add_handler(CommandHandler("sleep", sleep_command))
+    # Memories: group admins (this group) and the bot owner (global). The menu lives in /ai > 🧠 Memories.
+    for _name, _fn in (("addmem", addmem_command), ("mems", mems_command), ("delmem", delmem_command),
+                       ("clearmem", clearmem_command), ("addgmem", addgmem_command), ("gmems", gmems_command),
+                       ("delgmem", delgmem_command), ("cleargmem", cleargmem_command)):
+        app.add_handler(CommandHandler(_name, _fn))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, mem_private_input), group=3)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, ai_chat_handler), group=2)
 
 # =============================================================================
