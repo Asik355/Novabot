@@ -1355,6 +1355,7 @@ async def _mem_take_input(update: Update) -> bool:
             pass
         return True
     saved, reply = _mem_add(scope, chat, msg.text)
+    log.info("Memories: note %s (scope %s, chat %s)", "saved" if saved else "not saved", scope, chat.id)
     if saved:
         _mem_pending.pop(key, None)
     try:
@@ -1368,6 +1369,26 @@ async def _mem_take_input(update: Update) -> bool:
 async def mem_private_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Private chat: the bot owner sends a global note after tapping ➕ Add."""
     await _mem_take_input(update)
+
+
+async def mem_input_early(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Group -11, before every other handler: the note someone sends after tapping ➕ Add (private chat or group).
+    Only people who just tapped ➕ Add are touched; for everyone else this returns at once."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not _mem_pending or not msg or not msg.text or not chat or not user or (chat.id, user.id) not in _mem_pending:
+        return
+    try:
+        if not await _mem_take_input(update):
+            return  # the 3 minutes ran out: an ordinary message again
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        log.exception("Memories: couldn't handle a note in chat %s", chat.id)
+        try:
+            await msg.reply_text("⚠️ I couldn't save that right now. Please try again.")
+        except TelegramError:
+            pass
+    raise ApplicationHandlerStop  # nothing else (edit session, chat, watcher) answers a note
 
 
 # =====================================================================
@@ -3265,7 +3286,9 @@ def register_ai(app):
                        ("clearmem", clearmem_command), ("addgmem", addgmem_command), ("gmems", gmems_command),
                        ("delgmem", delgmem_command), ("cleargmem", cleargmem_command), ("memories", memories_command)):
         app.add_handler(CommandHandler(_name, _fn))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, mem_private_input), group=3)
+    # group -11: runs before every other handler, so the note sent after ➕ Add is never taken by something else
+    app.add_handler(MessageHandler((filters.ChatType.PRIVATE | filters.ChatType.GROUPS) & filters.TEXT & ~filters.COMMAND,
+                                   mem_input_early), group=-11)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, ai_chat_handler), group=2)
 
 # =============================================================================
