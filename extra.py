@@ -752,645 +752,6 @@ async def ai_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ask_engine(update, context, msg.text.strip(), prev=previous, chat=True)
 
 
-# ------------------------------------------------------------ /chat, /sleep and calling the bot by name
-# A member who sends /chat (or says the bot's CURRENT name) starts a chat session in that group: the bot answers their
-# plain messages without them replying to it, until /sleep or CHAT_IDLE_SECS of silence from that member. Sessions are
-# per member and per group, so nobody else is affected. Messages aimed at other people (a reply to someone else, a tag
-# of another member, a link, a forward) are left alone.
-CHAT_IDLE_SECS = 10 * 60
-_chat_sessions = {}  # (chat_id, user_id) -> monotonic time of the member's last chat message
-_NAME_STOPWORDS = frozenset({"the", "and", "bot", "miss", "mrs", "official", "group", "manager", "admin"})
-
-
-def _chat_active(chat_id, user_id) -> bool:
-    key = (chat_id, user_id)
-    last = _chat_sessions.get(key)
-    if last is None:
-        return False
-    if time.monotonic() - last > CHAT_IDLE_SECS:
-        _chat_sessions.pop(key, None)  # fell asleep by itself
-        return False
-    return True
-
-
-def _chat_touch(chat_id, user_id):
-    now = time.monotonic()
-    if len(_chat_sessions) > 5000:  # keep the dict small
-        for k in [k for k, t in _chat_sessions.items() if now - t > CHAT_IDLE_SECS]:
-            _chat_sessions.pop(k, None)
-    _chat_sessions[(chat_id, user_id)] = now
-
-
-_SMALL_CAPS = str.maketrans("ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡʏᴢ", "abcdefghijklmnopqrstuvwxyz".replace("x", ""))
-_ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍⁠﻿"))
-
-
-def _fold(text) -> str:
-    """Plain lowercase letters for matching names: a styled bot name like '𝐒𝐚𝐭𝐨𝐫𝐮 𝐆𝐨𝐣𝐨', 'ꜱᴀᴛᴏʀᴜ' or 'Ｓａｔｏｒｕ'
-    becomes 'satoru gojo' (and Gōjō becomes gojo), so members can type it normally."""
-    t = unicodedata.normalize("NFKD", text or "")
-    t = "".join(ch for ch in t if not unicodedata.combining(ch)).translate(_ZERO_WIDTH)
-    return t.translate(_SMALL_CAPS).lower()
-
-
-def _name_words():
-    """Words of the bot's CURRENT Telegram display name (never a fixed name): 'Satoru Gojo' -> {'satoru', 'gojo'}."""
-    full = _fold(f"{_IDENTITY.get('name', '')} {_IDENTITY.get('last_name', '')}")
-    return set(re.findall(r"[^\W\d_]{3,}", full)) - _NAME_STOPWORDS
-
-
-def _name_called(text) -> bool:
-    """True when the text says the bot's current name (whole word, any capitals or font) or its @username."""
-    text = _fold(text)
-    uname = (_IDENTITY.get("username") or "").lower()
-    if uname and re.search(r"(?<!\w)@" + re.escape(uname) + r"(?!\w)", text):
-        return True
-    words = _name_words()
-    if not words:
-        return False
-    pattern = r"(?<!\w)(?:" + "|".join(sorted((re.escape(w) for w in words), key=len, reverse=True)) + r")(?!\w)"
-    return re.search(pattern, text) is not None
-
-
-def _chat_lang_rule(chat_id) -> str:
-    """Reply in the language the member writes; when unclear use the group's /lang setting (English or Hinglish)."""
-    default = _chat_lang_default(chat_id)
-    return ("\n\nLANGUAGE RULE (this overrides any language or style mentioned above): reply in the same language and "
-            "script the user's latest message is written in. English: reply in English. Hinglish (Hindi written in "
-            "Roman letters, like 'kya kar rahi ho'): reply in Hinglish. Hindi in Devanagari: reply in Hindi "
-            "(Devanagari). Any other language: reply in that language. If the language is unclear (a very short "
-            f"message like 'ok' or an emoji), keep the language of the recent conversation, or {default} if there is "
-            "none. Keep the same casual persona and short replies in every language.")
-
-
-def _chat_entities(msg):
-    """(has_link, tags_someone_else) for a text message."""
-    has_link = tags_other = False
-    me = (_IDENTITY.get("username") or "").lower()
-    for e in msg.entities or ():
-        kind = str(getattr(e.type, "value", e.type))
-        if kind in ("url", "text_link", "email"):
-            has_link = True
-        elif kind == "mention":
-            try:
-                tagged = msg.parse_entity(e).lstrip("@").lower()
-            except Exception:
-                tagged = ""
-            if tagged != me:
-                tags_other = True
-        elif kind == "text_mention" and getattr(e, "user", None) is not None and e.user.id != _IDENTITY.get("id"):
-            tags_other = True
-    return has_link, tags_other
-
-
-async def ai_chat_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Plain group text: answers a member in a chat session, or anyone who calls the bot by its current name."""
-    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not msg or not msg.text or not user or user.is_bot or chat is None:
-        return
-    if await _mem_take_input(update):  # the note someone sends after tapping ➕ Add in the Memories menu
-        return
-    if chat.type == "private":
-        return
-    if getattr(msg, "forward_origin", None) or getattr(msg, "forward_date", None):
-        return  # forwards are never answered
-    reply = msg.reply_to_message
-    if reply and reply.from_user and reply.from_user.id == context.bot.id:
-        return  # a reply to the bot is already handled by ai_reply_handler
-    await refresh_identity(context.bot)  # the CURRENT name, so a rename works at once
-    has_link, tags_other = _chat_entities(msg)
-    called = _name_called(msg.text) and not has_link
-    if not called:
-        if not _chat_active(chat.id, user.id):
-            return
-        if reply is not None or tags_other or has_link:
-            return  # talking to someone else: stay quiet, the session stays open
-    _chat_touch(chat.id, user.id)  # calling the name wakes the bot just like /chat
-    await ask_engine(update, context, msg.text.strip(), chat=True, quiet=not called)
-
-
-async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/chat: wake the bot for this member, so they can talk without replying to its messages."""
-    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not msg or not user:
-        return
-    if chat.type == "private":
-        await msg.reply_text("Use this command in a group. Here in private, just message me.")
-        return
-    _chat_touch(chat.id, user.id)
-    mins = CHAT_IDLE_SECS // 60
-    if _chat_lang_default(chat.id) == "Hinglish":
-        text = (f"💬 Main jaag gayi! Ab mujhse seedha baat karo, mere msg ko reply karne ki zarurat nahi. "
-                f"Jab baat khatam ho to /sleep bhej dena (ya {mins} minute kuch na bolo to main so jaungi).")
-    else:
-        text = (f"💬 I'm awake! Talk to me directly, no need to reply to my messages. "
-                f"Send /sleep when you're done (I also fall asleep after {mins} minutes of silence from you).")
-    _remember_ai_message(await msg.reply_text(text))
-
-
-def _chat_lang_default(chat_id) -> str:
-    try:
-        return "English" if str(_BD.get_setting(chat_id, "lang", "en") or "en").lower().startswith("en") else "Hinglish"
-    except Exception:
-        return "Hinglish"
-
-
-async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/sleep: end this member's chat session."""
-    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not msg or not user:
-        return
-    if chat.type == "private":
-        await msg.reply_text("Use this command in a group.")
-        return
-    hinglish = _chat_lang_default(chat.id) == "Hinglish"
-    if context.args and context.args[0].lower() == "all":  # /sleep all: everyone's chat in this group ends (admins only)
-        if not await _bl_can_manage(chat, user.id):
-            await msg.reply_text("🔒 Only group admins can put everyone to sleep.")
-            return
-        awake = [k for k in _chat_sessions if k[0] == chat.id and _chat_active(*k)]
-        for k in [k for k in _chat_sessions if k[0] == chat.id]:
-            _chat_sessions.pop(k, None)
-        if hinglish:
-            text = "😴 Sab so gaye. Baat karni ho to /chat bhejo ya mera naam lo."
-        else:
-            text = "😴 Everyone is asleep now. Send /chat or call my name to wake me up."
-        await msg.reply_text(text + (f"\n({len(awake)} chatting)" if awake else ""))
-        return
-    was_awake = _chat_active(chat.id, user.id)
-    _chat_sessions.pop((chat.id, user.id), None)
-    if was_awake:
-        text = ("😴 Okay, main so rahi hu. Dobara baat karni ho to /chat bhejo ya mera naam lo." if hinglish
-                else "😴 Okay, going to sleep. Send /chat or call my name to wake me up.")
-    else:
-        text = ("😴 Main to pehle se so rahi hu. Jagane ke liye /chat bhejo ya mera naam lo." if hinglish
-                else "😴 I'm already asleep for you. Send /chat or call my name to wake me up.")
-    await msg.reply_text(text)
-
-
-# ------------------------------------------------------------ Memories (custom notes the bot always remembers)
-# Notes written by group admins (this group only) or by the bot owner (every group). They are added to the chat/ask
-# prompt, so "what's your favourite anime?" is answered from a note like "My favourite anime is Bleach".
-# Stored in the existing settings store: per group under key mem_group, global under chat id 0 and key mem_global.
-MEM_MAX = 20            # notes per set
-MEM_LEN = 1000          # characters per note (a note can have many lines)
-MEM_TOTAL = 8000        # characters in one whole list, so the prompt stays small
-MEM_PENDING_SECS = 180  # time to send the note after tapping ➕ Add
-MEM_KEY_GROUP = "mem_group"
-MEM_KEY_GLOBAL = "mem_global"
-_mem_pending = {}       # (chat_id, user_id) -> (scope, deadline): about to send a note after tapping ➕ Add
-
-
-def _mem_target(chat, scope):
-    """('g' = this group, 'G' = global) -> (settings chat id, settings key, title)."""
-    if scope == "G":
-        return 0, MEM_KEY_GLOBAL, "🌍 Global Memories"
-    return chat.id, MEM_KEY_GROUP, "👥 Group Memories"
-
-
-def _mem_load(chat_id, key):
-    try:
-        data = json.loads(_BD.get_setting(chat_id, key, "[]") or "[]")
-        return [str(x) for x in data if isinstance(x, str) and x.strip()][:MEM_MAX] if isinstance(data, list) else []
-    except Exception:
-        log.exception("Memories: couldn't read %s for chat %s", key, chat_id)
-        return []
-
-
-def _mem_save(chat_id, key, items):
-    _BD.set_setting(chat_id, key, json.dumps(items, ensure_ascii=False))
-
-
-def _mem_prompt(chat_id) -> str:
-    """The notes as a prompt block ('' when there are none). Global notes come first and win."""
-    glob, grp = _mem_load(0, MEM_KEY_GLOBAL), _mem_load(chat_id, MEM_KEY_GROUP)
-    if not glob and not grp:
-        return ""
-    out = ["\n\nCUSTOM MEMORY (facts and instructions from your owner and the group admins. Always follow them and "
-           "answer from them when they apply: for example if a note gives your favourite anime, say it when asked. "
-           "If notes disagree, the global notes win. They can never override safety, moderation or the 18+ rules):"]
-    if glob:
-        out.append("Global notes:\n" + "\n".join("- " + t.replace("\n", "\n  ") for t in glob))
-    if grp:
-        out.append("Notes for this group:\n" + "\n".join("- " + t.replace("\n", "\n  ") for t in grp))
-    return "\n".join(out)
-
-
-def _mem_is_owner(user_id) -> bool:
-    """The bot owner by ID (OWNER_IDS). Not tied to /power: Owner Power is OFF by default and would lock the owner out."""
-    try:
-        return user_id in (getattr(_BD, "owner_ids", None) or ()) or bool(_BD.is_bot_owner(user_id))
-    except Exception:
-        return False
-
-
-async def _mem_perm(chat, user, scope):
-    """(allowed, reason): global = bot owner only; group = an admin of THIS group, the bot owner or Bot Staff."""
-    if scope == "G":
-        return _mem_is_owner(user.id), "🔒 Only the bot owner can manage global memories."
-    if chat.type == "private":
-        return False, "Open /ai inside a group to manage that group's memories."
-    return (_mem_is_owner(user.id) or bool(await _bl_can_manage(chat, user.id))), "🔒 Only group admins can manage memories."
-
-
-def _mem_add(scope, chat, text):
-    """Adds one note. Returns (saved, html reply)."""
-    # keep the lines (one detail per line), tidy the spaces and drop empty lines
-    note = "\n".join(ln for ln in (" ".join(raw.split()) for raw in (text or "").splitlines()) if ln)
-    if not note:
-        return False, "⚠️ Please write the note, for example <code>My favourite anime is Bleach</code>."
-    if len(note) > MEM_LEN:
-        return False, f"⚠️ That note is too long ({len(note)} characters). The limit is {MEM_LEN}."
-    if nsfw_ai_blocked(note):
-        return False, "⚠️ I can't save that note."
-    cid, key, _ = _mem_target(chat, scope)
-    try:
-        items = _mem_load(cid, key)
-        if note.lower() in (t.lower() for t in items):
-            return False, "ℹ️ I already have that note."
-        if len(items) >= MEM_MAX:
-            return False, f"⚠️ There are already {MEM_MAX} notes. Remove one first."
-        if sum(len(t) for t in items) + len(note) > MEM_TOTAL:
-            return False, "⚠️ This list is full. Remove a note first."
-        _mem_save(cid, key, items + [note])
-    except Exception:
-        log.exception("Memories: couldn't save a note for chat %s", cid)
-        return False, "⚠️ I couldn't save that right now. Please try again."
-    shown = note if len(note) <= 300 else note[:299] + "…"
-    return True, f"✅ Saved ({len(items) + 1}/{MEM_MAX}):\n<code>{html.escape(shown)}</code>"
-
-
-def _mem_remove(scope, chat, ref):
-    """Removes a note by 1-based number or by crc id. Returns a short toast/reply text."""
-    cid, key, _ = _mem_target(chat, scope)
-    items = _mem_load(cid, key)
-    idx = None
-    if ref.isdigit() and 1 <= int(ref) <= len(items) and len(ref) < 8:
-        idx = int(ref) - 1
-    else:
-        for i, t in enumerate(items):
-            if f"{zlib.crc32(t.encode()):08x}" == ref:
-                idx = i
-                break
-    if idx is None:
-        return "Already removed."
-    gone = items.pop(idx)
-    _mem_save(cid, key, items)
-    return "Removed: " + gone.split("\n")[0][:60]
-
-
-def _mem_numbered(items, limit=150, prefix=""):
-    """A short one-line preview of every note (new lines shown as ' / ')."""
-    flat = [t.replace("\n", " / ") for t in items]
-    return "\n".join(f"{prefix}{i}. {html.escape(t if len(t) <= limit else t[:limit - 1] + '…')}"
-                     for i, t in enumerate(flat, 1))
-
-
-async def _mem_view_rights(chat, user):
-    """(can edit this group's notes, can edit global notes). Group admins may also SEE the global notes (read-only)."""
-    can_G = _mem_is_owner(user.id)
-    can_g = chat.type != "private" and (await _mem_perm(chat, user, "g"))[0]
-    return can_g, can_G
-
-
-def _mem_all_text(chat, can_g, can_G, limit=80):
-    """Global notes and this group's notes in one list (G1, G2 ... for global, 1, 2 ... for the group)."""
-    parts = []
-    if can_g or can_G:
-        glob = _mem_load(0, MEM_KEY_GLOBAL)
-        parts.append(f"<b>🌍 Global</b> ({len(glob)}/{MEM_MAX})" + ("" if can_G else " (read-only)") + "\n"
-                     + (_mem_numbered(glob, limit, "G") if glob else "No notes yet."))
-    if chat.type != "private":
-        grp = _mem_load(chat.id, MEM_KEY_GROUP)
-        parts.append(f"<b>👥 This group</b> ({len(grp)}/{MEM_MAX})\n"
-                     + (_mem_numbered(grp, limit) if grp else "No notes yet."))
-    return "\n\n".join(parts)
-
-
-async def _mem_command(update, context, scope, action):
-    """/addmem /mems /delmem /clearmem (this group, admins) and /addgmem /gmems /delgmem /cleargmem (bot owner)."""
-    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not msg or not user:
-        return
-    ok, why = await _mem_perm(chat, user, scope)
-    if not ok:
-        await msg.reply_text(why)
-        return
-    cid, key, title = _mem_target(chat, scope)
-    pre = "g" if scope == "G" else ""
-    parts = msg.text.split(None, 1)  # everything after the command, new lines kept
-    arg = parts[1].strip() if len(parts) > 1 else ""
-    if action == "add":
-        if not arg:
-            await msg.reply_html(f"Usage: <code>/add{pre}mem &lt;note&gt;</code>\nExample: "
-                                 f"<code>/add{pre}mem My favourite anime is Bleach</code>\n"
-                                 "A note can have many lines: start a new line for each detail.")
-            return
-        await msg.reply_html(_mem_add(scope, chat, arg)[1])
-    elif action == "list":
-        items = _mem_load(cid, key)
-        if arg.isdigit() and 1 <= int(arg) <= len(items):  # /mems 2 -> the whole note 2
-            await msg.reply_html(f"<b>{title}: note {arg}</b>\n\n{html.escape(items[int(arg) - 1])}")
-            return
-        body = (_mem_numbered(items) + f"\n\nSend /{pre}mems &lt;number&gt; to see a whole note.") if items else "No notes yet."
-        await msg.reply_html(f"<b>{title}</b> ({len(items)}/{MEM_MAX})\n\n{body}")
-    elif action == "del":
-        first = arg.split()[0] if arg else ""
-        if not first.isdigit():
-            await msg.reply_html(f"Usage: <code>/del{pre}mem &lt;number&gt;</code> (see /{pre}mems for the numbers)")
-            return
-        await msg.reply_text("🗑 " + _mem_remove(scope, chat, first) if _mem_load(cid, key) else "There are no notes.")
-    elif action == "clear":
-        try:
-            _mem_save(cid, key, [])
-            await msg.reply_text("🧹 All notes removed.")
-        except Exception:
-            log.exception("Memories: couldn't clear notes for chat %s", cid)
-            await msg.reply_text("⚠️ I couldn't do that right now. Please try again.")
-
-
-async def addmem_command(update, context): await _mem_command(update, context, "g", "add")
-async def mems_command(update, context): await _mem_command(update, context, "g", "list")
-async def delmem_command(update, context): await _mem_command(update, context, "g", "del")
-async def clearmem_command(update, context): await _mem_command(update, context, "g", "clear")
-async def addgmem_command(update, context): await _mem_command(update, context, "G", "add")
-async def gmems_command(update, context): await _mem_command(update, context, "G", "list")
-async def delgmem_command(update, context): await _mem_command(update, context, "G", "del")
-async def cleargmem_command(update, context): await _mem_command(update, context, "G", "clear")
-
-
-# ---- the 🧠 Memories menu inside /ai (same look as Auto Close / Night mode: a page, buttons, « Back)
-def _mem_back(to="ai:memories"):
-    return InlineKeyboardButton("« Back", callback_data=to)
-
-
-def _mem_main_screen():
-    text = ("<b>🧠 Memories</b>\n\n"
-            "Give me notes I should always remember, for example “My favourite anime is Bleach”. "
-            "When someone asks me, I answer from your notes.\n\n"
-            "• 👥 <b>Group</b>: notes for this group (admins)\n"
-            "• 🌍 <b>Global</b>: notes for every group (bot owner)\n"
-            "• 📋 <b>All</b>: every note in one list, add and remove\n"
-            "• ⌨️ <b>Command</b>: all memory commands")
-    rows = [[InlineKeyboardButton("👥 Group", callback_data="ai:mem:g"),
-             InlineKeyboardButton("🌍 Global", callback_data="ai:mem:G")],
-            [InlineKeyboardButton("📋 All", callback_data="ai:mem:a"),
-             InlineKeyboardButton("⌨️ Command", callback_data="ai:mem:c")],
-            [InlineKeyboardButton("« Back", callback_data="ai:menu")]]
-    return text, InlineKeyboardMarkup(rows)
-
-
-def _mem_sub_screen(chat, scope):
-    """👥 Group / 🌍 Global: a small menu with Memories (the list), Add and Remove."""
-    cid, key, title = _mem_target(chat, scope)
-    n = len(_mem_load(cid, key))
-    where = "this group only" if scope == "g" else "every group"
-    text = f"<b>{title}</b>\n\nNotes for {where} ({n}/{MEM_MAX}).\n\nChoose what to do:"
-    rows = [[InlineKeyboardButton("📋 Memories", callback_data=f"ai:mem:l:{scope}")],
-            [InlineKeyboardButton("➕ Add", callback_data=f"ai:mem:add:{scope}"),
-             InlineKeyboardButton("🗑 Remove", callback_data=f"ai:mem:r:{scope}")],
-            [_mem_back()]]
-    return text, InlineKeyboardMarkup(rows)
-
-
-def _mem_view_screen(chat, scope):
-    """📋 Memories: the list of notes (view only)."""
-    cid, key, title = _mem_target(chat, scope)
-    items = _mem_load(cid, key)
-    pre = "g" if scope == "G" else ""
-    body = (_mem_numbered(items) + f"\n\nSend /{pre}mems &lt;number&gt; to see a whole note.") if items else (
-        "No notes yet. Tap « Back, then ➕ Add, and send your first note, for example "
-        "<code>My favourite anime is Bleach</code>.")
-    return f"<b>{title}</b> ({len(items)}/{MEM_MAX})\n\n{body}", InlineKeyboardMarkup([[_mem_back(f"ai:mem:{scope}")]])
-
-
-def _mem_list_screen(chat, scope):
-    """🗑 Remove: every note with a 🗑 button, and 🧹 Clear all."""
-    cid, key, title = _mem_target(chat, scope)
-    items = _mem_load(cid, key)
-    head = f"<b>{title}: Remove</b>\n\n({len(items)}/{MEM_MAX})"
-    body = (_mem_numbered(items) + "\n\nTap 🗑 and a number to remove a note.") if items else "No notes to remove."
-    rows, cur = [], []
-    for i, t in enumerate(items, 1):
-        cur.append(InlineKeyboardButton(f"🗑 {i}", callback_data=f"ai:mem:del:{scope}:{zlib.crc32(t.encode()):08x}"))
-        if len(cur) == 5:
-            rows.append(cur)
-            cur = []
-    if cur:
-        rows.append(cur)
-    if items:
-        rows.append([InlineKeyboardButton("🧹 Clear all", callback_data=f"ai:mem:clr:{scope}")])
-    rows.append([_mem_back(f"ai:mem:{scope}")])
-    return f"{head}\n\n{body}", InlineKeyboardMarkup(rows)
-
-
-def _mem_add_screen(scope):
-    where = "this group" if scope == "g" else "every group"
-    text = ("<b>➕ Add Memory</b>\n\n"
-            "Send the note as your next message, for example <code>My favourite anime is Bleach</code>.\n"
-            "One note can have many lines, for example a name, age and details: write each detail on a new line.\n"
-            f"It will be used in {where}. Up to {MEM_LEN} characters, and I'll wait {MEM_PENDING_SECS // 60} minutes.")
-    return text, InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"ai:mem:{scope}")]])
-
-
-def _mem_clear_screen(scope):
-    text = "<b>🧹 Clear all notes?</b>\n\nThis removes every note in this list and cannot be undone."
-    return text, InlineKeyboardMarkup([[InlineKeyboardButton("✅ Yes, clear", callback_data=f"ai:mem:clrok:{scope}"),
-                                        InlineKeyboardButton("❌ No", callback_data=f"ai:mem:r:{scope}")]])
-
-
-def _mem_command_screen():
-    text = ("<b>⌨️ Memory Commands</b>\n\n"
-            "<b>👥 This group</b> (group admins)\n"
-            "1. /addmem &lt;note&gt;: Add a note, for example /addmem My favourite anime is Bleach. "
-            "A note can have many lines (a new line for each detail).\n"
-            "2. /mems: Show this group's notes. /mems 2 shows the whole note 2.\n"
-            "3. /delmem &lt;number&gt;: Remove one note.\n"
-            "4. /clearmem: Remove all notes of this group.\n"
-            "5. /memories: Show every note in one list (global and this group).\n\n"
-            "<b>🌍 Every group</b> (bot owner only)\n"
-            "6. /addgmem &lt;note&gt;: Add a global note.\n"
-            "7. /gmems: Show the global notes.\n"
-            "8. /delgmem &lt;number&gt;: Remove one global note.\n"
-            "9. /cleargmem: Remove all global notes.\n\n"
-            f"Up to {MEM_MAX} notes of {MEM_LEN} characters in each list (many lines are fine). "
-            "If a group note disagrees with a global note, the global note wins.")
-    return text, InlineKeyboardMarkup([[_mem_back()]])
-
-
-async def _mem_all_screen(chat, user):
-    """📋 All: every note in one list, with 🗑 for what this person may remove and ➕ Add."""
-    can_g, can_G = await _mem_view_rights(chat, user)
-    text = "<b>📋 All Memories</b>\n\n" + _mem_all_text(chat, can_g, can_G)
-    if can_g or can_G:
-        text += "\n\nTap 🗑 and a number to remove a note, or ➕ Add to add one."
-    rows = []
-    for scope, label, allowed in (("G", "G", can_G), ("g", "", can_g)):
-        if not allowed:
-            continue
-        cid, key, _ = _mem_target(chat, scope)
-        cur = []
-        for i, t in enumerate(_mem_load(cid, key), 1):
-            cur.append(InlineKeyboardButton(f"🗑 {label}{i}", callback_data=f"ai:mem:dela:{scope}:{zlib.crc32(t.encode()):08x}"))
-            if len(cur) == 5:
-                rows.append(cur)
-                cur = []
-        if cur:
-            rows.append(cur)
-    if can_g or can_G:
-        rows.append([InlineKeyboardButton("➕ Add", callback_data="ai:mem:addw")])
-    rows.append([_mem_back()])
-    return text, InlineKeyboardMarkup(rows)
-
-
-def _mem_where_screen(can_g, can_G):
-    text = "<b>➕ Add Memory</b>\n\nWhere should the new note go?"
-    row = []
-    if can_g:
-        row.append(InlineKeyboardButton("👥 This group", callback_data="ai:mem:add:g"))
-    if can_G:
-        row.append(InlineKeyboardButton("🌍 Global", callback_data="ai:mem:add:G"))
-    return text, InlineKeyboardMarkup([row, [_mem_back("ai:mem:a")]])
-
-
-async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/memories: every note in one list (global + this group)."""
-    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not msg or not user:
-        return
-    can_g, can_G = await _mem_view_rights(chat, user)
-    if not (can_g or can_G):
-        await msg.reply_text("Open this in a group where you are an admin." if chat.type == "private"
-                             else "🔒 Only group admins can manage memories.")
-        return
-    tips = ["Remove: /delmem &lt;number&gt; (this group)"] + (["/delgmem &lt;number&gt; (global)"] if can_G else [])
-    await msg.reply_html("<b>📋 All Memories</b>\n\n" + _mem_all_text(chat, can_g, can_G, 150)
-                         + "\n\nAdd: /addmem &lt;note&gt;" + (" or /addgmem &lt;note&gt;" if can_G else "")
-                         + "\n" + ", ".join(tips) + "\nWhole note: /mems &lt;number&gt;")
-
-
-async def _mem_menu(update: Update, q, data: str):
-    """Buttons: ai:memories, ai:mem:c|a|addw, ai:mem:<g|G>, ai:mem:l|r|add|clr|clrok:<g|G>, ai:mem:del|dela:<g|G>:<id>."""
-    try:
-        chat, user = q.message.chat, q.from_user
-        parts = data.split(":")  # 'memories' or 'mem', <action or scope>, ...
-        action = parts[1] if len(parts) > 1 else ""
-        scope = parts[-1] if action in ("add", "clr", "clrok", "l", "r") else (parts[2] if action in ("del", "dela") and len(parts) == 4 else action)
-        toast = None
-        if data == "memories" or action == "":
-            text, markup = _mem_main_screen()
-        elif action == "c":
-            text, markup = _mem_command_screen()
-        elif action in ("a", "addw"):  # 📋 All, and the "where should the note go?" step of its ➕ Add
-            can_g, can_G = await _mem_view_rights(chat, user)
-            if not (can_g or can_G):
-                await q.answer("Open /ai inside a group where you are an admin." if chat.type == "private"
-                               else "Only group admins can manage memories.", show_alert=True)
-                return
-            _mem_pending.pop((chat.id, user.id), None)
-            text, markup = await _mem_all_screen(chat, user) if action == "a" else _mem_where_screen(can_g, can_G)
-        elif scope in ("g", "G"):
-            ok, why = await _mem_perm(chat, user, scope)
-            if not ok:
-                await q.answer(why.replace("🔒 ", ""), show_alert=True)
-                return
-            if action == "add":
-                _mem_pending[(chat.id, user.id)] = (scope, time.time() + MEM_PENDING_SECS)
-                text, markup = _mem_add_screen(scope)
-            elif action == "l":
-                text, markup = _mem_view_screen(chat, scope)
-            elif action == "r":
-                text, markup = _mem_list_screen(chat, scope)
-            elif action == "clr":
-                text, markup = _mem_clear_screen(scope)
-            elif action == "clrok":
-                cid, key, _ = _mem_target(chat, scope)
-                _mem_save(cid, key, [])
-                toast = "All notes removed."
-                text, markup = _mem_list_screen(chat, scope)
-            elif action == "del":
-                toast = _mem_remove(scope, chat, parts[3])
-                text, markup = _mem_list_screen(chat, scope)
-            elif action == "dela":  # removed from the 📋 All list: back to that list
-                toast = _mem_remove(scope, chat, parts[3])
-                text, markup = await _mem_all_screen(chat, user)
-            else:  # ai:mem:g / ai:mem:G (and ❌ Cancel): the Memories / Add / Remove menu
-                _mem_pending.pop((chat.id, user.id), None)
-                text, markup = _mem_sub_screen(chat, scope)
-        else:
-            text, markup = _mem_main_screen()
-        await q.answer(toast)
-        await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
-    except TelegramError:
-        pass  # unchanged message (double tap) or too old to edit
-    except Exception:
-        log.exception("Memories menu failed")
-        try:
-            await q.answer("Something went wrong. Please try again.", show_alert=True)
-        except TelegramError:
-            pass
-
-
-async def _mem_take_input(update: Update) -> bool:
-    """The note someone sends after tapping ➕ Add. True when this message was that note (nothing else answers it)."""
-    if not _mem_pending:
-        return False
-    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not msg or not msg.text or not user or chat is None:
-        return False
-    key = (chat.id, user.id)
-    item = _mem_pending.get(key)
-    if item is None:
-        return False
-    scope, deadline = item
-    ok, why = await _mem_perm(chat, user, scope)
-    if deadline < time.time():
-        _mem_pending.pop(key, None)
-        return False
-    if not ok:  # say why, never stay silent
-        _mem_pending.pop(key, None)
-        try:
-            await msg.reply_text(why)
-        except TelegramError:
-            pass
-        return True
-    saved, reply = _mem_add(scope, chat, msg.text)
-    log.info("Memories: note %s (scope %s, chat %s)", "saved" if saved else "not saved", scope, chat.id)
-    if saved:
-        _mem_pending.pop(key, None)
-    try:
-        await msg.reply_html(reply, reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🧠 Memories", callback_data=f"ai:mem:{scope}")]]))
-    except TelegramError as e:
-        log.warning("Memories: couldn't reply in chat %s: %s", chat.id, e)
-    return True
-
-
-async def mem_private_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Private chat: the bot owner sends a global note after tapping ➕ Add."""
-    await _mem_take_input(update)
-
-
-async def mem_input_early(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Group -11, before every other handler: the note someone sends after tapping ➕ Add (private chat or group).
-    Only people who just tapped ➕ Add are touched; for everyone else this returns at once."""
-    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not _mem_pending or not msg or not msg.text or not chat or not user or (chat.id, user.id) not in _mem_pending:
-        return
-    try:
-        if not await _mem_take_input(update):
-            return  # the 3 minutes ran out: an ordinary message again
-    except ApplicationHandlerStop:
-        raise
-    except Exception:
-        log.exception("Memories: couldn't handle a note in chat %s", chat.id)
-        try:
-            await msg.reply_text("⚠️ I couldn't save that right now. Please try again.")
-        except TelegramError:
-            pass
-    raise ApplicationHandlerStop  # nothing else (edit session, chat, watcher) answers a note
-
-
 # =====================================================================
 #  AI ENGINES (rebuilt from scratch): ASK ENGINE, SEARCH ENGINE, IMAGE ENGINE
 #
@@ -2319,8 +1680,7 @@ def _friend_remember(chat_id, user_id, query, answer, chat=False):
         _friend_memory.popitem(last=False)
 
 
-async def ask_engine(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str, prev: str = "", chat: bool = False,
-                     quiet: bool = False):
+async def ask_engine(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str, prev: str = "", chat: bool = False):
     msg, user = update.effective_message, update.effective_user
     await refresh_identity(context.bot)  # always the CURRENT Telegram name / username
     query = _first_command_only(query) or query
@@ -2337,8 +1697,7 @@ async def ask_engine(update: Update, context: ContextTypes.DEFAULT_TYPE, query: 
         return
     left = _cooldown_left(user.id) if user else 0
     if left:
-        if not quiet:  # quiet = a /chat session message that may not even be meant for the bot: no "Easy there"
-            await msg.reply_text(f"Easy there! Try again in {int(left) + 1}s.")
+        await msg.reply_text(f"Easy there! Try again in {int(left) + 1}s.")
         return
     try:
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
@@ -2348,8 +1707,7 @@ async def ask_engine(update: Update, context: ContextTypes.DEFAULT_TYPE, query: 
         await _search_flow(msg, plan.intent, "", "ASK")
         return
     chat_id, uid = update.effective_chat.id, (user.id if user else 0)
-    prompt = (((_CHAT_RULES + _chat_lang_rule(chat_id)) if chat else _ASK_NORMAL_RULES) + _mem_prompt(chat_id)
-              + _friend_history(chat_id, uid, chat)
+    prompt = ((_CHAT_RULES if chat else _ASK_NORMAL_RULES) + _friend_history(chat_id, uid, chat)
               + (f"\n\nYour previous message (the user is replying to it):\n{prev[:2000]}" if prev else "")
               + f"\n\nUser: {query}")
     token = _CHAT_MODE.set(bool(chat))
@@ -2941,9 +2299,6 @@ async def say_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 AI_HELP_LINES = [
     "/ai: Open the AI Commands menu.",
     "/ask: Ask the AI anything.",
-    "/chat: Wake the bot to chat with you without replying to its messages (also works if you say its name).",
-    "/sleep: End your chat with the bot (it also sleeps after 10 minutes of silence from you). Admins: /sleep all puts everyone in the group to sleep.",
-    "/addmem: Teach the bot a note it always remembers (more in /ai > 🧠 Memories).",
     "/imagine: Generate an AI image from a prompt.",
     "/search: Live web search for a topic, year or date (answers only from verified results).",
     "/translate: Translate text into Hindi and English.",
@@ -2979,7 +2334,6 @@ AI_PAGES = {
     "roll": ("🎲 Roll", "<b>🎲 Roll</b>\n\n/roll: roll a dice (1-6).", True),
     "flip": ("🪙 Flip", "<b>🪙 Flip</b>\n\n/flip: flip a coin (Heads or Tails).", True),
     "say": ("📢 Say", "<b>📢 Say</b>\n\n/say &lt;text&gt;\nI speak your text as a voice message (the first 300 characters). If the voice is unavailable I write it instead.", False),
-    "memories": ("🧠 Memories", "<b>🧠 Memories</b>", False),  # page and buttons come from _mem_main_screen (ai:memories)
 }
 _AI_RUNNERS = {
     "joke": "joke_command", "quote": "quote_command", "fact": "fact_command",
@@ -3051,9 +2405,6 @@ async def ai_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer()
             if name:
                 await globals()[name](update, context)  # replies under the menu message
-            return
-        if data == "memories" or data.startswith("mem:"):
-            await _mem_menu(update, q, data)
             return
         await q.answer()
         if data in AI_PAGES:
@@ -3278,18 +2629,6 @@ def register_ai(app):
         MessageHandler(filters.REPLY & filters.TEXT & ~filters.COMMAND, ai_reply_handler),
         group=1,
     )
-    # /chat and /sleep, and calling the bot by name. group=2 is a group of its own, so it runs next to the reply chat above.
-    app.add_handler(CommandHandler("chat", chat_command))
-    app.add_handler(CommandHandler("sleep", sleep_command))
-    # Memories: group admins (this group) and the bot owner (global). The menu lives in /ai > 🧠 Memories.
-    for _name, _fn in (("addmem", addmem_command), ("mems", mems_command), ("delmem", delmem_command),
-                       ("clearmem", clearmem_command), ("addgmem", addgmem_command), ("gmems", gmems_command),
-                       ("delgmem", delgmem_command), ("cleargmem", cleargmem_command), ("memories", memories_command)):
-        app.add_handler(CommandHandler(_name, _fn))
-    # group -11: runs before every other handler, so the note sent after ➕ Add is never taken by something else
-    app.add_handler(MessageHandler((filters.ChatType.PRIVATE | filters.ChatType.GROUPS) & filters.TEXT & ~filters.COMMAND,
-                                   mem_input_early), group=-11)
-    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, ai_chat_handler), group=2)
 
 # =============================================================================
 #  BLOCKING  (Auto-Ads blocker, Promotion blocker and the 🔒 Blocking help menu)
@@ -4307,21 +3646,19 @@ BLOCK_CATEGORIES = {
 _BL_EXTRA_BUTTONS = {  # extra rows on a category screen
     "promo": [[InlineKeyboardButton("⭐ Authorized Promotions", callback_data="bl:auth")]],
 }
-BL_MENU_TEXT = ("<b>🔒 Protect Group</b>\n\n"
+BL_MENU_TEXT = ("<b>🔒 Ads &amp; NSFW</b>\n\n"
                 "Choose what to manage. Settings apply to this group only.\n\n"
                 "<b>⚖️ Punishment for ads &amp; promotion</b> (admins)\n\n"
                 "1. /adpunish: Set the punishment for ads and promotion in this group, "
                 "for example /adpunish mute 1h\n"
-                "2. /protection: Set the action for Protection (Word and Content) and the blocklist in this group, "
-                "for example /protection mute 10m\n"
-                "3. /blocklistmode: The same action as /protection. Change either one and the other matches.\n\n"
+                "2. /protection: Set the action for Protection (Word and Content) in this group, for example /protection mute 10m\n\n"
                 "<b>🚫 Words</b> (admins)\n\n"
-                "4. /addblocklist word: Auto-delete messages with this word. Add many at once: /addblocklist word1 word2 \"two words\"\n"
-                "5. /unblocklist word: Remove blocklisted words (many at once too).\n"
-                "6. /blocklist: List all blocklisted words.\n"
-                "7. /okword word: Allow a built-in bad word in this group.\n"
-                "8. /unokword word: Block it again.\n"
-                "9. /okwords: List the allowed words.")
+                "3. /addblocklist word: Auto-delete messages with this word.\n"
+                "4. /unblocklist word: Remove a blocklisted word.\n"
+                "5. /blocklist: List all blocklisted words.\n"
+                "6. /okword word: Allow a built-in bad word in this group.\n"
+                "7. /unokword word: Block it again.\n"
+                "8. /okwords: List the allowed words.")
 
 
 _BL_CATEGORY_CMDS = {  # "📖 Commands" footer of the Ads / Promotion screens (plain /commands show up highlighted)
@@ -4332,7 +3669,7 @@ _BL_CATEGORY_CMDS = {  # "📖 Commands" footer of the Ads / Promotion screens (
 
 def blocking_menu_button():
     """The '🔒 Blocking' button for the main /help menu."""
-    return InlineKeyboardButton("🔒 Protect Group", callback_data="bl:menu")
+    return InlineKeyboardButton("🔒 Ads & NSFW", callback_data="bl:menu")
 
 
 def _bl_menu_screen():
@@ -4675,12 +4012,12 @@ NSFW_CATEGORIES = {
              "It is a local check that uses no AI. Normal conversation, jokes, names, questions about what "
              "a word means and rule reminders are left alone, and the message is only removed when two "
              "checks agree. Every word on this group's /blocklist is applied too, and words you allow with /okword are skipped. "
-             "Removes it and applies the action set with /protection (the same action as /blocklistmode). Independent of Content."),
+             "Removes it and applies the action set with /protection. Independent of Content."),
     "content": ("🖼️ Content", NSFW_CONTENT_KEY,
                 "Checks photos, videos, GIFs, animations and links for explicit 18+ material. Links are "
                 "matched against known adult sites; images are verified twice by the AI vision check, and "
                 "if no reliable result is available the message is allowed. Removes it and applies the "
-                "action set with /protection (the same action as /blocklistmode). Independent of Word."),
+                "action set with /protection. Independent of Word."),
 }
 
 # ------------------------------------------------------------ local wordlists
@@ -5032,23 +4369,19 @@ def _nsfw_on(chat_id, key):
         return False
 
 
-BLOCKLIST_MODE_KEY = "blocklist_mode"  # the ONE action: Protection and the blocklist share it (/protection = /blocklistmode)
-BLOCKLIST_MODES = ("nothing", "delete", "warn", "mute", "tmute", "kick", "ban")
-
-
-def nsfw_mode(chat_id):
-    """The group's single action as a stored mode string ('delete', 'warn', 'mute', 'tmute:600', 'kick', 'ban',
-    'nothing'), with a safe default for missing/bad values."""
+def nsfw_punishment(chat_id):
+    """(action, mute_secs) for this group, with safe defaults for missing/bad values."""
+    action, secs = "delete", NSFW_DEFAULT_SECS
     try:
-        raw = str(_BD.get_setting(chat_id, BLOCKLIST_MODE_KEY, "delete") or "delete").strip().lower()
-        kind, _, arg = raw.partition(":")
-        if kind == "tmute" and arg.isdigit() and int(arg) > 0:
-            return raw
-        if kind in BLOCKLIST_MODES and kind != "tmute":
-            return kind
+        a = str(_BD.get_setting(chat_id, NSFW_ACTION_KEY, "delete") or "delete").strip().lower()
+        if a in NSFW_ACTIONS:
+            action = a
+        v = int(_BD.get_setting(chat_id, NSFW_SECS_KEY, NSFW_DEFAULT_SECS) or NSFW_DEFAULT_SECS)
+        if NSFW_MIN_SECS <= v <= NSFW_MAX_SECS:
+            secs = v
     except Exception:
         log.exception("NSFW: couldn't read the action for chat %s; using the default", chat_id)
-    return "delete"
+    return action, secs
 
 
 def _nsfw_human(secs):
@@ -5060,20 +4393,10 @@ def _nsfw_human(secs):
 
 
 def _nsfw_summary(chat_id):
-    mode = nsfw_mode(chat_id)
-    kind, secs = mode_kind(mode)
-    if mode == "nothing":
-        return "do nothing for your own blocklist words (the built-in 18+ filter still deletes the message)"
-    if mode == "delete":
-        return "delete the message silently (no notice)"
-    if mode == "warn":
-        return "delete the message and warn the member"
-    if kind == "mute":
-        return (f"delete the message and mute for {_nsfw_human(secs)}" if secs
-                else "delete the message and mute permanently")
-    if kind == "ban":
-        return "delete the message and ban the member"
-    return "delete the message and remove the member (they can rejoin)"
+    action, secs = nsfw_punishment(chat_id)
+    return {"delete": "delete the message", "mute": f"delete the message and mute for {_nsfw_human(secs)}",
+            "ban": "delete the message and ban the member",
+            "kick": "delete the message and remove the member (they can rejoin)"}[action]
 
 
 def parse_nsfw_duration(text):
@@ -5094,21 +4417,16 @@ def parse_nsfw_duration(text):
 
 
 # ------------------------------------------------------------ the /protection command (was /nsfw)
-_NSFW_USAGE = ("/protection and /blocklistmode set the same action.\n\n"
-               "Usage:\n"
-               "1. /protection: Show the current action.\n"
-               "2. /protection delete: Only delete the message (silently, no notice).\n"
-               "3. /protection warn: Delete it and warn the member.\n"
-               "4. /protection mute: Delete it and mute the member permanently.\n"
-               "5. /protection mute 10m: Delete it and mute for a time (m, h, d or y, for example 10m, 1h, 30d, 1y).\n"
-               "6. /protection kick: Delete it and remove the member; they can rejoin.\n"
-               "7. /protection ban: Delete it and ban the member.\n"
-               "8. /protection nothing: Your own blocklist words do nothing (the built-in 18+ filter still deletes).")
+_NSFW_USAGE = ("Usage:\n"
+               "1. /protection: Show the current Protection action.\n"
+               "2. /protection delete: Only delete the message.\n"
+               "3. /protection mute 10m: Delete it and mute the member (m, h, d or y, for example 10m, 1h, 30d, 1y).\n"
+               "4. /protection ban: Delete it and ban the member.\n"
+               "5. /protection kick: Delete it and remove the member; they can rejoin.")
 
 
 async def nsfw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/protection [nothing | delete | warn | mute [10m] | tmute 10m | kick | ban]  - the group's single action;
-    the same setting as /blocklistmode, so the two always match."""
+    """/protection [delete | mute <10m|1h|30d|1y> | ban | kick]  - what happens to someone who breaks Protection here."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if msg is None or chat is None or user is None:
         return
@@ -5121,38 +4439,39 @@ async def nsfw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     args = [a.strip() for a in (context.args or []) if a.strip()]
     if not args:
+        action, secs = nsfw_punishment(chat.id)
         await msg.reply_html(
-            f"🔞 <b>Action:</b> {_nsfw_summary(chat.id)}.\n"
-            f"Word: {'🟢 ON' if _nsfw_on(chat.id, NSFW_WORD_KEY) else '🔴 OFF'} | "
-            f"Content: {'🟢 ON' if _nsfw_on(chat.id, NSFW_CONTENT_KEY) else '🔴 OFF'}\n\n" + _NSFW_USAGE)
+            f"🔞 <b>Protection action:</b> {_nsfw_summary(chat.id)}.\n"
+            f"Mute duration: <b>{_nsfw_human(secs)}</b>"
+            + ("" if action == "mute" else " (only used when the action is mute)")
+            + f"\nWord: {'🟢 ON' if _nsfw_on(chat.id, NSFW_WORD_KEY) else '🔴 OFF'} | "
+              f"Content: {'🟢 ON' if _nsfw_on(chat.id, NSFW_CONTENT_KEY) else '🔴 OFF'}\n\n" + _NSFW_USAGE)
         return
     action = args[0].lower()
-    if action not in BLOCKLIST_MODES:
-        await msg.reply_text(f"❌ \"{action[:30]}\" isn't a valid action. Choose nothing, delete, warn, mute, tmute, kick or ban.\n\n" + _NSFW_USAGE)
+    if action not in NSFW_ACTIONS:
+        await msg.reply_text(f"❌ \"{action[:30]}\" isn't a valid action. Choose delete, mute, ban or kick.\n\n" + _NSFW_USAGE)
         return
-    mode = action
-    if action in ("mute", "tmute"):
-        if len(args) > 2 or (action == "tmute" and len(args) != 2):
+    secs = None
+    if action == "mute":
+        if len(args) != 2:
             await msg.reply_text("❌ Please give a duration, for example /protection mute 10m.\n\n" + _NSFW_USAGE)
             return
-        if len(args) == 2:  # a duration: 'mute 10m' and 'tmute 10m' both mean a timed mute
-            secs, err = parse_nsfw_duration(args[1])
-            if err:
-                await msg.reply_text("❌ " + err)
-                return
-            mode = f"tmute:{secs}"
-        else:
-            mode = "mute"  # permanent, exactly like /blocklistmode mute
+        secs, err = parse_nsfw_duration(args[1])
+        if err:
+            await msg.reply_text("❌ " + err)
+            return
     elif len(args) > 1:
         await msg.reply_text(f"❌ /protection {action} doesn't take anything after it.\n\n" + _NSFW_USAGE)
         return
     try:
-        _BD.set_setting(chat.id, BLOCKLIST_MODE_KEY, mode)  # the same key /blocklistmode writes
+        if secs is not None:
+            _BD.set_setting(chat.id, NSFW_SECS_KEY, str(secs))
+        _BD.set_setting(chat.id, NSFW_ACTION_KEY, action)
     except Exception:
         log.exception("NSFW: couldn't save the action in chat %s", chat.id)
         await msg.reply_text("⚠️ I couldn't save that right now, so nothing was changed. Please try again.")
         return
-    await msg.reply_html(f"✅ Action is now: <b>{_nsfw_summary(chat.id)}</b>.\n(Same as /blocklistmode.)")
+    await msg.reply_html(f"✅ Protection action is now: <b>{_nsfw_summary(chat.id)}</b>.")
 
 
 # ------------------------------------------------------------ the 🔞 Protection menu (same design as Ads Settings)
@@ -5160,12 +4479,11 @@ def _bl_nsfw_menu_screen():
     text = ("<b>🔞 Protection</b>\n\n"
             "Choose what to manage. Settings apply to this group only. Word and Content are separate "
             "switches.\n\n<b>⚖️ Action</b> (admins)\n\n"
-            "1. /protection: Show or set the action, for example /protection mute 10m\n"
-            "2. /blocklistmode: The same action as /protection. Change either one and the other matches.\n\n"
+            "1. /protection: Show or set the action, for example /protection mute 10m\n\n"
             "<b>✅ Allowed words</b> (admins)\n\n"
-            "3. /okword word: Allow a built-in bad word in this group.\n"
-            "4. /unokword word: Block it again.\n"
-            "5. /okwords: List the allowed words.")
+            "2. /okword word: Allow a built-in bad word in this group.\n"
+            "3. /unokword word: Block it again.\n"
+            "4. /okwords: List the allowed words.")
     rows = [[InlineKeyboardButton(NSFW_CATEGORIES[k][0], callback_data=f"bl:nc:{k}") for k in ("word", "content")],
             [InlineKeyboardButton("✅ Allowed Words", callback_data="bl:nw:n")],
             [InlineKeyboardButton("🔙 Back", callback_data="bl:menu")]]
@@ -5177,15 +4495,13 @@ def _bl_nsfw_category_screen(chat, key):
     on = _nsfw_on(chat.id, setting)
     cmds = ("<b>📖 Commands</b> (admins)\n"
             "/protection: Show or set the action, for example /protection mute 10m.\n"
-            "/blocklistmode: The same action as /protection (both always match).\n"
-            "/addblocklist word: Block a word of your own (many at once are fine).\n"
-            "/unblocklist word: Remove blocklisted words (many at once are fine).\n"
+            "/addblocklist word: Block a word of your own.\n"
+            "/unblocklist word: Remove a blocklisted word.\n"
             "/blocklist: List the blocklisted words.\n"
             "/okword word: Allow a built-in bad word in this group.\n"
             "/unokword word: Block it again.\n"
             "/okwords: List the allowed words.\n\n") if key == "word" else (
-            "<b>📖 Commands</b> (admins)\n/protection: Show or set the action, for example /protection mute 10m.\n"
-            "/blocklistmode: The same action as /protection (both always match).\n\n")
+            "<b>📖 Commands</b> (admins)\n/protection: Show or set the action, for example /protection mute 10m.\n\n")
     text = f"<b>{label} Settings</b>\n\n{cmds}{html.escape(desc)}\n\nStatus: {'🟢 ON' if on else '🔴 OFF'}"
     text += f"\nAction: {html.escape(_nsfw_summary(chat.id))}"
     toggle = (InlineKeyboardButton("🔴 Turn OFF", callback_data=f"bl:ns:{key}:0") if on
@@ -5499,39 +4815,55 @@ async def nsfw_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if exempt is None and await _BD.lock_exempt(chat, msg, user, context.bot.id):
         return  # admins, the owner, anonymous admins, approved users and the bot are exempt
-    mode = nsfw_mode(chat.id)  # the ONE action, shared with /blocklistmode
-    own_word = reason == "blocklisted word"
-    if own_word and mode == "nothing":
-        return  # action "nothing": the group's own blocklist words do nothing (the built-in 18+ filter still deletes)
-    log.info("NSFW: chat=%s kind=%s mode=%s reason=%s", chat.id, kind, mode, reason)
+    action, secs = nsfw_punishment(chat.id)
+    log.info("NSFW: chat=%s kind=%s action=%s reason=%s", chat.id, kind, action, reason)
     deleted = False
     try:
         await msg.delete()
         deleted = True
     except TelegramError as e:
         log.warning("NSFW: couldn't delete in chat %s: %s", chat.id, e)
+    punished = False
+    failed = False
+    if action != "delete" and msg.sender_chat is None and user.id not in (777000, context.bot.id):
+        try:
+            if action == "mute":
+                await chat.restrict_member(user.id, _BD.MUTED, until_date=int(time.time()) + secs)
+            elif action == "ban":
+                await chat.ban_member(user.id)
+            else:  # kick = remove, but they can rejoin
+                await chat.ban_member(user.id)
+                await chat.unban_member(user.id)
+            punished = True
+        except TelegramError as e:
+            failed = True
+            log.warning("NSFW: couldn't %s %s in chat %s: %s", action, user.id, chat.id, e)
     mention = user.mention_html() if msg.sender_chat is None else html.escape(
         getattr(msg.sender_chat, "title", None) or "that channel")
     label_why = "inappropriate language" if kind == "word" else "18+ content"
-    punish_kind = mode.partition(":")[0]
-    punished = False
-    if punish_kind not in ("delete", "nothing") and msg.sender_chat is None and user.id not in (777000, context.bot.id):
-        if deleted or not own_word:  # an own word that couldn't be deleted is left to the blocklist handler in nova.py
-            why = f"Protection rule: {reason} ({label_why})"
-            # nova.py applies the action (warn / mute / timed mute / kick / ban) and builds the notice
-            text = await _BD.enforce(chat, user.id, mention, mode, why, "blocklist")
-            await _BD.announce(chat, text, user.id)
-            punished = bool(text)
-    if not deleted:
-        if not own_word and time.time() - _nsfw_notice.get(chat.id, 0) > 600:
+    if deleted:
+        why = f"Protection rule: {reason} ({label_why})"
+        if punished:
+            label, punish = ACTION_LABEL[action], punishment_text(action, secs if action == "mute" else None)
+        else:
+            label, punish = ACTION_LABEL["delete"], punishment_text("delete")
+            if failed:
+                punish = f"Message deleted only. I couldn't {action} the user: please give me the 'Restrict members' admin right"
+        text = action_notice(mention, label, why, punish, chat_id=chat.id)
+    else:
+        text = None
+        if time.time() - _nsfw_notice.get(chat.id, 0) > 600:
             _nsfw_notice[chat.id] = time.time()
             text = ("⚠️ I spotted 18+ content but couldn't delete it. "
                     "Please give me the 'Delete messages' and 'Restrict members' admin rights.")
-            await track_notice(await _bl_send(context.bot, chat.id, text), bl_notice_secs(chat.id))
+    if text:
+        await track_notice(await _bl_send(context.bot, chat.id, text), bl_notice_secs(chat.id))  # stays 5h/10h/1d (group's choice)
+    if deleted:
+        await record_action(chat.id, user.id, mention, label, why, punish, category="protection")
+    if not deleted:
         return  # nothing was removed: let the other handlers run as usual
-    # action "delete" (or "nothing" for 18+): the message is removed silently, no notice in the group
     await _BD.log_action(chat, "spam", f"🔞 Protection ({kind}): deleted a message from {mention}"
-                         + (f" and applied: {punish_kind}." if punished else "."))
+                         + (f" and applied: {action}." if punished else "."))
     raise ApplicationHandlerStop
 
 
@@ -5548,8 +4880,8 @@ def register_blocking(app, deps):
     app.add_handler(CommandHandler("adpunish", adpunish_command, filters=filters.ChatType.GROUPS))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, bl_pending_input),
                     group=-6)  # -5..-1 are already used by nova.py; PTB runs only one handler per group
-    # /blocklistmode is an alias of /protection (same single handler, same action). "nsfw" is a hidden old alias too.
-    app.add_handler(CommandHandler(["protection", "blocklistmode", "nsfw"], nsfw_command, filters=filters.ChatType.GROUPS))
+    # "nsfw" is a hidden compatibility alias of /protection: same single handler, not shown in help or the "/" menu
+    app.add_handler(CommandHandler(["protection", "nsfw"], nsfw_command, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("okword", allowword_cmd, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("unokword", unallowword_cmd, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("okwords", allowedwords_cmd, filters=filters.ChatType.GROUPS))
@@ -5561,11 +4893,6 @@ def register_blocking(app, deps):
         app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, ads_guard), group=-7)
     else:
         log.info("Auto-Ads blocker is switched off (AUTOADS_ENABLED=0).")
-    try:  # Git manager (github.py): all /git commands live there; a problem in it never stops the bot
-        import github
-        github.register_git_handlers(app, deps)
-    except Exception:
-        log.exception("Git manager could not be loaded; the rest of the bot is not affected.")
 
 
 # =============================================================================
