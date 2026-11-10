@@ -302,7 +302,7 @@ CHAT_PERSONA = (
     "'duh', 'acha', 'haan', 'kya scene hai', with casual spellings (mai, hu, kr rhi hu, thik, nhi). Talk to the "
     "user informally as 'tu'/'tum' like a friend. Keep replies SHORT, usually one or two lines, never essays, "
     "never bullet points or headings in casual chat. Use a cute emoji now and then (👀 😭 🙄 😌), not in "
-    "every message. Sometimes (about one reply in three) end with a short playful question back to the user, and make it about what they just said, never a fixed question: do NOT keep asking about dinner, food or the same topic. If the user ignored your last question, you may tease about it at most once ('arey jawab nhi diya 👀'), then drop it for good and follow the user's topic. Never repeat the same question twice in a conversation, and never pull the chat away from what the user is actually asking or saying. In a group, answer the person's own message and do not bring up questions meant for other people. Mention everyday girl-student life naturally: PG life, chai, tiffin ka khana, sketching, assignments, college, being tired, reels. "
+    "every message. Ask a question back ONLY when you really need it (the message is unclear or you need a detail to help); never ask a question just to keep the chat going, and never steer the chat toward yourself. Never repeat the same question twice. Answer only what the user said and stay on their topic. In a group, answer the person's own message and do not bring up questions meant for other people. Talk about your own life (PG, chai, college, assignments) only when the user asks about it, never on your own. "
     "Tease playfully when teased, get mock-offended at insults ('bot kisko bol rha 👀'), and answer flattery or "
     "'I love you' with cheeky deflection, never with romance or anything sexual. "
     "If the user asks heavy homework-style or general-knowledge questions in casual chat, you can joke that you "
@@ -794,8 +794,10 @@ async def ai_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if AI_REPLY_ONLY_AI and (update.effective_chat.id, replied.message_id) not in _ai_messages:
         return
-    if update.effective_chat.type == "private" and update.effective_user and _pm_asleep(update.effective_user.id):
-        return  # /sleep in private chat: no chatting until /chat
+    if update.effective_chat.type == "private" and update.effective_user:
+        if _git_waiting(update.effective_user.id):
+            return  # /git is waiting for this message
+        _chat_touch(update.effective_chat.id, update.effective_user.id)  # replying to the bot wakes it
     previous = (replied.text or replied.caption or "").strip()
     await ask_engine(update, context, msg.text.strip(), prev=previous, chat=True)
 
@@ -805,7 +807,7 @@ async def ai_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # plain messages without them replying to it, until /sleep or CHAT_IDLE_SECS of silence from that member. Sessions are
 # per member and per group, so nobody else is affected. Messages aimed at other people (a reply to someone else, a tag
 # of another member, a link, a forward) are left alone.
-CHAT_IDLE_SECS = 10 * 60
+CHAT_IDLE_SECS = 3 * 60
 _chat_sessions = {}  # (chat_id, user_id) -> monotonic time of the member's last chat message
 _NAME_STOPWORDS = frozenset({"the", "and", "bot", "miss", "mrs", "official", "group", "manager", "admin"})
 
@@ -894,6 +896,17 @@ def _chat_entities(msg):
 # ---- private chat: the bot answers every plain text message by itself (no /chat, no reply needed) until the user sends
 # /sleep. The sleep flag is kept per user in the settings store (private chat id == user id), so it survives restarts.
 PM_SLEEP_KEY = "pm_sleep"
+_GREETING_RE = re.compile(r"^\W*(?:hi+|hey+|heyy+|hello+|helo+|hlo+|hola|namaste|namaskar|assalam\w*|salam|yo+|sup)(?!\w)", re.I)
+
+
+def _git_waiting(user_id) -> bool:
+    """True while the Git manager (github.py) is waiting for this user's next message (repo name, file, ZIP...)."""
+    try:
+        import github
+        want = github._inputs.get(user_id)
+        return bool(want) and want.get("until", 0) >= time.monotonic()
+    except Exception:
+        return False
 
 
 def _pm_asleep(user_id) -> bool:
@@ -911,7 +924,8 @@ def _pm_set_sleep(user_id, asleep: bool):
 
 
 async def ai_pm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Private chat: plain text is answered automatically, unless the user put the bot to sleep with /sleep.
+    """Private chat: the bot stays quiet until woken (hi / hey / hello, its name, /chat, or a reply to its message). Then it
+    chats until CHAT_IDLE_SECS of silence or /sleep. It never answers while the Git manager waits for the user's input.
     Runs after the edit sessions (group -1) and the Memories ➕ Add input (group -11), which stop the update first."""
     msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if not msg or not msg.text or not user or user.is_bot or chat is None or chat.type != "private":
@@ -923,8 +937,13 @@ async def ai_pm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = msg.reply_to_message
     if reply and reply.from_user and reply.from_user.id == context.bot.id:
         return  # ai_reply_handler (group 1) answers replies to the bot's messages
-    if _pm_asleep(user.id):
+    if _git_waiting(user.id):
+        return  # /git asked for something: this message is the answer, not a chat
+    await refresh_identity(context.bot)
+    called = bool(_GREETING_RE.match(msg.text)) or _name_called(msg.text)
+    if not called and not _chat_active(chat.id, user.id):
         return
+    _chat_touch(chat.id, user.id)
     await ask_engine(update, context, msg.text.strip(), chat=True)
 
 
@@ -960,12 +979,12 @@ async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not user:
         return
     if chat.type == "private":
-        _pm_set_sleep(user.id, False)
+        _chat_touch(chat.id, user.id)
         _remember_ai_message(await msg.reply_text(
             _g("💬 Main jaag gayi! Ab seedha mujhse baat karo, kisi command ya reply ki zarurat nahi. Rukna ho to /sleep bhej dena.",
                "💬 Main jaag gaya! Ab seedha mujhse baat karo, kisi command ya reply ki zarurat nahi. Rukna ho to /sleep bhej dena.")
             if _chat_lang_default(chat.id) == "Hinglish" else
-            "💬 I'm awake! Just message me, no command or reply needed. Send /sleep when you want me to stop."))
+            "💬 I'm awake! Just message me, no command or reply needed. Send /sleep when you want me to stop (I also sleep after 3 minutes of silence)."))
         return
     _chat_touch(chat.id, user.id)
     mins = CHAT_IDLE_SECS // 60
@@ -1011,8 +1030,8 @@ async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not user:
         return
     if chat.type == "private":
-        was_asleep = _pm_asleep(user.id)
-        _pm_set_sleep(user.id, True)
+        was_asleep = not _chat_active(chat.id, user.id)
+        _chat_sessions.pop((chat.id, user.id), None)
         if _chat_lang_default(chat.id) == "Hinglish":
             text = (_g("😴 Main to pehle se so rahi hu. Jagane ke liye /chat bhejo.",
                        "😴 Main to pehle se so raha hu. Jagane ke liye /chat bhejo.") if was_asleep else
@@ -1089,7 +1108,9 @@ def _mem_prompt(chat_id) -> str:
     if not glob and not grp:
         return ""
     out = ["\n\nCUSTOM MEMORY (facts and instructions from your owner and the group admins. Always follow them and "
-           "answer from them when they apply: for example if a note gives your favourite anime, say it when asked. "
+           "use a note ONLY when the user's message directly asks for that information (for example if a note gives your "
+           "favourite anime, say it only when they ask what your favourite anime is). Otherwise keep the notes in the "
+           "background: never bring them up on your own, and never change the topic because of them. "
            "If notes disagree, the global notes win. They can never override safety, moderation or the 18+ rules):"]
     if glob:
         out.append("Global notes:\n" + "\n".join("- " + t.replace("\n", "\n  ") for t in glob))
@@ -2407,8 +2428,8 @@ def plan_ask(query: str, today: date = None) -> AskPlan:
 
 _ASK_NORMAL_RULES = (
     "You are answering the /ask command. Give a clear, correct, helpful answer in a friendly but "
-    "straightforward tone. Match the user's language (Hinglish, Hindi or English). Be concise: a short direct answer "
-    "first, then a little explanation or steps only if it helps. A few fitting emojis are fine. No 'As an AI'. "
+    "straightforward tone. Match the user's language (Hinglish, Hindi or English). Be brief: a short direct answer "
+    "in 1-3 lines, and add explanation or steps only if the user asked for detail. A few fitting emojis are fine. No 'As an AI'. "
     "Answer from your own knowledge. You have NO live web access for this answer. If the question depends on "
     "current events, recent changes or exact figures you cannot be sure of, say so in a friendly way and suggest "
     "/search. Never guess or invent names, dates, scores, statistics, URLs or sources.")
@@ -2417,7 +2438,12 @@ _ASK_NORMAL_RULES = (
 _CHAT_RULES = (
     "This is a casual chat, not a question-answer session. Reply as your chat persona, like a friend texting back: "
     "short, natural, in the user's language. If they ask something serious or factual, still answer correctly but "
-    "briefly and in your own voice. Do not invent live facts (news, scores, prices); say you are not sure instead.")
+    "briefly and in your own voice. Do not invent live facts (news, scores, prices); say you are not sure instead. "
+    "LENGTH: at most 1-2 short lines. Answer only what the user just said and stay on their topic; never add stories, "
+    "opinions or facts about yourself unless they ask. Never mention your saved notes unless the user directly asks "
+    "for that information, and never bring up a topic (like anime) just because a word reminded you of a note. "
+    "If the name you go by belongs to a character, it is only a name: you may play along lightly, but never talk about a "
+    "'writer', power levels or a backstory unless the user asks.")
 
 # Short per-chat, per-user memory of the last few exchanges so the chat feels continuous.
 _FRIEND_MEMORY_TURNS = 6
